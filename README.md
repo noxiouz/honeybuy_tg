@@ -110,6 +110,7 @@ env template lives at `deploy/ubuntu/env.example`.
 - `/bought milk` - mark active items matching the name as bought.
 - `/clear_bought` - remove bought items from active history.
 - `/clear` - clear the whole active list in the current chat, with confirmation.
+- `/recipes` - show saved recipes.
 - `/reanalyze` - reanalyze a replied-to voice message.
 - `/text_parse_mode` - configure natural text parsing for the current chat.
 
@@ -173,6 +174,26 @@ message with `это куплено` to mark it bought.
 The same reply-context commands also work as voice messages when the voice
 message itself replies to the tracked bot message. AI parsing is also prompted
 to map natural undo phrases to the latest tracked `Added` result.
+
+Recipe memory works with public recipe links. Teach a recipe with:
+
+```text
+выучи солянку https://cookidoo.co.uk/recipes/recipe/en-GB/r769287
+```
+
+Then reuse it later:
+
+```text
+добавь все для солянки
+купи на солянку
+ингредиенты для солянки
+```
+
+The bot fetches the recipe page, asks OpenAI to extract grocery ingredients,
+stores them in SQLite for the current chat, and adds them to the shopping list
+when requested. Voice commands use AI as a fallback, so the wording does not
+need to match exactly. Pasted recipe text support is still planned; for now,
+send a public recipe link.
 
 ## Metrics
 

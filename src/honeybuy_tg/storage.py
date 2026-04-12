@@ -5,11 +5,18 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from honeybuy_tg.models import ItemStatus, ShoppingItem
+from honeybuy_tg.models import ItemStatus, Recipe, RecipeIngredient, ShoppingItem
 
 
 def normalize_item_name(name: str) -> str:
     return " ".join(name.casefold().strip().split())
+
+
+def normalize_recipe_lookup_name(name: str) -> str:
+    normalized = normalize_item_name(name)
+    if len(normalized) > 3 and normalized[-1] in {"а", "е", "и", "у", "ы", "ю", "я"}:
+        return normalized[:-1]
+    return normalized
 
 
 def utc_now() -> str:
@@ -129,6 +136,30 @@ class Storage:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (chat_id, message_id, item_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS recipes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    normalized_name TEXT NOT NULL,
+                    source_url TEXT,
+                    created_by INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (chat_id, normalized_name)
+                );
+
+                CREATE TABLE IF NOT EXISTS recipe_ingredients (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recipe_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    quantity_text TEXT,
+                    position INTEGER NOT NULL,
+                    FOREIGN KEY (recipe_id) REFERENCES recipes (id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_recipes_chat_name
+                    ON recipes (chat_id, normalized_name);
                 """
             )
             db.commit()
@@ -312,6 +343,157 @@ class Storage:
             )
             db.commit()
             return cursor.rowcount
+
+    async def save_recipe(
+        self,
+        *,
+        chat_id: int,
+        name: str,
+        source_url: str | None,
+        created_by: int,
+        ingredients: list[tuple[str, str | None]],
+    ) -> Recipe:
+        now = utc_now()
+        clean_name = " ".join(name.strip().split())
+        normalized_name = normalize_item_name(clean_name)
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                INSERT INTO recipes (
+                    chat_id, name, normalized_name, source_url,
+                    created_by, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, normalized_name) DO UPDATE SET
+                    name = excluded.name,
+                    source_url = excluded.source_url,
+                    updated_at = excluded.updated_at
+                RETURNING id
+                """,
+                (
+                    chat_id,
+                    clean_name,
+                    normalized_name,
+                    source_url,
+                    created_by,
+                    now,
+                    now,
+                ),
+            )
+            recipe_id = cursor.fetchone()["id"]
+            db.execute(
+                "DELETE FROM recipe_ingredients WHERE recipe_id = ?",
+                (recipe_id,),
+            )
+            db.executemany(
+                """
+                INSERT INTO recipe_ingredients (
+                    recipe_id, name, quantity_text, position
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (
+                        recipe_id,
+                        " ".join(ingredient_name.strip().split()),
+                        " ".join(quantity.strip().split()) if quantity else None,
+                        position,
+                    )
+                    for position, (ingredient_name, quantity) in enumerate(
+                        ingredients,
+                        start=1,
+                    )
+                    if ingredient_name.strip()
+                ],
+            )
+            db.commit()
+
+        recipe = await self.get_recipe(chat_id=chat_id, name=clean_name)
+        if recipe is None:
+            raise RuntimeError("Saved recipe could not be loaded")
+        return recipe
+
+    async def get_recipe(self, *, chat_id: int, name: str) -> Recipe | None:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                SELECT * FROM recipes
+                WHERE chat_id = ? AND normalized_name = ?
+                """,
+                (chat_id, normalize_item_name(name)),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                row = self._find_recipe_by_lookup_name(
+                    db=db,
+                    chat_id=chat_id,
+                    name=name,
+                )
+                if row is None:
+                    return None
+            ingredients = db.execute(
+                """
+                SELECT * FROM recipe_ingredients
+                WHERE recipe_id = ?
+                ORDER BY position, id
+                """,
+                (row["id"],),
+            ).fetchall()
+        return row_to_recipe(row, ingredients)
+
+    def _find_recipe_by_lookup_name(
+        self,
+        *,
+        db: sqlite3.Connection,
+        chat_id: int,
+        name: str,
+    ) -> sqlite3.Row | None:
+        lookup_name = normalize_recipe_lookup_name(name)
+        cursor = db.execute(
+            """
+            SELECT * FROM recipes
+            WHERE chat_id = ?
+            """,
+            (chat_id,),
+        )
+        for row in cursor.fetchall():
+            if normalize_recipe_lookup_name(row["name"]) == lookup_name:
+                return row
+        return None
+
+    async def list_recipes(self, *, chat_id: int) -> list[Recipe]:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                SELECT * FROM recipes
+                WHERE chat_id = ?
+                ORDER BY name
+                """,
+                (chat_id,),
+            )
+            rows = cursor.fetchall()
+            recipe_ids = [row["id"] for row in rows]
+            if not recipe_ids:
+                return []
+            placeholders = ",".join("?" for _ in recipe_ids)
+            ingredient_rows = db.execute(
+                f"""
+                SELECT * FROM recipe_ingredients
+                WHERE recipe_id IN ({placeholders})
+                ORDER BY recipe_id, position, id
+                """,
+                recipe_ids,
+            ).fetchall()
+
+        ingredients_by_recipe_id: dict[int, list[sqlite3.Row]] = {}
+        for ingredient_row in ingredient_rows:
+            ingredients_by_recipe_id.setdefault(ingredient_row["recipe_id"], []).append(
+                ingredient_row
+            )
+        return [
+            row_to_recipe(row, ingredients_by_recipe_id.get(row["id"], []))
+            for row in rows
+        ]
 
     async def save_bot_message(
         self,
@@ -688,4 +870,33 @@ def row_to_item(row: sqlite3.Row) -> ShoppingItem:
         updated_at=datetime.fromisoformat(values["updated_at"]),
         bought_at=parse_dt(values["bought_at"]),
         removed_at=parse_dt(values["removed_at"]),
+    )
+
+
+def row_to_recipe(
+    row: sqlite3.Row,
+    ingredient_rows: list[sqlite3.Row],
+) -> Recipe:
+    values: dict[str, Any] = dict(row)
+    return Recipe(
+        id=values["id"],
+        chat_id=values["chat_id"],
+        name=values["name"],
+        normalized_name=values["normalized_name"],
+        source_url=values["source_url"],
+        created_by=values["created_by"],
+        created_at=datetime.fromisoformat(values["created_at"]),
+        updated_at=datetime.fromisoformat(values["updated_at"]),
+        ingredients=tuple(row_to_recipe_ingredient(row) for row in ingredient_rows),
+    )
+
+
+def row_to_recipe_ingredient(row: sqlite3.Row) -> RecipeIngredient:
+    values: dict[str, Any] = dict(row)
+    return RecipeIngredient(
+        id=values["id"],
+        recipe_id=values["recipe_id"],
+        name=values["name"],
+        quantity_text=values["quantity_text"],
+        position=values["position"],
     )

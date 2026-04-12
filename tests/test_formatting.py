@@ -66,6 +66,23 @@ def test_format_items_without_categories_is_ungrouped():
     )
 
 
+def test_format_items_can_use_html_for_telegram():
+    text = format_items(
+        [item(1, "сыр <брынза>")],
+        categories_by_item_id={1: "Молочка & сыр"},
+        html=True,
+    )
+
+    assert text == "\n".join(
+        [
+            "<b>Shopping list</b>",
+            "",
+            "<b>Молочка &amp; сыр</b>",
+            "• сыр &lt;брынза&gt;",
+        ]
+    )
+
+
 def test_format_shop_mode():
     text = format_shop_mode([item(1, "помидоры"), item(2, "молоко")])
 

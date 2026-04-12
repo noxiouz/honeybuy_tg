@@ -133,6 +133,105 @@ class ShoppingTextParser:
         return payload
 
 
+class RecipeExtractor:
+    def __init__(self, *, api_key: str, model: str) -> None:
+        self.client = AsyncOpenAI(api_key=api_key)
+        self.model = model
+
+    async def extract(
+        self,
+        *,
+        requested_name: str,
+        source_url: str,
+        page_text: str,
+    ) -> dict[str, object]:
+        started_at = perf_counter()
+        try:
+            result = await self.client.responses.create(
+                model=self.model,
+                instructions=(
+                    "Extract a recipe from visible recipe-page text. Return only "
+                    "valid JSON with shape: "
+                    '{"name":"солянка","ingredients":[{"name":"carrot",'
+                    '"quantity":"120 g"}]}. Use the requested name if it is a '
+                    "reasonable alias. Ingredients must be grocery items only; omit "
+                    "nutrition, ratings, equipment, navigation, and recommendations. "
+                    "Preserve useful quantities as short text."
+                ),
+                input=json.dumps(
+                    {
+                        "requested_name": requested_name,
+                        "source_url": source_url,
+                        "page_text": page_text[:20_000],
+                    },
+                    ensure_ascii=False,
+                ),
+                temperature=0,
+                max_output_tokens=2500,
+            )
+        except Exception:
+            record_ai_request(
+                operation="recipe_extract",
+                status="error",
+                duration_seconds=perf_counter() - started_at,
+            )
+            raise
+        record_ai_request(
+            operation="recipe_extract",
+            status="ok",
+            duration_seconds=perf_counter() - started_at,
+        )
+        payload = json.loads(response_text(result))
+        if not isinstance(payload, dict):
+            raise ValueError("AI recipe extractor returned non-object JSON")
+        return payload
+
+
+class RecipeCommandParser:
+    def __init__(self, *, api_key: str, model: str) -> None:
+        self.client = AsyncOpenAI(api_key=api_key)
+        self.model = model
+
+    async def parse(self, text: str) -> dict[str, object]:
+        started_at = perf_counter()
+        try:
+            result = await self.client.responses.create(
+                model=self.model,
+                instructions=(
+                    "Parse commands that teach or reuse saved recipes. Return only "
+                    "valid JSON with shape: "
+                    '{"action":"learn_recipe|add_recipe|unknown",'
+                    '"recipe_name":"солянка","url":"https://example.com"}. '
+                    "Use action 'learn_recipe' when the user asks to remember, learn, "
+                    "save, or teach a recipe and provides a recipe URL. Use action "
+                    "'add_recipe' when the user asks to add/buy ingredients/products "
+                    "for a saved recipe, even if phrased loosely, for example "
+                    "'добавь для солянки', 'купи на солянку', 'ингредиенты для "
+                    "солянки', or 'все для солянки'. Return unknown for ordinary "
+                    "single-product shopping commands."
+                ),
+                input=text,
+                temperature=0,
+                max_output_tokens=500,
+            )
+        except Exception:
+            record_ai_request(
+                operation="recipe_command_parse",
+                status="error",
+                duration_seconds=perf_counter() - started_at,
+            )
+            raise
+        record_ai_request(
+            operation="recipe_command_parse",
+            status="ok",
+            duration_seconds=perf_counter() - started_at,
+        )
+        payload = json.loads(response_text(result))
+        if not isinstance(payload, dict):
+            raise ValueError("AI recipe command parser returned non-object JSON")
+        return payload
+
+
 def response_text(result: object) -> str:
     text = getattr(result, "output_text", None)
     if isinstance(text, str) and text.strip():

@@ -23,12 +23,20 @@ from aiogram.types import (
     TelegramObject,
 )
 
-from honeybuy_tg.ai import ShoppingItemCategorizer, ShoppingTextParser, VoiceTranscriber
+from honeybuy_tg.ai import (
+    RecipeCommandParser,
+    RecipeExtractor,
+    ShoppingItemCategorizer,
+    ShoppingTextParser,
+    VoiceTranscriber,
+)
 from honeybuy_tg.config import Settings
 from honeybuy_tg.formatting import (
     format_added,
     format_item,
     format_items,
+    format_recipe_list,
+    format_recipe_saved,
     format_shop_mode,
     format_shop_session,
     format_updated,
@@ -47,6 +55,16 @@ from honeybuy_tg.parser import (
     normalize_text,
     parse_shopping_text,
     parsed_command_from_ai,
+)
+from honeybuy_tg.recipes import (
+    AddRecipeRequest,
+    fetch_recipe_page_text,
+    LearnRecipeRequest,
+    parse_add_recipe_request,
+    parse_learn_recipe_request,
+    looks_like_recipe_reuse_request,
+    recipe_command_from_ai,
+    should_try_ai_recipe_command,
 )
 from honeybuy_tg.service import ShoppingListService
 from honeybuy_tg.storage import Storage, normalize_item_name
@@ -198,6 +216,35 @@ def voice_reply_context_message(*, voice_message: Message) -> Message | None:
     return voice_message.reply_to_message
 
 
+def recipe_name_from_ai(payload: dict[str, object], *, fallback: str) -> str:
+    name = payload.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return fallback
+
+
+def recipe_ingredients_from_ai(payload: dict[str, object]) -> list[tuple[str, str | None]]:
+    raw_ingredients = payload.get("ingredients", [])
+    if not isinstance(raw_ingredients, list):
+        return []
+
+    ingredients = []
+    for raw_ingredient in raw_ingredients:
+        if not isinstance(raw_ingredient, dict):
+            continue
+        name = raw_ingredient.get("name")
+        quantity = raw_ingredient.get("quantity")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        ingredients.append(
+            (
+                name.strip(),
+                quantity.strip() if isinstance(quantity, str) and quantity.strip() else None,
+            )
+        )
+    return ingredients
+
+
 def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
     service = ShoppingListService(storage)
     transcriber = (
@@ -218,6 +265,22 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
     )
     text_parser = (
         ShoppingTextParser(
+            api_key=settings.openai_api_key,
+            model=settings.openai_parse_model,
+        )
+        if settings.openai_api_key
+        else None
+    )
+    recipe_extractor = (
+        RecipeExtractor(
+            api_key=settings.openai_api_key,
+            model=settings.openai_parse_model,
+        )
+        if settings.openai_api_key
+        else None
+    )
+    recipe_command_parser = (
+        RecipeCommandParser(
             api_key=settings.openai_api_key,
             model=settings.openai_parse_model,
         )
@@ -423,12 +486,152 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         record_shopping_action(action=action, source=source, count=len(items))
         await save_item_result_message(message=sent, kind=kind, items=items)
 
+    async def apply_recipe_command(message: Message, text: str, *, source: str) -> bool:
+        if message.from_user is None:
+            return False
+
+        learn_request = parse_learn_recipe_request(text)
+        add_request = parse_add_recipe_request(text)
+        tried_ai_recipe_command = False
+        if (
+            learn_request is None
+            and add_request is None
+            and recipe_command_parser is not None
+            and should_try_ai_recipe_command(text)
+        ):
+            tried_ai_recipe_command = True
+            try:
+                recipe_command = recipe_command_from_ai(
+                    await recipe_command_parser.parse(text)
+                )
+            except Exception:
+                logger.exception("Failed to parse recipe command with AI")
+            else:
+                if (
+                    recipe_command.action == "learn_recipe"
+                    and recipe_command.name is not None
+                    and recipe_command.url is not None
+                ):
+                    learn_request = LearnRecipeRequest(
+                        name=recipe_command.name,
+                        url=recipe_command.url,
+                    )
+                elif (
+                    recipe_command.action == "add_recipe"
+                    and recipe_command.name is not None
+                ):
+                    add_request = AddRecipeRequest(name=recipe_command.name)
+
+        if (
+            learn_request is None
+            and add_request is None
+            and tried_ai_recipe_command
+            and looks_like_recipe_reuse_request(text)
+        ):
+            await message.answer(
+                "I could not match that to a saved recipe.\n\n"
+                "Try: добавь все для солянки"
+            )
+            return True
+
+        if learn_request is not None:
+            if recipe_extractor is None:
+                await message.answer(
+                    "Recipe learning needs OPENAI_API_KEY because the page must be "
+                    "converted into ingredients."
+                )
+                return True
+
+            try:
+                page_text = await fetch_recipe_page_text(learn_request.url)
+                payload = await recipe_extractor.extract(
+                    requested_name=learn_request.name,
+                    source_url=learn_request.url,
+                    page_text=page_text,
+                )
+                recipe = await service.save_recipe(
+                    chat_id=message.chat.id,
+                    name=recipe_name_from_ai(payload, fallback=learn_request.name),
+                    source_url=learn_request.url,
+                    user_id=message.from_user.id,
+                    ingredients=recipe_ingredients_from_ai(payload),
+                )
+            except Exception as error:
+                logger.exception("Failed to learn recipe")
+                await storage.log_event(
+                    chat_id=message.chat.id,
+                    user_id=message.from_user.id,
+                    telegram_message_id=message.message_id,
+                    input_type="recipe",
+                    raw_text=text,
+                    status="error",
+                    error=str(error),
+                )
+                await message.answer(
+                    "I could not learn that recipe.\n\n"
+                    "Try a public recipe link, or paste the recipe text."
+                )
+                return True
+
+            await storage.log_event(
+                chat_id=message.chat.id,
+                user_id=message.from_user.id,
+                telegram_message_id=message.message_id,
+                input_type="recipe",
+                raw_text=text,
+                ai_result_json=json.dumps(
+                    {
+                        "source": source,
+                        "recipe": recipe.name,
+                        "ingredients": len(recipe.ingredients),
+                    },
+                    ensure_ascii=False,
+                ),
+                status="ok",
+            )
+            await message.answer(format_recipe_saved(recipe))
+            return True
+
+        if add_request is None:
+            return False
+
+        recipe = await service.get_recipe(chat_id=message.chat.id, name=add_request.name)
+        if recipe is None:
+            await message.answer(
+                f"I do not know recipe: {add_request.name}\n\n"
+                "Teach it first: выучи солянка https://..."
+            )
+            return True
+
+        added = await service.add_recipe_ingredients(
+            chat_id=message.chat.id,
+            recipe=recipe,
+            user_id=message.from_user.id,
+        )
+        await answer_item_result(
+            message=message,
+            text=(
+                format_updated(f"Added ingredients for {recipe.name}", added)
+                if added
+                else f"Everything for {recipe.name} is already on the list."
+            ),
+            kind="added",
+            action="add",
+            source="recipe",
+            items=added,
+        )
+        return True
+
     async def send_list(message: Message) -> None:
         items = await service.list_active(chat_id=message.chat.id)
         categories_by_item_id = await categorize_list_items(items)
         sent = await message.answer(
-            format_items(items, categories_by_item_id=categories_by_item_id),
-            reply_markup=item_keyboard(items),
+            format_items(
+                items,
+                categories_by_item_id=categories_by_item_id,
+                html=True,
+            ),
+            parse_mode="HTML",
         )
         await storage.save_bot_message(
             chat_id=message.chat.id,
@@ -784,6 +987,9 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                     "Transcribed text is too long. "
                     f"Limit: {settings.max_transcript_characters} characters."
                 )
+                return
+
+            if await apply_recipe_command(command_message, transcript, source="voice"):
                 return
 
             parsed = await parse_text_with_ai_fallback(transcript)
@@ -1157,6 +1363,12 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             reply_markup=clear_list_keyboard(),
         )
 
+    @router.message(Command("recipes"))
+    async def recipes(message: Message) -> None:
+        if not await require_allowed(message):
+            return
+        await message.answer(format_recipe_list(await service.list_recipes(chat_id=message.chat.id)))
+
     @router.message(Command("text_parse_mode"))
     async def text_parse_mode(message: Message) -> None:
         if message.from_user is None:
@@ -1243,6 +1455,8 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             if not await require_allowed(message):
                 return
             parsed_text = strip_bot_mention(message.text, bot_username=bot_user.username)
+            if await apply_recipe_command(message, parsed_text, source="text"):
+                return
             parsed = await parse_text_with_ai_fallback(parsed_text)
             handled_reply_context = await apply_reply_context_command(
                 message=message,
@@ -1472,6 +1686,7 @@ def help_text() -> str:
             "/bought milk - mark matching active items as bought",
             "/clear_bought - clear bought items",
             "/clear - clear the whole active list with confirmation",
+            "/recipes - show saved recipes",
             "/text_parse_mode - configure natural text parsing in this chat",
             "Reply to a voice message with @bot_username to reanalyze it",
             "/whoami - show user and chat IDs",
@@ -1542,6 +1757,7 @@ async def set_bot_commands(bot: Bot) -> None:
             BotCommand(command="bought", description="Mark item bought"),
             BotCommand(command="clear_bought", description="Clear bought items"),
             BotCommand(command="clear", description="Clear active list"),
+            BotCommand(command="recipes", description="Show saved recipes"),
             BotCommand(command="reanalyze", description="Reanalyze replied voice"),
             BotCommand(command="text_parse_mode", description="Set text parsing mode"),
         ]

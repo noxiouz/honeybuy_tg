@@ -1,0 +1,199 @@
+import asyncio
+import re
+from dataclasses import dataclass
+from html.parser import HTMLParser
+from typing import Any, Literal
+from urllib.error import URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+
+
+URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class LearnRecipeRequest:
+    name: str
+    url: str
+
+
+@dataclass(frozen=True)
+class AddRecipeRequest:
+    name: str
+
+
+@dataclass(frozen=True)
+class RecipeCommand:
+    action: Literal["learn_recipe", "add_recipe", "unknown"]
+    name: str | None = None
+    url: str | None = None
+
+
+def recipe_command_from_ai(payload: dict[str, Any]) -> RecipeCommand:
+    action = payload.get("action")
+    if action not in {"learn_recipe", "add_recipe"}:
+        return RecipeCommand(action="unknown")
+
+    recipe_name = payload.get("recipe_name")
+    if not isinstance(recipe_name, str) or not recipe_name.strip():
+        return RecipeCommand(action="unknown")
+
+    url = payload.get("url")
+    if action == "learn_recipe" and not isinstance(url, str):
+        return RecipeCommand(action="unknown")
+
+    return RecipeCommand(
+        action=action,
+        name=recipe_name.strip(),
+        url=url.strip() if isinstance(url, str) else None,
+    )
+
+
+def parse_learn_recipe_request(text: str) -> LearnRecipeRequest | None:
+    match = URL_RE.search(text)
+    if match is None:
+        return None
+
+    prefix = text[: match.start()]
+    url = match.group(0).rstrip(".,)")
+    normalized_prefix = normalize_recipe_command_text(prefix)
+    if not normalized_prefix.startswith(("выучи", "запомни")):
+        return None
+
+    name = normalized_prefix
+    for leading in (
+        "выучи рецепт",
+        "выучи",
+        "запомни рецепт",
+        "запомни",
+    ):
+        if name.startswith(leading):
+            name = name[len(leading) :].strip(" -:,.")
+            break
+    name = name.replace("вот ссылка", "").strip(" -:,.")
+    if not name:
+        return None
+    return LearnRecipeRequest(name=name, url=url)
+
+
+def parse_add_recipe_request(text: str) -> AddRecipeRequest | None:
+    normalized = normalize_recipe_command_text(text)
+    prefixes = (
+        "добавь все для",
+        "добавить все для",
+        "купи все для",
+        "купить все для",
+        "добавь ингредиенты для",
+        "добавить ингредиенты для",
+        "добавь продукты для",
+        "добавить продукты для",
+        "добавь рецепт",
+        "приготовь",
+    )
+    for prefix in prefixes:
+        if normalized.startswith(prefix + " "):
+            name = normalized[len(prefix) :].strip(" -:,.")
+            if name:
+                return AddRecipeRequest(name=name)
+    return None
+
+
+def should_try_ai_recipe_command(text: str) -> bool:
+    normalized = normalize_recipe_command_text(text)
+    return any(
+        marker in normalized
+        for marker in (
+            "рецепт",
+            "ингредиент",
+            "продукт",
+            "готов",
+            "выучи",
+            "запомни",
+            "для ",
+            " на ",
+        )
+    )
+
+
+def looks_like_recipe_reuse_request(text: str) -> bool:
+    normalized = normalize_recipe_command_text(text)
+    return any(
+        marker in normalized
+        for marker in (
+            " все для ",
+            " для ",
+            " на ",
+            "ингредиент",
+            "продукт",
+            "приготов",
+        )
+    )
+
+
+def normalize_recipe_command_text(text: str) -> str:
+    text = text.casefold().strip().replace("ё", "е")
+    text = re.sub(r"[.!?]+$", "", text)
+    return " ".join(text.split())
+
+
+async def fetch_recipe_page_text(url: str, *, timeout: int = 15) -> str:
+    return await asyncio.to_thread(fetch_recipe_page_text_sync, url, timeout=timeout)
+
+
+def fetch_recipe_page_text_sync(url: str, *, timeout: int = 15) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("Only HTTP and HTTPS recipe links are supported")
+
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (compatible; HoneybuyRecipeBot/0.1; "
+                "+https://example.invalid)"
+            )
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            content_type = response.headers.get("content-type", "")
+            if "html" not in content_type and "text" not in content_type:
+                raise ValueError("Recipe link did not return readable text")
+            charset = response.headers.get_content_charset() or "utf-8"
+            raw_html = response.read(1_500_000)
+    except URLError as error:
+        raise ValueError(f"Could not fetch recipe link: {error}") from error
+
+    html = raw_html.decode(charset, errors="replace")
+    return html_to_text(html)
+
+
+def html_to_text(html: str) -> str:
+    parser = VisibleTextParser()
+    parser.feed(html)
+    return parser.text()
+
+
+class VisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+        self._hidden_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"script", "style", "noscript", "svg"}:
+            self._hidden_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript", "svg"} and self._hidden_depth:
+            self._hidden_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._hidden_depth:
+            return
+        text = " ".join(data.split())
+        if text:
+            self._parts.append(text)
+
+    def text(self) -> str:
+        return "\n".join(self._parts)

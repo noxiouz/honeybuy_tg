@@ -8,6 +8,8 @@ from honeybuy_tg.telegram_bot import (
     parse_item_ids,
     parse_bare_voice_items,
     parse_text_command_with_ai_fallback,
+    recipe_ingredients_from_ai,
+    recipe_name_from_ai,
     should_parse_text_message,
     strip_bot_mention,
     voice_reply_context_message,
@@ -169,6 +171,23 @@ def test_voice_reply_context_ignores_reanalysis_command_reply():
         )
         is None
     )
+
+
+def test_recipe_ai_payload_helpers():
+    payload = {
+        "name": "солянка",
+        "ingredients": [
+            {"name": "fresh dill", "quantity": "8 sprigs"},
+            {"name": "water", "quantity": None},
+            {"quantity": "bad"},
+        ],
+    }
+
+    assert recipe_name_from_ai(payload, fallback="fallback") == "солянка"
+    assert recipe_ingredients_from_ai(payload) == [
+        ("fresh dill", "8 sprigs"),
+        ("water", None),
+    ]
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,6 @@
-from honeybuy_tg.models import ShoppingItem
+from html import escape
+
+from honeybuy_tg.models import Recipe, RecipeIngredient, ShoppingItem
 
 
 def format_item(item: ShoppingItem) -> str:
@@ -21,13 +23,15 @@ def format_items(
     items: list[ShoppingItem],
     *,
     categories_by_item_id: dict[int, str] | None = None,
+    html: bool = False,
 ) -> str:
     if not items:
         return "Shopping list is empty.\n\nSend /add milk or say: купи молоко"
-    lines = ["Shopping list"]
+    title = "<b>Shopping list</b>" if html else "Shopping list"
+    lines = [title]
     if not categories_by_item_id:
         for item in items:
-            lines.append(f"• {format_item(item)}")
+            lines.append(f"• {format_item_for_output(item, html=html)}")
         return "\n".join(lines)
 
     for category, category_items in group_items_by_category(
@@ -36,14 +40,21 @@ def format_items(
     ):
         if category:
             lines.append("")
-            lines.append(category)
+            lines.append(f"<b>{escape(category)}</b>" if html else category)
         for item in category_items:
-            lines.append(f"• {format_item(item)}")
+            lines.append(f"• {format_item_for_output(item, html=html)}")
     return "\n".join(lines)
 
 
 def format_added(item: ShoppingItem) -> str:
     return f"Added\n• {format_item(item)}"
+
+
+def format_item_for_output(item: ShoppingItem, *, html: bool) -> str:
+    text = format_item(item)
+    if html:
+        return escape(text)
+    return text
 
 
 def format_updated(action: str, items: list[ShoppingItem]) -> str:
@@ -67,6 +78,32 @@ def format_shop_session(items: list[tuple[int, str, bool]]) -> str:
     for _, item_text, checked in items:
         marker = "✅" if checked else "☐"
         lines.append(f"{marker} {item_text}")
+    return "\n".join(lines)
+
+
+def format_recipe_ingredient(ingredient: RecipeIngredient) -> str:
+    if ingredient.quantity_text:
+        return f"{ingredient.name}, {ingredient.quantity_text}"
+    return ingredient.name
+
+
+def format_recipe_saved(recipe: Recipe) -> str:
+    lines = [
+        "Saved recipe",
+        recipe.name,
+        "",
+        f"Ingredients: {len(recipe.ingredients)}",
+    ]
+    lines.extend(f"• {format_recipe_ingredient(ingredient)}" for ingredient in recipe.ingredients)
+    return "\n".join(lines)
+
+
+def format_recipe_list(recipes: list[Recipe]) -> str:
+    if not recipes:
+        return "No saved recipes yet."
+    lines = ["Saved recipes"]
+    for recipe in recipes:
+        lines.append(f"• {recipe.name} ({len(recipe.ingredients)} ingredients)")
     return "\n".join(lines)
 
 

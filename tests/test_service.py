@@ -24,3 +24,52 @@ async def test_service_lists_active_items(tmp_path):
     items = await service.list_active(chat_id=1)
 
     assert [item.name for item in items] == ["Milk", "Bread"]
+
+
+@pytest.mark.asyncio
+async def test_service_adds_recipe_ingredients(tmp_path):
+    service = ShoppingListService(Storage(tmp_path / "test.sqlite3"))
+    await service.storage.init()
+
+    recipe = await service.save_recipe(
+        chat_id=1,
+        name="Солянка",
+        source_url=None,
+        user_id=10,
+        ingredients=[("fresh dill", "8 sprigs"), ("water", None)],
+    )
+
+    added = await service.add_recipe_ingredients(
+        chat_id=1,
+        recipe=recipe,
+        user_id=10,
+    )
+
+    assert [item.name for item in added] == ["fresh dill, 8 sprigs", "water"]
+
+
+@pytest.mark.asyncio
+async def test_service_skips_active_recipe_ingredient_duplicates(tmp_path):
+    service = ShoppingListService(Storage(tmp_path / "test.sqlite3"))
+    await service.storage.init()
+
+    recipe = await service.save_recipe(
+        chat_id=1,
+        name="Солянка",
+        source_url=None,
+        user_id=10,
+        ingredients=[("fresh dill", "8 sprigs"), ("water", None)],
+    )
+    await service.add_recipe_ingredients(chat_id=1, recipe=recipe, user_id=10)
+
+    added_again = await service.add_recipe_ingredients(
+        chat_id=1,
+        recipe=recipe,
+        user_id=10,
+    )
+
+    assert added_again == []
+    assert [item.name for item in await service.list_active(chat_id=1)] == [
+        "fresh dill, 8 sprigs",
+        "water",
+    ]

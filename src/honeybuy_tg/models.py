@@ -25,3 +25,25 @@ class ShoppingItem:
     updated_at: datetime
     bought_at: datetime | None
     removed_at: datetime | None
+
+
+@dataclass(frozen=True)
+class RecipeIngredient:
+    id: int
+    recipe_id: int
+    name: str
+    quantity_text: str | None
+    position: int
+
+
+@dataclass(frozen=True)
+class Recipe:
+    id: int
+    chat_id: int
+    name: str
+    normalized_name: str
+    source_url: str | None
+    created_by: int
+    created_at: datetime
+    updated_at: datetime
+    ingredients: tuple[RecipeIngredient, ...] = ()

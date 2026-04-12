@@ -112,6 +112,38 @@ async def test_bot_message_lookup(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_recipe_lifecycle(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+
+    recipe = await storage.save_recipe(
+        chat_id=1,
+        name="Солянка",
+        source_url="https://example.com/solyanka",
+        created_by=10,
+        ingredients=[
+            ("fresh dill", "8 sprigs"),
+            ("tomato paste", "60 g"),
+        ],
+    )
+
+    loaded = await storage.get_recipe(chat_id=1, name="солянки")
+    recipes = await storage.list_recipes(chat_id=1)
+
+    assert recipe.name == "Солянка"
+    assert loaded is not None
+    assert [ingredient.name for ingredient in loaded.ingredients] == [
+        "fresh dill",
+        "tomato paste",
+    ]
+    assert [ingredient.quantity_text for ingredient in loaded.ingredients] == [
+        "8 sprigs",
+        "60 g",
+    ]
+    assert [recipe.name for recipe in recipes] == ["Солянка"]
+
+
+@pytest.mark.asyncio
 async def test_chat_text_parse_mode_lifecycle(tmp_path):
     storage = Storage(tmp_path / "test.sqlite3")
     await storage.init()

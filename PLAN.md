@@ -114,6 +114,25 @@ Optional optimization:
 
 Used for commands like "delete this" when the user replies to a previous bot message.
 
+### `recipes`
+
+- `id`: primary key.
+- `chat_id`: Telegram chat ID.
+- `name`: recipe name as shown to users.
+- `normalized_name`: lowercased/normalized recipe name.
+- `source_url`: optional source URL.
+- `created_by`: Telegram user ID.
+- `created_at`: timestamp.
+- `updated_at`: timestamp.
+
+### `recipe_ingredients`
+
+- `id`: primary key.
+- `recipe_id`: recipe foreign key.
+- `name`: grocery ingredient name.
+- `quantity_text`: optional quantity text.
+- `position`: original ingredient order.
+
 ## AI Structured Command Schema
 
 The AI parser should output a strict JSON object:
@@ -349,6 +368,19 @@ Acceptance criteria:
 
 - [ ] The bot is usable in a normal grocery flow without typing exact commands.
 - [ ] Errors are short and actionable.
+
+## Phase 9.5: Recipe Memory
+
+- [x] Detect "выучи <recipe> <url>" recipe-learning requests.
+- [x] Fetch public recipe pages as readable text.
+- [x] Use OpenAI to extract recipe name and grocery ingredients.
+- [x] Store recipes and ingredients in SQLite scoped by chat.
+- [x] Detect "добавь все для <recipe>" reuse requests.
+- [x] Add saved recipe ingredients to the chat shopping list.
+- [x] Add `/recipes` to list saved recipes.
+- [ ] Support learning from pasted recipe text without a URL.
+- [ ] Add recipe deletion or overwrite confirmation if needed.
+- [ ] Add better alias management for multiple names per recipe.
 
 ## Phase 10: Deployment
 
