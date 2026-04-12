@@ -1,0 +1,392 @@
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from honeybuy_tg.models import ItemStatus, ShoppingItem
+
+
+def normalize_item_name(name: str) -> str:
+    return " ".join(name.casefold().strip().split())
+
+
+def utc_now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def parse_dt(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    return datetime.fromisoformat(value)
+
+
+class Storage:
+    def __init__(self, database_path: Path) -> None:
+        self.database_path = database_path
+
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.database_path) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys = ON")
+            yield db
+
+    async def init(self) -> None:
+        with self.connect() as db:
+            db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS authorized_chats (
+                    chat_id INTEGER PRIMARY KEY,
+                    chat_type TEXT NOT NULL,
+                    title TEXT,
+                    authorized_by INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS shopping_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    normalized_name TEXT NOT NULL,
+                    quantity REAL,
+                    unit TEXT,
+                    note TEXT,
+                    due_date TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_by INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    bought_at TEXT,
+                    removed_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_shopping_items_chat_status
+                    ON shopping_items (chat_id, status);
+
+                CREATE INDEX IF NOT EXISTS idx_shopping_items_chat_name
+                    ON shopping_items (chat_id, normalized_name);
+
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    telegram_message_id INTEGER,
+                    input_type TEXT NOT NULL,
+                    raw_text TEXT,
+                    ai_result_json TEXT,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS bot_messages (
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    item_ids TEXT,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, message_id)
+                );
+                """
+            )
+            db.commit()
+
+    async def authorize_chat(
+        self,
+        *,
+        chat_id: int,
+        chat_type: str,
+        title: str | None,
+        authorized_by: int,
+    ) -> None:
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO authorized_chats (
+                    chat_id, chat_type, title, authorized_by, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    chat_type = excluded.chat_type,
+                    title = excluded.title,
+                    authorized_by = excluded.authorized_by
+                """,
+                (chat_id, chat_type, title, authorized_by, utc_now()),
+            )
+            db.commit()
+
+    async def is_chat_authorized(self, chat_id: int) -> bool:
+        with self.connect() as db:
+            cursor = db.execute(
+                "SELECT 1 FROM authorized_chats WHERE chat_id = ?",
+                (chat_id,),
+            )
+            row = cursor.fetchone()
+        return row is not None
+
+    async def add_item(
+        self,
+        *,
+        chat_id: int,
+        name: str,
+        created_by: int,
+        quantity: float | None = None,
+        unit: str | None = None,
+        note: str | None = None,
+        due_date: str | None = None,
+    ) -> ShoppingItem:
+        now = utc_now()
+        clean_name = " ".join(name.strip().split())
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                INSERT INTO shopping_items (
+                    chat_id, name, normalized_name, quantity, unit, note, due_date,
+                    status, created_by, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chat_id,
+                    clean_name,
+                    normalize_item_name(clean_name),
+                    quantity,
+                    unit,
+                    note,
+                    due_date,
+                    ItemStatus.ACTIVE.value,
+                    created_by,
+                    now,
+                    now,
+                ),
+            )
+            db.commit()
+            item_id = cursor.lastrowid
+
+        item = await self.get_item(chat_id=chat_id, item_id=item_id)
+        if item is None:
+            raise RuntimeError("Inserted item could not be loaded")
+        return item
+
+    async def get_item(self, *, chat_id: int, item_id: int) -> ShoppingItem | None:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                SELECT * FROM shopping_items
+                WHERE chat_id = ? AND id = ?
+                """,
+                (chat_id, item_id),
+            )
+            row = cursor.fetchone()
+        return row_to_item(row) if row is not None else None
+
+    async def list_items(
+        self,
+        *,
+        chat_id: int,
+        status: ItemStatus = ItemStatus.ACTIVE,
+    ) -> list[ShoppingItem]:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                SELECT * FROM shopping_items
+                WHERE chat_id = ? AND status = ?
+                ORDER BY due_date IS NULL, due_date, created_at, id
+                """,
+                (chat_id, status.value),
+            )
+            rows = cursor.fetchall()
+        return [row_to_item(row) for row in rows]
+
+    async def mark_matching_bought(
+        self, *, chat_id: int, name: str
+    ) -> list[ShoppingItem]:
+        return await self._update_matching_items(
+            chat_id=chat_id,
+            name=name,
+            new_status=ItemStatus.BOUGHT,
+        )
+
+    async def remove_matching_items(
+        self, *, chat_id: int, name: str
+    ) -> list[ShoppingItem]:
+        return await self._update_matching_items(
+            chat_id=chat_id,
+            name=name,
+            new_status=ItemStatus.REMOVED,
+        )
+
+    async def mark_item_bought(
+        self, *, chat_id: int, item_id: int
+    ) -> ShoppingItem | None:
+        return await self._update_item_by_id(
+            chat_id=chat_id,
+            item_id=item_id,
+            new_status=ItemStatus.BOUGHT,
+        )
+
+    async def remove_item(self, *, chat_id: int, item_id: int) -> ShoppingItem | None:
+        return await self._update_item_by_id(
+            chat_id=chat_id,
+            item_id=item_id,
+            new_status=ItemStatus.REMOVED,
+        )
+
+    async def clear_bought(self, *, chat_id: int) -> int:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE shopping_items
+                SET status = ?, removed_at = ?, updated_at = ?
+                WHERE chat_id = ? AND status = ?
+                """,
+                (
+                    ItemStatus.REMOVED.value,
+                    utc_now(),
+                    utc_now(),
+                    chat_id,
+                    ItemStatus.BOUGHT.value,
+                ),
+            )
+            db.commit()
+            return cursor.rowcount
+
+    async def save_bot_message(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        kind: str,
+        item_ids: str | None = None,
+    ) -> None:
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT OR REPLACE INTO bot_messages (
+                    chat_id, message_id, kind, item_ids, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (chat_id, message_id, kind, item_ids, utc_now()),
+            )
+            db.commit()
+
+    async def log_event(
+        self,
+        *,
+        chat_id: int,
+        user_id: int,
+        input_type: str,
+        status: str,
+        telegram_message_id: int | None = None,
+        raw_text: str | None = None,
+        ai_result_json: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO events (
+                    chat_id, user_id, telegram_message_id, input_type, raw_text,
+                    ai_result_json, status, error, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chat_id,
+                    user_id,
+                    telegram_message_id,
+                    input_type,
+                    raw_text,
+                    ai_result_json,
+                    status,
+                    error,
+                    utc_now(),
+                ),
+            )
+            db.commit()
+
+    async def _update_matching_items(
+        self,
+        *,
+        chat_id: int,
+        name: str,
+        new_status: ItemStatus,
+    ) -> list[ShoppingItem]:
+        normalized_name = normalize_item_name(name)
+        active_items = await self.list_items(chat_id=chat_id)
+        matched_ids = [
+            item.id
+            for item in active_items
+            if item.normalized_name == normalized_name
+            or normalized_name in item.normalized_name
+            or item.normalized_name in normalized_name
+        ]
+        updated: list[ShoppingItem] = []
+        for item_id in matched_ids:
+            item = await self._update_item_by_id(
+                chat_id=chat_id,
+                item_id=item_id,
+                new_status=new_status,
+            )
+            if item is not None:
+                updated.append(item)
+        return updated
+
+    async def _update_item_by_id(
+        self,
+        *,
+        chat_id: int,
+        item_id: int,
+        new_status: ItemStatus,
+    ) -> ShoppingItem | None:
+        now = utc_now()
+        bought_at = now if new_status == ItemStatus.BOUGHT else None
+        removed_at = now if new_status == ItemStatus.REMOVED else None
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE shopping_items
+                SET status = ?,
+                    bought_at = COALESCE(?, bought_at),
+                    removed_at = COALESCE(?, removed_at),
+                    updated_at = ?
+                WHERE chat_id = ? AND id = ? AND status = ?
+                """,
+                (
+                    new_status.value,
+                    bought_at,
+                    removed_at,
+                    now,
+                    chat_id,
+                    item_id,
+                    ItemStatus.ACTIVE.value,
+                ),
+            )
+            db.commit()
+            if cursor.rowcount == 0:
+                return None
+        return await self.get_item(chat_id=chat_id, item_id=item_id)
+
+
+def row_to_item(row: sqlite3.Row) -> ShoppingItem:
+    values: dict[str, Any] = dict(row)
+    return ShoppingItem(
+        id=values["id"],
+        chat_id=values["chat_id"],
+        name=values["name"],
+        normalized_name=values["normalized_name"],
+        quantity=values["quantity"],
+        unit=values["unit"],
+        note=values["note"],
+        due_date=values["due_date"],
+        status=ItemStatus(values["status"]),
+        created_by=values["created_by"],
+        created_at=datetime.fromisoformat(values["created_at"]),
+        updated_at=datetime.fromisoformat(values["updated_at"]),
+        bought_at=parse_dt(values["bought_at"]),
+        removed_at=parse_dt(values["removed_at"]),
+    )
