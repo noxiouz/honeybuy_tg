@@ -1,7 +1,7 @@
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +89,45 @@ class Storage:
                     item_ids TEXT,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (chat_id, message_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS pending_confirmations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    items_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pending_confirmations_chat_status
+                    ON pending_confirmations (chat_id, status);
+
+                CREATE TABLE IF NOT EXISTS chat_settings (
+                    chat_id INTEGER PRIMARY KEY,
+                    text_parse_mode TEXT NOT NULL,
+                    updated_by INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS category_cache (
+                    normalized_name TEXT PRIMARY KEY,
+                    category TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS shop_sessions (
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    item_text TEXT NOT NULL,
+                    checked INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, message_id, item_id)
                 );
                 """
             )
@@ -254,6 +293,26 @@ class Storage:
             db.commit()
             return cursor.rowcount
 
+    async def clear_active_items(self, *, chat_id: int) -> int:
+        now = utc_now()
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE shopping_items
+                SET status = ?, removed_at = ?, updated_at = ?
+                WHERE chat_id = ? AND status = ?
+                """,
+                (
+                    ItemStatus.REMOVED.value,
+                    now,
+                    now,
+                    chat_id,
+                    ItemStatus.ACTIVE.value,
+                ),
+            )
+            db.commit()
+            return cursor.rowcount
+
     async def save_bot_message(
         self,
         *,
@@ -308,6 +367,212 @@ class Storage:
                 ),
             )
             db.commit()
+
+    async def create_pending_confirmation(
+        self,
+        *,
+        chat_id: int,
+        user_id: int,
+        source_message_id: int,
+        items_json: str,
+    ) -> int:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                INSERT INTO pending_confirmations (
+                    chat_id, user_id, source_message_id, items_json, status, created_at
+                )
+                VALUES (?, ?, ?, ?, 'pending', ?)
+                """,
+                (chat_id, user_id, source_message_id, items_json, utc_now()),
+            )
+            db.commit()
+            return cursor.lastrowid
+
+    async def get_pending_confirmation(
+        self,
+        *,
+        confirmation_id: int,
+        chat_id: int,
+    ) -> sqlite3.Row | None:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                SELECT * FROM pending_confirmations
+                WHERE id = ? AND chat_id = ? AND status = 'pending'
+                """,
+                (confirmation_id, chat_id),
+            )
+            return cursor.fetchone()
+
+    async def resolve_pending_confirmation(
+        self,
+        *,
+        confirmation_id: int,
+        chat_id: int,
+        status: str,
+    ) -> bool:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE pending_confirmations
+                SET status = ?, resolved_at = ?
+                WHERE id = ? AND chat_id = ? AND status = 'pending'
+                """,
+                (status, utc_now(), confirmation_id, chat_id),
+            )
+            db.commit()
+            return cursor.rowcount > 0
+
+    async def set_chat_text_parse_mode(
+        self,
+        *,
+        chat_id: int,
+        mode: str,
+        updated_by: int,
+    ) -> None:
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO chat_settings (
+                    chat_id, text_parse_mode, updated_by, updated_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    text_parse_mode = excluded.text_parse_mode,
+                    updated_by = excluded.updated_by,
+                    updated_at = excluded.updated_at
+                """,
+                (chat_id, mode, updated_by, utc_now()),
+            )
+            db.commit()
+
+    async def get_chat_text_parse_mode(self, *, chat_id: int) -> str | None:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                SELECT text_parse_mode FROM chat_settings
+                WHERE chat_id = ?
+                """,
+                (chat_id,),
+            )
+            row = cursor.fetchone()
+        return row["text_parse_mode"] if row is not None else None
+
+    async def get_cached_categories(self, names: list[str]) -> dict[str, str]:
+        normalized_names = sorted({normalize_item_name(name) for name in names if name})
+        if not normalized_names:
+            return {}
+
+        placeholders = ",".join("?" for _ in normalized_names)
+        with self.connect() as db:
+            cursor = db.execute(
+                f"""
+                SELECT normalized_name, category FROM category_cache
+                WHERE normalized_name IN ({placeholders}) AND expires_at > ?
+                """,
+                (*normalized_names, utc_now()),
+            )
+            rows = cursor.fetchall()
+        return {row["normalized_name"]: row["category"] for row in rows}
+
+    async def set_cached_categories(
+        self,
+        *,
+        categories_by_name: dict[str, str],
+        ttl_seconds: int,
+    ) -> None:
+        if not categories_by_name:
+            return
+
+        now = datetime.now(UTC)
+        expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat(
+            timespec="seconds"
+        )
+        with self.connect() as db:
+            db.executemany(
+                """
+                INSERT INTO category_cache (
+                    normalized_name, category, expires_at, updated_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(normalized_name) DO UPDATE SET
+                    category = excluded.category,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    (
+                        normalize_item_name(name),
+                        category,
+                        expires_at,
+                        now.isoformat(timespec="seconds"),
+                    )
+                    for name, category in categories_by_name.items()
+                ],
+            )
+            db.commit()
+
+    async def create_shop_session(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        items: list[tuple[int, str]],
+    ) -> None:
+        now = utc_now()
+        with self.connect() as db:
+            db.executemany(
+                """
+                INSERT OR REPLACE INTO shop_sessions (
+                    chat_id, message_id, item_id, item_text, checked,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, 0, ?, ?)
+                """,
+                [
+                    (chat_id, message_id, item_id, item_text, now, now)
+                    for item_id, item_text in items
+                ],
+            )
+            db.commit()
+
+    async def get_shop_session_items(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+    ) -> list[sqlite3.Row]:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                SELECT item_id, item_text, checked FROM shop_sessions
+                WHERE chat_id = ? AND message_id = ?
+                ORDER BY rowid
+                """,
+                (chat_id, message_id),
+            )
+            return cursor.fetchall()
+
+    async def set_shop_session_item_checked(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        item_id: int,
+        checked: bool,
+    ) -> bool:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE shop_sessions
+                SET checked = ?, updated_at = ?
+                WHERE chat_id = ? AND message_id = ? AND item_id = ?
+                """,
+                (1 if checked else 0, utc_now(), chat_id, message_id, item_id),
+            )
+            db.commit()
+            return cursor.rowcount > 0
 
     async def _update_matching_items(
         self,

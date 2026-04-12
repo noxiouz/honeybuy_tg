@@ -43,7 +43,7 @@ Optional optimization:
 - `TELEGRAM_BOT_TOKEN`: Telegram bot token from BotFather.
 - `OPENAI_API_KEY`: OpenAI API key.
 - `OWNER_USER_ID`: Telegram user ID of the owner.
-- `ALLOWED_USER_IDS`: comma-separated user IDs allowed to interact in authorized chats.
+- `ALLOWED_USER_IDS`: optional extra user IDs allowed to interact with the bot in private chats.
 - `DATABASE_PATH`: SQLite database path, default `./data/honeybuy.sqlite3`.
 - `OPENAI_PARSE_MODEL`: default `gpt-5.4-mini`.
 - `OPENAI_TRANSCRIBE_MODEL`: default `gpt-4o-mini-transcribe`.
@@ -52,7 +52,7 @@ Optional optimization:
 ## High-Level Architecture
 
 - `bot`: Telegram update handlers and message routing.
-- `auth`: owner allowlist, chat authorization, unauthorized-chat rejection.
+- `auth`: owner identity, chat authorization, unauthorized-chat rejection.
 - `storage`: SQLite schema and repository functions using Python's standard `sqlite3`.
 - `ai`: OpenAI calls for transcription, image parsing, and command parsing.
 - `parser`: structured command schema and validation.
@@ -211,7 +211,7 @@ Acceptance criteria:
 - [x] Add middleware or guard for authorization.
 - [x] Ignore private messages from unknown users.
 - [x] Leave a group when the bot is added by a non-owner user.
-- [x] Allow messages only in authorized chats from `ALLOWED_USER_IDS`.
+- [x] Allow messages in authorized group chats from everyone in that chat.
 - [x] Add `/whoami` command to show user ID and chat ID.
 - [x] Add clear logs for denied access.
 
@@ -266,22 +266,27 @@ Acceptance criteria:
 
 ## Phase 6: Voice Messages
 
-- [ ] Download Telegram voice message files.
-- [ ] Store temporary audio files under a temp directory.
-- [ ] Convert OGG/OPUS to an OpenAI-supported audio format if needed.
-- [ ] Add `ffmpeg` requirement to README.
-- [ ] Transcribe voice with `gpt-4o-mini-transcribe`.
-- [ ] Pass transcript to the same AI text parser used for text messages.
-- [ ] Reply with the transcript and parsed action summary.
-- [ ] Delete temporary files after processing.
-- [ ] Add error handling for failed transcription.
+- [x] Download Telegram voice message files.
+- [x] Store temporary audio files under a temp directory.
+- [x] Convert OGG/OPUS to WebM before transcription.
+- [x] Add `ffmpeg` requirement to README.
+- [x] Transcribe voice with `gpt-4o-mini-transcribe`.
+- [x] Pass transcript to a simple shopping command parser.
+- [x] Reply with the transcript and parsed action summary.
+- [x] Delete temporary files after processing.
+- [x] Add error handling for failed transcription.
+- [x] Reject voice messages over the configured duration limit.
+- [x] Reject voice files over the configured file size limit.
+- [x] Reject transcripts over the configured text length limit.
+- [x] Reanalyze a replied-to voice message when the bot is mentioned.
+- [x] Ask for Buy/Bought/Cancel confirmation when voice transcript is a bare item list.
 
 Acceptance criteria:
 
 - [ ] Voice message "купи молоко и хлеб" adds both items.
 - [ ] Voice message "удали молоко" removes milk.
 - [ ] Voice message "я купил хлеб" marks bread bought.
-- [ ] The bot prints the parsed result after processing.
+- [x] The bot prints the parsed result after processing.
 
 ## Phase 7: Photo Messages
 
@@ -324,6 +329,7 @@ Acceptance criteria:
 
 - [ ] Format confirmations consistently.
 - [ ] Keep shopping-list messages compact.
+- [x] Group shopping-list output by AI-selected grocery category.
 - [ ] Show due dates when present.
 - [ ] Group overdue or due-soon items if useful.
 - [ ] Decide whether bought items are hidden by default.
@@ -376,6 +382,7 @@ Acceptance criteria:
 - [ ] Decide whether to require confirmation before applying photo-parsed items.
 - [ ] Decide whether wife can authorize chats or only the owner can.
 - [ ] Decide whether all text should go through AI, or only text that is not a slash command.
+- [x] Add per-chat setting for natural text parsing: `off`, `mention`, or `all`.
 - [ ] Decide whether to normalize item names aggressively.
 - [ ] Decide whether to keep old bought/removed items forever or periodically clean them up.
 - [ ] Decide whether to add webhooks later.
@@ -403,6 +410,6 @@ The first useful milestone should be:
 After that, add AI in this order:
 
 - [ ] Natural text parsing.
-- [ ] Voice transcription and parsing.
+- [x] Voice transcription and parsing.
 - [ ] Photo parsing.
 - [ ] Reply-context commands.

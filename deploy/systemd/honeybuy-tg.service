@@ -1,0 +1,18 @@
+[Unit]
+Description=Honeybuy Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=honeybuy
+Group=honeybuy
+WorkingDirectory=/opt/honeybuy-tg
+EnvironmentFile=/etc/honeybuy-tg/env
+Environment=UV_CACHE_DIR=/var/cache/honeybuy-tg/uv
+ExecStart=/usr/local/bin/uv run python -m honeybuy_tg
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

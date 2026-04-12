@@ -50,3 +50,117 @@ async def test_authorized_chat(tmp_path):
     )
 
     assert await storage.is_chat_authorized(100)
+
+
+@pytest.mark.asyncio
+async def test_pending_confirmation_lifecycle(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+
+    confirmation_id = await storage.create_pending_confirmation(
+        chat_id=1,
+        user_id=10,
+        source_message_id=100,
+        items_json='["яйца", "масло"]',
+    )
+
+    row = await storage.get_pending_confirmation(
+        confirmation_id=confirmation_id,
+        chat_id=1,
+    )
+    assert row is not None
+    assert row["items_json"] == '["яйца", "масло"]'
+
+    assert await storage.resolve_pending_confirmation(
+        confirmation_id=confirmation_id,
+        chat_id=1,
+        status="confirmed_add",
+    )
+    assert (
+        await storage.get_pending_confirmation(
+            confirmation_id=confirmation_id,
+            chat_id=1,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_text_parse_mode_lifecycle(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+
+    assert await storage.get_chat_text_parse_mode(chat_id=1) is None
+
+    await storage.set_chat_text_parse_mode(
+        chat_id=1,
+        mode="all",
+        updated_by=10,
+    )
+
+    assert await storage.get_chat_text_parse_mode(chat_id=1) == "all"
+
+    await storage.set_chat_text_parse_mode(
+        chat_id=1,
+        mode="mention",
+        updated_by=10,
+    )
+
+    assert await storage.get_chat_text_parse_mode(chat_id=1) == "mention"
+
+
+@pytest.mark.asyncio
+async def test_category_cache_lifecycle(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+
+    assert await storage.get_cached_categories(["Молоко"]) == {}
+
+    await storage.set_cached_categories(
+        categories_by_name={"Молоко": "Молочка"},
+        ttl_seconds=60,
+    )
+
+    assert await storage.get_cached_categories(["молоко"]) == {"молоко": "Молочка"}
+
+
+@pytest.mark.asyncio
+async def test_clear_active_items_is_scoped_by_chat(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+
+    await storage.add_item(chat_id=1, name="Milk", created_by=10)
+    await storage.add_item(chat_id=1, name="Bread", created_by=10)
+    await storage.add_item(chat_id=2, name="Eggs", created_by=20)
+
+    assert await storage.clear_active_items(chat_id=1) == 2
+
+    assert await storage.list_items(chat_id=1) == []
+    assert [item.name for item in await storage.list_items(chat_id=2)] == ["Eggs"]
+
+
+@pytest.mark.asyncio
+async def test_shop_session_lifecycle(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+
+    await storage.create_shop_session(
+        chat_id=1,
+        message_id=100,
+        items=[(1, "Milk"), (2, "Bread")],
+    )
+    assert [
+        (row["item_id"], row["item_text"], row["checked"])
+        for row in await storage.get_shop_session_items(chat_id=1, message_id=100)
+    ] == [(1, "Milk", 0), (2, "Bread", 0)]
+
+    assert await storage.set_shop_session_item_checked(
+        chat_id=1,
+        message_id=100,
+        item_id=1,
+        checked=True,
+    )
+    assert [
+        (row["item_id"], row["item_text"], row["checked"])
+        for row in await storage.get_shop_session_items(chat_id=1, message_id=100)
+    ] == [(1, "Milk", 1), (2, "Bread", 0)]

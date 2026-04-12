@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from typing import Literal
+
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -28,6 +30,30 @@ class Settings(BaseSettings):
     openai_transcribe_model: str = Field(
         default="gpt-4o-mini-transcribe",
         validation_alias="OPENAI_TRANSCRIBE_MODEL",
+    )
+    max_voice_duration_seconds: int = Field(
+        default=120,
+        gt=0,
+        validation_alias="MAX_VOICE_DURATION_SECONDS",
+    )
+    max_voice_file_size_bytes: int = Field(
+        default=10_000_000,
+        gt=0,
+        validation_alias="MAX_VOICE_FILE_SIZE_BYTES",
+    )
+    max_transcript_characters: int = Field(
+        default=4_000,
+        gt=0,
+        validation_alias="MAX_TRANSCRIPT_CHARACTERS",
+    )
+    text_parse_mode: Literal["off", "mention", "all"] = Field(
+        default="mention",
+        validation_alias="TEXT_PARSE_MODE",
+    )
+    category_cache_ttl_seconds: int = Field(
+        default=2_592_000,
+        gt=0,
+        validation_alias="CATEGORY_CACHE_TTL_SECONDS",
     )
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 

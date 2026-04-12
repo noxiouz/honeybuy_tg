@@ -48,3 +48,6 @@ class ShoppingListService:
 
     async def clear_bought(self, *, chat_id: int) -> int:
         return await self.storage.clear_bought(chat_id=chat_id)
+
+    async def clear_active(self, *, chat_id: int) -> int:
+        return await self.storage.clear_active_items(chat_id=chat_id)
