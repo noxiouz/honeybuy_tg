@@ -76,6 +76,11 @@ async def test_pending_confirmation_lifecycle(tmp_path):
         chat_id=1,
         status="confirmed_add",
     )
+    assert not await storage.resolve_pending_confirmation(
+        confirmation_id=confirmation_id,
+        chat_id=1,
+        status="confirmed_add",
+    )
     assert (
         await storage.get_pending_confirmation(
             confirmation_id=confirmation_id,
@@ -83,6 +88,27 @@ async def test_pending_confirmation_lifecycle(tmp_path):
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_bot_message_lookup(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+
+    await storage.save_bot_message(
+        chat_id=1,
+        message_id=100,
+        kind="added",
+        item_ids="1,2",
+    )
+
+    row = await storage.get_bot_message(chat_id=1, message_id=100)
+    latest = await storage.get_latest_bot_message(chat_id=1, kind="added")
+
+    assert row is not None
+    assert row["item_ids"] == "1,2"
+    assert latest is not None
+    assert latest["message_id"] == 100
 
 
 @pytest.mark.asyncio

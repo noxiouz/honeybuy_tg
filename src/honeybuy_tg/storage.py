@@ -333,6 +333,40 @@ class Storage:
             )
             db.commit()
 
+    async def get_bot_message(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+    ) -> sqlite3.Row | None:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                SELECT * FROM bot_messages
+                WHERE chat_id = ? AND message_id = ?
+                """,
+                (chat_id, message_id),
+            )
+            return cursor.fetchone()
+
+    async def get_latest_bot_message(
+        self,
+        *,
+        chat_id: int,
+        kind: str,
+    ) -> sqlite3.Row | None:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                SELECT * FROM bot_messages
+                WHERE chat_id = ? AND kind = ?
+                ORDER BY created_at DESC, message_id DESC
+                LIMIT 1
+                """,
+                (chat_id, kind),
+            )
+            return cursor.fetchone()
+
     async def log_event(
         self,
         *,

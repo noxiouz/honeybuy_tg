@@ -165,3 +165,34 @@ Current safety limits are configured in `.env`:
 - `MAX_VOICE_DURATION_SECONDS=120`
 - `MAX_VOICE_FILE_SIZE_BYTES=10000000`
 - `MAX_TRANSCRIPT_CHARACTERS=4000`
+
+Reply-context commands are supported for tracked bot messages. Reply to an
+`Added` result with `удали это`, `отмени`, `удали то что добавил`, or
+`последнее убери` to remove those newly added items. Reply to a single-item bot
+message with `это куплено` to mark it bought.
+The same reply-context commands also work as voice messages when the voice
+message itself replies to the tracked bot message. AI parsing is also prompted
+to map natural undo phrases to the latest tracked `Added` result.
+
+## Metrics
+
+The bot can expose Prometheus metrics for Grafana dashboards. Enable the local
+HTTP exporter with:
+
+```env
+METRICS_ENABLED=true
+METRICS_HOST=127.0.0.1
+METRICS_PORT=9108
+```
+
+Then configure Prometheus to scrape `http://127.0.0.1:9108/metrics` on the
+server. Keep the exporter bound to localhost unless you put it behind a trusted
+network or reverse proxy.
+
+Useful metric families include:
+
+- `honeybuy_telegram_messages_total`
+- `honeybuy_shopping_actions_total`
+- `honeybuy_ai_requests_total`
+- `honeybuy_ai_request_seconds`
+- `honeybuy_voice_rejections_total`

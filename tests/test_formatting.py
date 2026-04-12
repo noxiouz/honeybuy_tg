@@ -40,16 +40,16 @@ def test_format_items_groups_by_category():
 
     assert text == "\n".join(
         [
-            "Shopping list:",
+            "Shopping list",
             "",
-            "Овощи:",
-            "- помидоры",
+            "Овощи",
+            "• помидоры",
             "",
-            "Молочка:",
-            "- молоко",
+            "Молочка",
+            "• молоко",
             "",
-            "Бакалея:",
-            "- яйца",
+            "Бакалея",
+            "• яйца",
         ]
     )
 
@@ -59,9 +59,9 @@ def test_format_items_without_categories_is_ungrouped():
 
     assert text == "\n".join(
         [
-            "Shopping list:",
-            "- помидоры",
-            "- молоко",
+            "Shopping list",
+            "• помидоры",
+            "• молоко",
         ]
     )
 
@@ -71,7 +71,9 @@ def test_format_shop_mode():
 
     assert text == "\n".join(
         [
-            "Shopping mode:",
+            "Shopping mode",
+            "Tap an item after it is in the cart.",
+            "",
             "☐ помидоры",
             "☐ молоко",
         ]
@@ -88,7 +90,9 @@ def test_format_shop_session_with_checked_item():
 
     assert text == "\n".join(
         [
-            "Shopping mode:",
+            "Shopping mode",
+            "Tap an item after it is in the cart.",
+            "",
             "✅ помидоры",
             "☐ молоко",
         ]

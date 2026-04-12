@@ -15,8 +15,13 @@ fi
 apt-get update
 apt-get install -y ca-certificates curl ffmpeg git
 
-if ! command -v uv >/dev/null 2>&1; then
-  curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+UV_BIN=/usr/local/bin/uv
+if [[ ! -x "$UV_BIN" ]]; then
+  if command -v uv >/dev/null 2>&1; then
+    install -m 0755 "$(command -v uv)" "$UV_BIN"
+  else
+    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+  fi
 fi
 
 if ! id -u honeybuy >/dev/null 2>&1; then
@@ -34,7 +39,7 @@ fi
 
 install -m 0644 deploy/systemd/honeybuy-tg.service "/etc/systemd/system/$SERVICE_NAME.service"
 
-uv sync --frozen
+"$UV_BIN" sync --frozen
 chown -R honeybuy:honeybuy "$APP_DIR/.venv" "$APP_DIR/.uv-cache" 2>/dev/null || true
 
 systemctl daemon-reload

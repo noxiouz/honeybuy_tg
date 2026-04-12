@@ -47,6 +47,9 @@ Optional optimization:
 - `DATABASE_PATH`: SQLite database path, default `./data/honeybuy.sqlite3`.
 - `OPENAI_PARSE_MODEL`: default `gpt-5.4-mini`.
 - `OPENAI_TRANSCRIBE_MODEL`: default `gpt-4o-mini-transcribe`.
+- `METRICS_ENABLED`: enable Prometheus metrics exporter, default `false`.
+- `METRICS_HOST`: metrics bind host, default `127.0.0.1`.
+- `METRICS_PORT`: metrics bind port, default `9108`.
 - `LOG_LEVEL`: default `INFO`.
 
 ## High-Level Architecture
@@ -59,6 +62,7 @@ Optional optimization:
 - `services`: shopping-list operations, conflict handling, deduplication.
 - `ui`: message formatting and inline keyboards.
 - `config`: environment loading and runtime settings.
+- `metrics`: Prometheus counters, histograms, and exporter startup.
 
 ## Data Model
 
@@ -311,18 +315,19 @@ Acceptance criteria:
 
 ## Phase 8: Reply Context Commands
 
-- [ ] Track bot messages that list items.
+- [x] Track bot messages that list items and added-item results.
 - [ ] Support replying to a bot item/list message with:
-  - [ ] "удали это"
-  - [ ] "это куплено"
-  - [ ] voice equivalent of both commands.
-- [ ] Resolve reply targets from `bot_messages`.
+  - [x] "удали это"
+  - [x] "это куплено" for single-item tracked messages.
+  - [x] voice equivalent of both commands.
+- [x] Support "отмени" / "удали что было добавлено..." for tracked added messages.
+- [x] Resolve reply targets from `bot_messages`.
 - [ ] Ask for clarification if one reply maps to multiple possible items.
 - [ ] Add tests for reply-target resolution.
 
 Acceptance criteria:
 
-- [ ] "удали это" works when replying to a single-item bot message.
+- [x] "удали это" works when replying to tracked added-item bot messages.
 - [ ] Ambiguous replies do not delete multiple items accidentally.
 
 ## Phase 9: UX Polish
@@ -357,6 +362,7 @@ Acceptance criteria:
 - [ ] Configure log rotation.
 - [ ] Add backup note for SQLite database.
 - [ ] Add a simple health check command or startup log.
+- [x] Add optional Prometheus metrics exporter for Grafana/Prometheus.
 
 Acceptance criteria:
 

@@ -1,14 +1,16 @@
 import asyncio
 import logging
 import json
+from collections.abc import Awaitable, Callable
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 import re
 import shutil
+from typing import Any
 from tempfile import TemporaryDirectory
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
@@ -18,6 +20,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    TelegramObject,
 )
 
 from honeybuy_tg.ai import ShoppingItemCategorizer, ShoppingTextParser, VoiceTranscriber
@@ -30,10 +33,18 @@ from honeybuy_tg.formatting import (
     format_shop_session,
     format_updated,
 )
+from honeybuy_tg.metrics import (
+    observe_voice_transcript_chars,
+    record_bot_start,
+    record_message,
+    record_shopping_action,
+    record_voice_rejection,
+)
 from honeybuy_tg.models import ShoppingItem
 from honeybuy_tg.parser import (
     ParsedAction,
     ParsedCommand,
+    normalize_text,
     parse_shopping_text,
     parsed_command_from_ai,
 )
@@ -41,6 +52,150 @@ from honeybuy_tg.service import ShoppingListService
 from honeybuy_tg.storage import Storage, normalize_item_name
 
 logger = logging.getLogger(__name__)
+
+LAST_ADDED_REFERENCE = "__last_added__"
+
+CONTEXT_ITEM_REFERENCES = {
+    "это",
+    "этот",
+    "эту",
+    "эти",
+    "this",
+    "that",
+    "it",
+}
+
+UNDO_ADDED_REQUESTS = {
+    "отмени",
+    "отмена",
+    "отмени последнее",
+    "отмени предыдущее",
+    "отмени предыдущие",
+    "отмени добавленное",
+    "удали последнее",
+    "удали предыдущее",
+    "удали предыдущие",
+    "удали добавленное",
+    "убери последнее",
+    "убери предыдущее",
+    "убери предыдущие",
+    "убери добавленное",
+    "последнее убери",
+    "предыдущее убери",
+    "не надо",
+    "не нужно",
+    "undo",
+    "undo last",
+}
+
+
+class MetricsMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        kind = telegram_event_kind(event)
+        try:
+            result = await handler(event, data)
+        except Exception:
+            record_message(kind=kind, status="error")
+            raise
+        record_message(kind=kind, status="ok")
+        return result
+
+
+def telegram_event_kind(event: TelegramObject) -> str:
+    if isinstance(event, CallbackQuery):
+        if event.data:
+            return f"callback:{event.data.split(':', 1)[0]}"
+        return "callback"
+    if isinstance(event, Message):
+        if event.voice:
+            return "voice"
+        if event.photo:
+            return "photo"
+        if event.text:
+            return "text"
+        return "message"
+    return event.__class__.__name__.casefold()
+
+
+async def parse_text_command_with_ai_fallback(
+    text: str,
+    *,
+    text_parser: ShoppingTextParser | None,
+    default_action: ParsedAction | None = None,
+) -> ParsedCommand:
+    if text_parser is not None:
+        try:
+            parsed = parsed_command_from_ai(await text_parser.parse(text))
+            if parsed.action != ParsedAction.UNKNOWN or default_action is None:
+                return parsed
+        except Exception:
+            logger.exception("Failed to parse shopping text with AI")
+    return parse_shopping_text(text, default_action=default_action)
+
+
+def parse_bare_voice_items(text: str) -> ParsedCommand | None:
+    if parse_shopping_text(text).action != ParsedAction.UNKNOWN:
+        return None
+
+    candidate = parse_shopping_text(text, default_action=ParsedAction.ADD_ITEMS)
+    if candidate.action == ParsedAction.ADD_ITEMS and candidate.items:
+        return candidate
+    return None
+
+
+def is_context_item_reference(items: tuple[str, ...]) -> bool:
+    return bool(items) and all(normalize_text(item) in CONTEXT_ITEM_REFERENCES for item in items)
+
+
+def is_last_added_reference(items: tuple[str, ...]) -> bool:
+    return items == (LAST_ADDED_REFERENCE,)
+
+
+def is_undo_added_request(text: str) -> bool:
+    normalized = normalize_text(text)
+    if normalized in UNDO_ADDED_REQUESTS:
+        return True
+    if normalized.endswith(" не надо") or normalized.endswith(" не нужно"):
+        return True
+    return (
+        any(
+            phrase in normalized
+            for phrase in (
+                "что было добавлено",
+                "что добавил",
+                "что добавили",
+                "то что добавил",
+                "то что добавили",
+                "которое добавил",
+                "которое добавили",
+            )
+        )
+        and (
+            normalized.startswith("удали")
+            or normalized.startswith("убери")
+            or normalized.startswith("отмени")
+        )
+    )
+
+
+def parse_item_ids(raw_item_ids: str | None) -> tuple[int, ...]:
+    if not raw_item_ids:
+        return ()
+    item_ids = []
+    for raw_item_id in raw_item_ids.split(","):
+        raw_item_id = raw_item_id.strip()
+        if raw_item_id:
+            item_ids.append(int(raw_item_id))
+    return tuple(item_ids)
+
+
+def voice_reply_context_message(*, voice_message: Message) -> Message | None:
+    return voice_message.reply_to_message
 
 
 def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
@@ -240,6 +395,34 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             ]
         )
 
+    async def save_item_result_message(
+        *,
+        message: Message,
+        kind: str,
+        items: list[ShoppingItem],
+    ) -> None:
+        if not items:
+            return
+        await storage.save_bot_message(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            kind=kind,
+            item_ids=",".join(str(item.id) for item in items),
+        )
+
+    async def answer_item_result(
+        *,
+        message: Message,
+        text: str,
+        kind: str,
+        action: str,
+        source: str,
+        items: list[ShoppingItem],
+    ) -> None:
+        sent = await message.answer(text)
+        record_shopping_action(action=action, source=source, count=len(items))
+        await save_item_result_message(message=sent, kind=kind, items=items)
+
     async def send_list(message: Message) -> None:
         items = await service.list_active(chat_id=message.chat.id)
         categories_by_item_id = await categorize_list_items(items)
@@ -298,6 +481,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         transcript: str | None = None,
     ) -> None:
         prefix = f"Transcript: {transcript}\n\n" if transcript else ""
+        source = "voice" if transcript else "text"
 
         if message.from_user is None:
             return
@@ -311,7 +495,14 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 )
                 for item in parsed.items
             ]
-            await message.answer(prefix + format_updated("Added", added))
+            await answer_item_result(
+                message=message,
+                text=prefix + format_updated("Added", added),
+                kind="added",
+                action="add",
+                source=source,
+                items=added,
+            )
             return
 
         if parsed.action == ParsedAction.REMOVE_ITEMS:
@@ -320,7 +511,14 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 removed.extend(
                     await service.remove_by_name(chat_id=message.chat.id, name=item)
                 )
-            await message.answer(prefix + format_updated("Removed", removed))
+            await answer_item_result(
+                message=message,
+                text=prefix + format_updated("Removed", removed),
+                kind="removed",
+                action="remove",
+                source=source,
+                items=removed,
+            )
             return
 
         if parsed.action == ParsedAction.MARK_BOUGHT:
@@ -332,7 +530,14 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                         name=item,
                     )
                 )
-            await message.answer(prefix + format_updated("Marked bought", bought))
+            await answer_item_result(
+                message=message,
+                text=prefix + format_updated("Marked bought", bought),
+                kind="bought",
+                action="bought",
+                source=source,
+                items=bought,
+            )
             return
 
         if parsed.action == ParsedAction.SHOW_LIST:
@@ -343,6 +548,117 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
 
         clarification = parsed.clarification_question or "I did not understand that."
         await message.answer(prefix + clarification)
+
+    async def update_items_from_ids(
+        *,
+        message: Message,
+        item_ids: tuple[int, ...],
+        action: ParsedAction,
+        source: str,
+    ) -> list[ShoppingItem]:
+        updated: list[ShoppingItem] = []
+        for item_id in item_ids:
+            if action == ParsedAction.REMOVE_ITEMS:
+                item = await service.remove_by_id(
+                    chat_id=message.chat.id,
+                    item_id=item_id,
+                )
+            elif action == ParsedAction.MARK_BOUGHT:
+                item = await service.mark_bought_by_id(
+                    chat_id=message.chat.id,
+                    item_id=item_id,
+                )
+            else:
+                item = None
+            if item is not None:
+                updated.append(item)
+
+        result_action = "Removed" if action == ParsedAction.REMOVE_ITEMS else "Marked bought"
+        kind = "removed" if action == ParsedAction.REMOVE_ITEMS else "bought"
+        metric_action = "remove" if action == ParsedAction.REMOVE_ITEMS else "bought"
+        await answer_item_result(
+            message=message,
+            text=format_updated(result_action, updated),
+            kind=kind,
+            action=metric_action,
+            source=source,
+            items=updated,
+        )
+        return updated
+
+    async def apply_reply_context_command(
+        *,
+        message: Message,
+        parsed: ParsedCommand,
+        text: str,
+        reply_to_message: Message | None = None,
+    ) -> bool:
+        if message.from_user is None:
+            return False
+        target_reply = reply_to_message or message.reply_to_message
+
+        if is_undo_added_request(text) or (
+            parsed.action == ParsedAction.REMOVE_ITEMS
+            and is_last_added_reference(parsed.items)
+        ):
+            row = None
+            if target_reply is not None:
+                row = await storage.get_bot_message(
+                    chat_id=message.chat.id,
+                    message_id=target_reply.message_id,
+                )
+            if row is None:
+                row = await storage.get_latest_bot_message(
+                    chat_id=message.chat.id,
+                    kind="added",
+                )
+            if row is None or row["kind"] != "added":
+                await message.answer("I do not know which added items to undo.")
+                return True
+            item_ids = parse_item_ids(row["item_ids"])
+            if not item_ids:
+                await message.answer("That message has no tracked shopping items.")
+                return True
+            await update_items_from_ids(
+                message=message,
+                item_ids=item_ids,
+                action=ParsedAction.REMOVE_ITEMS,
+                source="reply_context",
+            )
+            return True
+
+        if target_reply is None:
+            return False
+        if parsed.action not in {ParsedAction.REMOVE_ITEMS, ParsedAction.MARK_BOUGHT}:
+            return False
+        if not is_context_item_reference(parsed.items):
+            return False
+
+        row = await storage.get_bot_message(
+            chat_id=message.chat.id,
+            message_id=target_reply.message_id,
+        )
+        if row is None:
+            await message.answer("I cannot map that reply to shopping-list items.")
+            return True
+
+        item_ids = parse_item_ids(row["item_ids"])
+        if not item_ids:
+            await message.answer("That message has no tracked shopping items.")
+            return True
+        if row["kind"] != "added" and len(item_ids) > 1:
+            await message.answer(
+                "That message has multiple items. Reply with the exact item name."
+            )
+            return True
+
+        await update_items_from_ids(
+            message=message,
+            item_ids=item_ids,
+            action=parsed.action,
+            source="reply_context",
+        )
+        return True
 
     async def ask_voice_items_confirmation(
         *,
@@ -373,12 +689,11 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         *,
         default_action: ParsedAction | None = None,
     ) -> ParsedCommand:
-        if text_parser is not None:
-            try:
-                return parsed_command_from_ai(await text_parser.parse(text))
-            except Exception:
-                logger.exception("Failed to parse shopping text with AI")
-        return parse_shopping_text(text, default_action=default_action)
+        return await parse_text_command_with_ai_fallback(
+            text,
+            text_parser=text_parser,
+            default_action=default_action,
+        )
 
     async def process_voice_source(
         *,
@@ -412,6 +727,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 command_message.chat.id,
                 command_message.from_user.id,
             )
+            record_voice_rejection("duration_limit")
             await command_message.answer(
                 "Voice message is too long. "
                 f"Limit: {settings.max_voice_duration_seconds} seconds."
@@ -426,6 +742,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 command_message.chat.id,
                 command_message.from_user.id,
             )
+            record_voice_rejection("file_size_limit")
             await command_message.answer(
                 "Voice message file is too large. "
                 f"Limit: {settings.max_voice_file_size_bytes // 1_000_000} MB."
@@ -433,6 +750,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             return
         if transcriber is None:
             logger.info("Rejecting voice message because OPENAI_API_KEY is missing")
+            record_voice_rejection("openai_api_key_missing")
             await command_message.answer(
                 "OPENAI_API_KEY is not configured for voice messages."
             )
@@ -454,12 +772,14 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 )
                 transcript = await transcriber.transcribe(webm_path)
 
+            observe_voice_transcript_chars(len(transcript))
             if len(transcript) > settings.max_transcript_characters:
                 logger.info(
                     "Rejecting voice transcript over text limit chat_id=%s user_id=%s",
                     command_message.chat.id,
                     command_message.from_user.id,
                 )
+                record_voice_rejection("transcript_length_limit")
                 await command_message.answer(
                     "Transcribed text is too long. "
                     f"Limit: {settings.max_transcript_characters} characters."
@@ -467,12 +787,43 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 return
 
             parsed = await parse_text_with_ai_fallback(transcript)
-            if parsed.action == ParsedAction.UNKNOWN:
-                candidate = await parse_text_with_ai_fallback(
-                    transcript,
-                    default_action=ParsedAction.ADD_ITEMS,
+            handled_reply_context = await apply_reply_context_command(
+                message=command_message,
+                parsed=parsed,
+                text=transcript,
+                reply_to_message=voice_reply_context_message(
+                    voice_message=voice_message,
+                ),
+            )
+            if handled_reply_context:
+                await storage.log_event(
+                    chat_id=command_message.chat.id,
+                    user_id=command_message.from_user.id,
+                    telegram_message_id=voice_message.message_id,
+                    input_type="voice",
+                    raw_text=transcript,
+                    ai_result_json=json.dumps(
+                        {
+                            "source": source,
+                            "action": parsed.action.value,
+                            "items": list(parsed.items),
+                            "needs_confirmation": parsed.needs_confirmation,
+                            "reply_context": True,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    status="ok",
                 )
-                if candidate.items:
+                return
+            if parsed.action in {ParsedAction.UNKNOWN, ParsedAction.ADD_ITEMS}:
+                if parsed.action == ParsedAction.UNKNOWN:
+                    candidate = await parse_text_with_ai_fallback(
+                        transcript,
+                        default_action=ParsedAction.ADD_ITEMS,
+                    )
+                else:
+                    candidate = parse_bare_voice_items(transcript)
+                if candidate is not None and candidate.items:
                     await ask_voice_items_confirmation(
                         message=command_message,
                         voice_message=voice_message,
@@ -552,16 +903,31 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
 
         items = tuple(json.loads(row["items_json"]))
         if action == "cancel":
-            await storage.resolve_pending_confirmation(
+            resolved = await storage.resolve_pending_confirmation(
                 confirmation_id=confirmation_id,
                 chat_id=callback.message.chat.id,
                 status="cancelled",
             )
+            if not resolved:
+                await callback.answer(
+                    "This confirmation is no longer active", show_alert=True
+                )
+                return
             await callback.message.edit_text("Cancelled.")
             await callback.answer("Cancelled")
             return
 
         if action == "add":
+            resolved = await storage.resolve_pending_confirmation(
+                confirmation_id=confirmation_id,
+                chat_id=callback.message.chat.id,
+                status="confirmed_add",
+            )
+            if not resolved:
+                await callback.answer(
+                    "This confirmation is no longer active", show_alert=True
+                )
+                return
             added = [
                 await service.add_item(
                     chat_id=callback.message.chat.id,
@@ -570,16 +936,27 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 )
                 for item in items
             ]
-            await storage.resolve_pending_confirmation(
-                confirmation_id=confirmation_id,
-                chat_id=callback.message.chat.id,
-                status="confirmed_add",
-            )
             await callback.message.edit_text(format_updated("Added", added))
+            record_shopping_action(action="add", source="voice_confirmation", count=len(added))
+            await save_item_result_message(
+                message=callback.message,
+                kind="added",
+                items=added,
+            )
             await callback.answer("Added")
             return
 
         if action == "bought":
+            resolved = await storage.resolve_pending_confirmation(
+                confirmation_id=confirmation_id,
+                chat_id=callback.message.chat.id,
+                status="confirmed_bought",
+            )
+            if not resolved:
+                await callback.answer(
+                    "This confirmation is no longer active", show_alert=True
+                )
+                return
             bought: list[ShoppingItem] = []
             for item in items:
                 bought.extend(
@@ -588,12 +965,17 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                         name=item,
                     )
                 )
-            await storage.resolve_pending_confirmation(
-                confirmation_id=confirmation_id,
-                chat_id=callback.message.chat.id,
-                status="confirmed_bought",
-            )
             await callback.message.edit_text(format_updated("Marked bought", bought))
+            record_shopping_action(
+                action="bought",
+                source="voice_confirmation",
+                count=len(bought),
+            )
+            await save_item_result_message(
+                message=callback.message,
+                kind="bought",
+                items=bought,
+            )
             await callback.answer("Marked bought")
             return
 
@@ -701,7 +1083,14 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         except ValueError:
             await message.answer("Usage: /add milk")
             return
-        await message.answer(format_added(item))
+        await answer_item_result(
+            message=message,
+            text=format_added(item),
+            kind="added",
+            action="add",
+            source="command",
+            items=[item],
+        )
 
     @router.message(Command("remove"))
     async def remove_item(message: Message) -> None:
@@ -713,7 +1102,14 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         except ValueError:
             await message.answer("Usage: /remove milk")
             return
-        await message.answer(format_updated("Removed", removed))
+        await answer_item_result(
+            message=message,
+            text=format_updated("Removed", removed),
+            kind="removed",
+            action="remove",
+            source="command",
+            items=removed,
+        )
 
     @router.message(Command("bought"))
     async def bought_item(message: Message) -> None:
@@ -727,13 +1123,21 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         except ValueError:
             await message.answer("Usage: /bought milk")
             return
-        await message.answer(format_updated("Marked bought", bought))
+        await answer_item_result(
+            message=message,
+            text=format_updated("Marked bought", bought),
+            kind="bought",
+            action="bought",
+            source="command",
+            items=bought,
+        )
 
     @router.message(Command("clear_bought"))
     async def clear_bought(message: Message) -> None:
         if not await require_allowed(message):
             return
         count = await service.clear_bought(chat_id=message.chat.id)
+        record_shopping_action(action="clear_bought", source="command", count=count)
         await message.answer(f"Cleared bought items: {count}")
 
     @router.message(Command("clear"))
@@ -838,9 +1242,15 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         ):
             if not await require_allowed(message):
                 return
-            parsed = await parse_text_with_ai_fallback(
-                strip_bot_mention(message.text, bot_username=bot_user.username)
+            parsed_text = strip_bot_mention(message.text, bot_username=bot_user.username)
+            parsed = await parse_text_with_ai_fallback(parsed_text)
+            handled_reply_context = await apply_reply_context_command(
+                message=message,
+                parsed=parsed,
+                text=parsed_text,
             )
+            if handled_reply_context:
+                return
             if parsed.action != ParsedAction.UNKNOWN:
                 await apply_parsed_command(message, parsed)
                 await storage.log_event(
@@ -869,6 +1279,11 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             chat_id=callback.message.chat.id,
             item_id=item_id,
         )
+        record_shopping_action(
+            action="bought",
+            source="button",
+            count=1 if item else 0,
+        )
         await callback.answer("Marked bought" if item else "Item was already updated")
         if callback.message:
             await callback.message.answer(
@@ -885,6 +1300,11 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         item = await service.mark_bought_by_id(
             chat_id=callback.message.chat.id,
             item_id=item_id,
+        )
+        record_shopping_action(
+            action="bought",
+            source="shop_button",
+            count=1 if item else 0,
         )
         await storage.set_shop_session_item_checked(
             chat_id=callback.message.chat.id,
@@ -903,6 +1323,11 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         item = await service.remove_by_id(
             chat_id=callback.message.chat.id,
             item_id=item_id,
+        )
+        record_shopping_action(
+            action="remove",
+            source="button",
+            count=1 if item else 0,
         )
         await callback.answer("Removed" if item else "Item was already updated")
         if callback.message:
@@ -983,6 +1408,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             return
 
         count = await service.clear_active(chat_id=callback.message.chat.id)
+        record_shopping_action(action="clear_active", source="button", count=count)
         await callback.message.edit_text(f"Cleared active shopping items: {count}")
         await callback.answer("Cleared")
 
@@ -1005,6 +1431,8 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         await callback.answer("Chat is not authorized", show_alert=True)
         return False
 
+    router.message.middleware(MetricsMiddleware())
+    router.callback_query.middleware(MetricsMiddleware())
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
     return dispatcher
@@ -1015,6 +1443,7 @@ async def run_bot(settings: Settings, storage: Storage) -> None:
     bot = Bot(token=settings.telegram_bot_token)
     await set_bot_commands(bot)
     dispatcher = build_dispatcher(settings, storage)
+    record_bot_start()
     logger.info(
         "Starting Telegram polling; voice_duration_limit=%ss voice_file_size_limit=%s",
         settings.max_voice_duration_seconds,

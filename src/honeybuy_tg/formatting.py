@@ -23,11 +23,11 @@ def format_items(
     categories_by_item_id: dict[int, str] | None = None,
 ) -> str:
     if not items:
-        return "Shopping list is empty."
-    lines = ["Shopping list:"]
+        return "Shopping list is empty.\n\nSend /add milk or say: купи молоко"
+    lines = ["Shopping list"]
     if not categories_by_item_id:
         for item in items:
-            lines.append(f"- {format_item(item)}")
+            lines.append(f"• {format_item(item)}")
         return "\n".join(lines)
 
     for category, category_items in group_items_by_category(
@@ -36,21 +36,22 @@ def format_items(
     ):
         if category:
             lines.append("")
-            lines.append(f"{category}:")
+            lines.append(category)
         for item in category_items:
-            lines.append(f"- {format_item(item)}")
+            lines.append(f"• {format_item(item)}")
     return "\n".join(lines)
 
 
 def format_added(item: ShoppingItem) -> str:
-    return f"Added: {format_item(item)}"
+    return f"Added\n• {format_item(item)}"
 
 
 def format_updated(action: str, items: list[ShoppingItem]) -> str:
     if not items:
-        return "No matching active items found."
-    names = ", ".join(format_item(item) for item in items)
-    return f"{action}: {names}"
+        return "No matching active items."
+    lines = [action]
+    lines.extend(f"• {format_item(item)}" for item in items)
+    return "\n".join(lines)
 
 
 def format_shop_mode(items: list[ShoppingItem]) -> str:
@@ -62,7 +63,7 @@ def format_shop_mode(items: list[ShoppingItem]) -> str:
 def format_shop_session(items: list[tuple[int, str, bool]]) -> str:
     if not items:
         return "Shopping checklist is empty."
-    lines = ["Shopping mode:"]
+    lines = ["Shopping mode", "Tap an item after it is in the cart.", ""]
     for _, item_text, checked in items:
         marker = "✅" if checked else "☐"
         lines.append(f"{marker} {item_text}")

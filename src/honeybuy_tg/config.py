@@ -55,6 +55,14 @@ class Settings(BaseSettings):
         gt=0,
         validation_alias="CATEGORY_CACHE_TTL_SECONDS",
     )
+    metrics_enabled: bool = Field(default=False, validation_alias="METRICS_ENABLED")
+    metrics_host: str = Field(default="127.0.0.1", validation_alias="METRICS_HOST")
+    metrics_port: int = Field(
+        default=9108,
+        gt=0,
+        le=65535,
+        validation_alias="METRICS_PORT",
+    )
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
     @property

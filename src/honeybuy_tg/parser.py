@@ -192,5 +192,8 @@ def unknown_command() -> ParsedCommand:
     return ParsedCommand(
         action=ParsedAction.UNKNOWN,
         needs_confirmation=True,
-        clarification_question="I could not understand the shopping command.",
+        clarification_question=(
+            "I could not understand that.\n\n"
+            "Try: купи молоко, молоко купил, or удали молоко"
+        ),
     )
