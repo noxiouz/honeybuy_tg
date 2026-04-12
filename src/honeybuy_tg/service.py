@@ -96,21 +96,24 @@ class ShoppingListService:
         user_id: int,
     ) -> list[ShoppingItem]:
         added = []
-        active_names = {
-            item.normalized_name for item in await self.list_active(chat_id=chat_id)
-        }
+        active_names = set()
+        for item in await self.list_active(chat_id=chat_id):
+            active_names.add(item.normalized_name)
+            active_names.add(recipe_ingredient_base_name(item.name))
         for ingredient in recipe.ingredients:
             item_name = recipe_ingredient_item_name(
                 ingredient.name,
                 ingredient.quantity_text,
             )
             normalized_name = normalize_item_name(item_name)
-            if normalized_name in active_names:
+            base_name = recipe_ingredient_base_name(item_name)
+            if normalized_name in active_names or base_name in active_names:
                 continue
             added.append(
                 await self.add_item(chat_id=chat_id, name=item_name, user_id=user_id)
             )
             active_names.add(normalized_name)
+            active_names.add(base_name)
         return added
 
 
@@ -118,3 +121,7 @@ def recipe_ingredient_item_name(name: str, quantity_text: str | None) -> str:
     if quantity_text:
         return f"{name}, {quantity_text}"
     return name
+
+
+def recipe_ingredient_base_name(name: str) -> str:
+    return normalize_item_name(name.split(",", 1)[0])

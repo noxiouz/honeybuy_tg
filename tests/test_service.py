@@ -73,3 +73,30 @@ async def test_service_skips_active_recipe_ingredient_duplicates(tmp_path):
         "fresh dill, 8 sprigs",
         "water",
     ]
+
+
+@pytest.mark.asyncio
+async def test_service_skips_recipe_ingredient_when_base_item_exists(tmp_path):
+    service = ShoppingListService(Storage(tmp_path / "test.sqlite3"))
+    await service.storage.init()
+
+    await service.add_item(chat_id=1, name="tomato paste", user_id=10)
+    recipe = await service.save_recipe(
+        chat_id=1,
+        name="Солянка",
+        source_url=None,
+        user_id=10,
+        ingredients=[("tomato paste", "60 g"), ("lemon", "6 slices")],
+    )
+
+    added = await service.add_recipe_ingredients(
+        chat_id=1,
+        recipe=recipe,
+        user_id=10,
+    )
+
+    assert [item.name for item in added] == ["lemon, 6 slices"]
+    assert [item.name for item in await service.list_active(chat_id=1)] == [
+        "tomato paste",
+        "lemon, 6 slices",
+    ]
