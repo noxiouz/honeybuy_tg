@@ -2,6 +2,31 @@
 
 Private Telegram shopping-list bot for one list per chat.
 
+## Implemented Features
+
+- Chat-scoped shopping lists backed by local SQLite.
+- Private bot access: owner authorization for chats, with all members of an
+  authorized group allowed to use that chat's list.
+- Telegram command suggestions for supported slash commands.
+- Exact commands for adding, removing, buying, listing, shopping mode, clearing
+  bought items, clearing the active list with confirmation, and showing IDs.
+- Natural text parsing with per-chat modes: `off`, `mention`, or `all`.
+- OpenAI-backed voice transcription and command parsing, with limits for voice
+  duration, file size, and transcript length.
+- Reply-based voice reanalysis for group chats where Telegram privacy mode
+  blocks ordinary voice messages.
+- Inline confirmation buttons for bare voice item lists such as `яйца и масло`.
+- Shopping mode checklist with one-tap `Got` buttons and in-message checkmarks.
+- AI-selected grocery categories for `/list`, cached by item name.
+- Reply-context undo/remove/bought commands for tracked bot messages, including
+  voice equivalents.
+- Recipe memory from public recipe links: teach a recipe, store ingredients
+  locally, and later add everything for that recipe.
+- Recipe ingredient deduplication against active list items, including base-name
+  matches like `tomato paste` vs `tomato paste, 60 g`.
+- Optional Prometheus metrics exporter for Grafana/Prometheus.
+- Ubuntu deployment files for `systemd`, `uv`, SQLite data, and `ffmpeg`.
+
 ## Local Setup
 
 Install `uv`, then install dependencies:
