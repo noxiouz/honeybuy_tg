@@ -146,8 +146,6 @@ Optional metrics:
 
 ### Product
 
-- [ ] Photo input: parse shopping-list photos when the caption implies shopping
-  intent.
 - [ ] Pasted recipe text: learn recipes without a URL.
 - [ ] Recipe deletion.
 - [ ] Recipe overwrite confirmation.
@@ -155,6 +153,11 @@ Optional metrics:
 - [ ] Better due-date support in rendered lists.
 - [ ] Optional bought-item history view if it becomes useful.
 - [ ] Decide retention policy for old bought/removed items.
+
+### Deferred
+
+- [ ] Photo input: parse shopping-list photos when the caption implies shopping
+  intent.
 
 ### AI And Cost
 
@@ -178,4 +181,6 @@ Optional metrics:
    work.
 2. Watch production logs after `/list` or `/shop` runs against old rows, because
    those paths backfill canonical identities and remove duplicate active rows.
-3. Start the photo-input phase after the current list-dedupe behavior is stable.
+3. Finish hardening AI response validation and AI metrics status reporting.
+4. Revisit the next product improvement after the current deployed behavior is
+   stable.
