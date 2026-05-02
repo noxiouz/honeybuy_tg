@@ -176,6 +176,44 @@ async def test_recipe_lifecycle(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_delete_recipe_is_scoped_by_chat_and_cascades_ingredients(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+
+    chat_1_recipe = await storage.save_recipe(
+        chat_id=1,
+        name="Солянка",
+        source_url=None,
+        created_by=10,
+        ingredients=[("fresh dill", "8 sprigs")],
+    )
+    await storage.save_recipe(
+        chat_id=2,
+        name="Солянка",
+        source_url=None,
+        created_by=20,
+        ingredients=[("tomato paste", "60 g")],
+    )
+
+    assert await storage.delete_recipe(chat_id=1, name="солянки") is None
+    assert await storage.get_recipe(chat_id=1, name="Солянка") is not None
+
+    deleted = await storage.delete_recipe(chat_id=1, name="солянка")
+
+    assert deleted is not None
+    assert deleted.name == "Солянка"
+    assert await storage.get_recipe(chat_id=1, name="Солянка") is None
+    assert await storage.get_recipe(chat_id=2, name="Солянка") is not None
+    with sqlite3.connect(storage.database_path) as db:
+        db.execute("PRAGMA foreign_keys = ON")
+        ingredient_count = db.execute(
+            "SELECT COUNT(*) FROM recipe_ingredients WHERE recipe_id = ?",
+            (chat_1_recipe.id,),
+        ).fetchone()[0]
+    assert ingredient_count == 0
+
+
+@pytest.mark.asyncio
 async def test_chat_text_parse_mode_lifecycle(tmp_path):
     storage = Storage(tmp_path / "test.sqlite3")
     await storage.init()

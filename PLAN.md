@@ -33,7 +33,7 @@ stores state locally in SQLite.
 - Telegram slash command suggestions are registered on bot startup.
 - Commands: `/whoami`, `/start`, `/help`, `/authorize`, `/list`, `/shop`,
   `/add`, `/remove`, `/bought`, `/clear_bought`, `/clear`, `/recipes`,
-  `/reanalyze`, and `/text_parse_mode`.
+  `/delete_recipe`, `/reanalyze`, and `/text_parse_mode`.
 - `/clear` requires inline-button confirmation.
 - Natural text parsing modes per chat: `off`, `mention`, or `all`.
 - Voice transcription with duration, file-size, and transcript-length limits.
@@ -46,7 +46,7 @@ stores state locally in SQLite.
 - `/list` renders active items grouped by AI-selected grocery category.
 - `/shop` renders a compact checklist and updates the same message with checked
   items.
-- Recipe memory from public recipe links: learn, store, list, and reuse recipes.
+- Recipe memory from public recipe links: learn, store, list, delete, and reuse recipes.
 - Pasted recipe text can be learned and saved without requiring a public URL.
 - Recipe ingredients are deduplicated against active shopping-list items.
 - AI item identity normalization deduplicates equivalent items across languages,
@@ -147,7 +147,7 @@ Optional metrics:
 
 ### Product
 
-- [ ] Recipe deletion.
+- [x] Recipe deletion.
 - [ ] Recipe overwrite confirmation.
 - [ ] Recipe aliases, so one recipe can be recalled by several names.
 - [ ] Better due-date support in rendered lists.
@@ -183,4 +183,4 @@ Optional metrics:
    those paths backfill canonical identities and remove duplicate active rows.
 3. Finish hardening AI response validation and AI metrics status reporting.
 4. Revisit the next product improvement after the current deployed behavior is
-   stable: recipe deletion, overwrite confirmation, and aliases.
+   stable: recipe overwrite confirmation and aliases.

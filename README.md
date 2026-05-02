@@ -20,8 +20,8 @@ Private Telegram shopping-list bot for one list per chat.
 - AI-selected grocery categories for `/list`, cached by item name.
 - Reply-context undo/remove/bought commands for tracked bot messages, including
   voice equivalents.
-- Recipe memory from public recipe links: teach a recipe, store ingredients
-  locally, and later add everything for that recipe.
+- Recipe memory from public recipe links or pasted recipe text: teach a recipe,
+  store ingredients locally, and later add everything for that recipe.
 - Recipe ingredient deduplication against active list items, including base-name
   matches like `tomato paste` vs `tomato paste, 60 g`, plus AI-normalized
   cross-language matches like `томатная паста` vs `tomato paste`.
@@ -137,6 +137,7 @@ env template lives at `deploy/ubuntu/env.example`.
 - `/clear_bought` - remove bought items from active history.
 - `/clear` - clear the whole active list in the current chat, with confirmation.
 - `/recipes` - show saved recipes.
+- `/delete_recipe solyanka` - delete a saved recipe from the current chat.
 - `/reanalyze` - reanalyze a replied-to voice message.
 - `/text_parse_mode` - configure natural text parsing for the current chat.
 
@@ -202,10 +203,22 @@ The same reply-context commands also work as voice messages when the voice
 message itself replies to the tracked bot message. AI parsing is also prompted
 to map natural undo phrases to the latest tracked `Added` result.
 
-Recipe memory works with public recipe links. Teach a recipe with:
+Recipe memory works with public recipe links and pasted recipe text. Teach a
+recipe from a public URL with:
 
 ```text
 выучи солянку https://cookidoo.co.uk/recipes/recipe/en-GB/r769287
+```
+
+Or paste the recipe body directly:
+
+```text
+Save recipe pancakes
+Ingredients:
+- flour 200 g
+- milk 300 ml
+Steps:
+Mix and cook.
 ```
 
 Then reuse it later:
@@ -216,11 +229,13 @@ Then reuse it later:
 ингредиенты для солянки
 ```
 
-The bot fetches the recipe page, asks OpenAI to extract grocery ingredients,
-stores them in SQLite for the current chat, and adds them to the shopping list
-when requested. Voice commands use AI as a fallback, so the wording does not
-need to match exactly. Pasted recipe text support is still planned; for now,
-send a public recipe link.
+For URL learning, the bot fetches the recipe page; for pasted text, it uses the
+pasted body as the source. In both cases OpenAI extracts grocery ingredients,
+the bot stores them in SQLite for the current chat, and later adds them to the
+shopping list when requested. Voice reuse commands use AI as a fallback, so the
+wording does not need to match exactly. Delete a saved recipe from the current
+chat with `/delete_recipe солянка`; deletion uses the saved recipe name, not
+loose recipe-reuse matching.
 
 ## Metrics
 

@@ -1461,6 +1461,20 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             return
         await message.answer(format_recipe_list(await service.list_recipes(chat_id=message.chat.id)))
 
+    @router.message(Command("delete_recipe"))
+    async def delete_recipe(message: Message) -> None:
+        if not await require_allowed(message):
+            return
+        name = command_argument(message.text, "/delete_recipe")
+        if not name:
+            await message.answer("Usage: /delete_recipe solyanka")
+            return
+        recipe = await service.delete_recipe(chat_id=message.chat.id, name=name)
+        if recipe is None:
+            await message.answer(f"I do not know recipe: {name}")
+            return
+        await message.answer(f"Deleted recipe: {recipe.name}")
+
     @router.message(Command("text_parse_mode"))
     async def text_parse_mode(message: Message) -> None:
         if message.from_user is None:
@@ -1779,6 +1793,7 @@ def help_text() -> str:
             "/clear_bought - clear bought items",
             "/clear - clear the whole active list with confirmation",
             "/recipes - show saved recipes",
+            "/delete_recipe solyanka - delete a saved recipe",
             "/text_parse_mode - configure natural text parsing in this chat",
             "Reply to a voice message with @bot_username to reanalyze it",
             "/whoami - show user and chat IDs",
@@ -1850,6 +1865,7 @@ async def set_bot_commands(bot: Bot) -> None:
             BotCommand(command="clear_bought", description="Clear bought items"),
             BotCommand(command="clear", description="Clear active list"),
             BotCommand(command="recipes", description="Show saved recipes"),
+            BotCommand(command="delete_recipe", description="Delete a saved recipe"),
             BotCommand(command="reanalyze", description="Reanalyze replied voice"),
             BotCommand(command="text_parse_mode", description="Set text parsing mode"),
         ]

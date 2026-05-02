@@ -133,6 +133,12 @@ class ShoppingListService:
     async def list_recipes(self, *, chat_id: int) -> list[Recipe]:
         return await self.storage.list_recipes(chat_id=chat_id)
 
+    async def delete_recipe(self, *, chat_id: int, name: str) -> Recipe | None:
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("Recipe name is required")
+        return await self.storage.delete_recipe(chat_id=chat_id, name=clean_name)
+
     async def add_recipe_ingredients(
         self,
         *,

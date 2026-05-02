@@ -95,6 +95,25 @@ async def test_service_saves_pasted_recipe_without_source_url(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_service_deletes_recipe(tmp_path):
+    service = ShoppingListService(Storage(tmp_path / "test.sqlite3"))
+    await service.storage.init()
+    await service.save_recipe(
+        chat_id=1,
+        name="Pancakes",
+        source_url=None,
+        user_id=10,
+        ingredients=[("flour", "200 g")],
+    )
+
+    deleted = await service.delete_recipe(chat_id=1, name="pancakes")
+
+    assert deleted is not None
+    assert deleted.name == "Pancakes"
+    assert await service.get_recipe(chat_id=1, name="pancakes") is None
+
+
+@pytest.mark.asyncio
 async def test_service_skips_active_recipe_ingredient_duplicates(tmp_path):
     service = ShoppingListService(Storage(tmp_path / "test.sqlite3"))
     await service.storage.init()

@@ -689,6 +689,48 @@ async def test_effective_text_parse_mode_uses_default():
 
 
 @pytest.mark.asyncio
+async def test_delete_recipe_command_deletes_saved_recipe(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    await storage.save_recipe(
+        chat_id=1,
+        name="Pancakes",
+        source_url=None,
+        created_by=42,
+        ingredients=[("flour", "200 g")],
+    )
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+    update = Update.model_validate(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "date": int(datetime.now(UTC).timestamp()),
+                "chat": {"id": 1, "type": "private"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Owner"},
+                "text": "/delete_recipe pancakes",
+                "entities": [{"type": "bot_command", "offset": 0, "length": 14}],
+            },
+        }
+    )
+
+    await dispatcher.feed_update(bot, update)
+
+    sent = next(
+        request for request in session.requests if isinstance(request, SendMessage)
+    )
+    assert sent.text == "Deleted recipe: Pancakes"
+    assert await storage.get_recipe(chat_id=1, name="pancakes") is None
+
+
+@pytest.mark.asyncio
 async def test_shop_command_creates_categorized_session(tmp_path):
     storage = Storage(tmp_path / "test.sqlite3")
     await storage.init()

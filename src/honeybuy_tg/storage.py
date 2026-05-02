@@ -511,6 +511,35 @@ class Storage:
             ).fetchall()
         return row_to_recipe(row, ingredients)
 
+    async def delete_recipe(self, *, chat_id: int, name: str) -> Recipe | None:
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT * FROM recipes
+                WHERE chat_id = ? AND normalized_name = ?
+                """,
+                (chat_id, normalize_item_name(name)),
+            ).fetchone()
+            if row is None:
+                return None
+            ingredients = db.execute(
+                """
+                SELECT * FROM recipe_ingredients
+                WHERE recipe_id = ?
+                ORDER BY position, id
+                """,
+                (row["id"],),
+            ).fetchall()
+            cursor = db.execute(
+                """
+                DELETE FROM recipes
+                WHERE chat_id = ? AND id = ?
+                """,
+                (chat_id, row["id"]),
+            )
+            db.commit()
+        return row_to_recipe(row, ingredients) if cursor.rowcount else None
+
     def _find_recipe_by_lookup_name(
         self,
         *,
