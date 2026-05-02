@@ -94,6 +94,10 @@ class ShoppingListService:
         source_url: str | None,
         user_id: int,
         ingredients: list[tuple[str, str | None]],
+        overwrite: bool = False,
+        expected_recipe_id: int | None = None,
+        expected_normalized_name: str | None = None,
+        expected_state_digest: str | None = None,
     ) -> Recipe:
         clean_name = name.strip()
         clean_ingredients = [
@@ -122,6 +126,10 @@ class ShoppingListService:
                 )
                 for ingredient_name, quantity in clean_ingredients
             ],
+            overwrite=overwrite,
+            expected_recipe_id=expected_recipe_id,
+            expected_normalized_name=expected_normalized_name,
+            expected_state_digest=expected_state_digest,
         )
 
     async def get_recipe(self, *, chat_id: int, name: str) -> Recipe | None:

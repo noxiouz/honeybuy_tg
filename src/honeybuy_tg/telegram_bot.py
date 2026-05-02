@@ -4,6 +4,7 @@ import json
 from collections.abc import Awaitable, Callable
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 import re
 import shutil
@@ -73,7 +74,13 @@ from honeybuy_tg.recipes import (
     should_try_ai_recipe_command,
 )
 from honeybuy_tg.service import ShoppingListService
-from honeybuy_tg.storage import Storage, normalize_item_name
+from honeybuy_tg.storage import (
+    RecipeAlreadyExistsError,
+    StaleRecipeOverwriteError,
+    Storage,
+    normalize_item_name,
+    recipe_state_digest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +118,21 @@ UNDO_ADDED_REQUESTS = {
     "undo",
     "undo last",
 }
+
+
+@dataclass(frozen=True)
+class ExtractedRecipeSave:
+    name: str
+    source_url: str | None
+    ingredients: list[tuple[str, str | None]]
+
+
+def recipe_overwrite_target_payload(recipe: Recipe) -> dict[str, object]:
+    return {
+        "id": recipe.id,
+        "normalized_name": recipe.normalized_name,
+        "state_digest": recipe_state_digest(recipe),
+    }
 
 
 class MetricsMiddleware(BaseMiddleware):
@@ -258,7 +280,27 @@ async def learn_recipe_from_request(
     service: ShoppingListService,
     chat_id: int,
     user_id: int,
+    overwrite: bool = False,
 ) -> Recipe:
+    extracted_recipe = await extract_recipe_save_from_request(
+        learn_request=learn_request,
+        recipe_extractor=recipe_extractor,
+    )
+    return await service.save_recipe(
+        chat_id=chat_id,
+        name=extracted_recipe.name,
+        source_url=extracted_recipe.source_url,
+        user_id=user_id,
+        ingredients=extracted_recipe.ingredients,
+        overwrite=overwrite,
+    )
+
+
+async def extract_recipe_save_from_request(
+    *,
+    learn_request: LearnRecipeRequest,
+    recipe_extractor: RecipeExtractor,
+) -> ExtractedRecipeSave:
     if learn_request.recipe_text is not None:
         page_text = learn_request.recipe_text
         source_url = None
@@ -273,11 +315,9 @@ async def learn_recipe_from_request(
         source_url=source_url,
         page_text=page_text,
     )
-    return await service.save_recipe(
-        chat_id=chat_id,
+    return ExtractedRecipeSave(
         name=recipe_name_from_ai(payload, fallback=learn_request.name),
         source_url=source_url,
-        user_id=user_id,
         ingredients=recipe_ingredients_from_ai(payload),
     )
 
@@ -536,6 +576,22 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             ]
         )
 
+    def recipe_overwrite_keyboard(confirmation_id: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Replace recipe",
+                        callback_data=f"recipe_overwrite:confirm:{confirmation_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Cancel",
+                        callback_data=f"recipe_overwrite:cancel:{confirmation_id}",
+                    ),
+                ]
+            ]
+        )
+
     async def save_item_result_message(
         *,
         message: Message,
@@ -563,6 +619,37 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         sent = await message.answer(text)
         record_shopping_action(action=action, source=source, count=len(items))
         await save_item_result_message(message=sent, kind=kind, items=items)
+
+    async def ask_recipe_overwrite_confirmation(
+        *,
+        message: Message,
+        existing_recipe: Recipe,
+        extracted_recipe: ExtractedRecipeSave,
+    ) -> None:
+        if message.from_user is None:
+            return
+        confirmation_id = await storage.create_pending_confirmation(
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+            source_message_id=message.message_id,
+            items_json=json.dumps(
+                {
+                    "type": "recipe_overwrite",
+                    "name": extracted_recipe.name,
+                    "source_url": extracted_recipe.source_url,
+                    "ingredients": extracted_recipe.ingredients,
+                    "target_recipe": recipe_overwrite_target_payload(
+                        existing_recipe
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        await message.answer(
+            f"Recipe already exists: {existing_recipe.name}\n"
+            f"Replace it with {extracted_recipe.name}?",
+            reply_markup=recipe_overwrite_keyboard(confirmation_id),
+        )
 
     async def apply_recipe_command(message: Message, text: str, *, source: str) -> bool:
         if message.from_user is None:
@@ -626,13 +713,24 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 return True
 
             try:
-                recipe = await learn_recipe_from_request(
+                extracted_recipe = await extract_recipe_save_from_request(
                     learn_request=learn_request,
                     recipe_extractor=recipe_extractor,
-                    service=service,
-                    chat_id=message.chat.id,
-                    user_id=message.from_user.id,
                 )
+                recipe = await service.save_recipe(
+                    chat_id=message.chat.id,
+                    name=extracted_recipe.name,
+                    source_url=extracted_recipe.source_url,
+                    user_id=message.from_user.id,
+                    ingredients=extracted_recipe.ingredients,
+                )
+            except RecipeAlreadyExistsError as error:
+                await ask_recipe_overwrite_confirmation(
+                    message=message,
+                    existing_recipe=error.recipe,
+                    extracted_recipe=extracted_recipe,
+                )
+                return True
             except Exception as error:
                 logger.exception("Failed to learn recipe")
                 await storage.log_event(
@@ -1264,6 +1362,162 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
 
         await callback.answer("Unknown action", show_alert=True)
 
+    async def apply_recipe_overwrite_confirmation(
+        *,
+        callback: CallbackQuery,
+        action: str,
+        confirmation_id: int,
+    ) -> None:
+        if callback.message is None:
+            await callback.answer("Missing message", show_alert=True)
+            return
+        if not await require_allowed_callback(callback):
+            return
+
+        row = await storage.get_pending_confirmation(
+            confirmation_id=confirmation_id,
+            chat_id=callback.message.chat.id,
+        )
+        if row is None:
+            await callback.answer(
+                "This confirmation is no longer active", show_alert=True
+            )
+            return
+        if row["user_id"] != callback.from_user.id:
+            await callback.answer(
+                "Only the requester can confirm this", show_alert=True
+            )
+            return
+
+        try:
+            payload = json.loads(row["items_json"])
+        except json.JSONDecodeError:
+            await callback.answer("Invalid recipe confirmation", show_alert=True)
+            return
+        if not isinstance(payload, dict) or payload.get("type") != "recipe_overwrite":
+            await callback.answer("Unknown confirmation", show_alert=True)
+            return
+
+        if action == "cancel":
+            claimed = await storage.claim_pending_confirmation(
+                confirmation_id=confirmation_id,
+                chat_id=callback.message.chat.id,
+                user_id=callback.from_user.id,
+                status="cancelled_recipe_overwrite",
+            )
+            if claimed is None:
+                await callback.answer(
+                    "This confirmation is no longer active", show_alert=True
+                )
+                return
+            await callback.message.edit_text("Recipe replacement cancelled.")
+            await callback.answer("Cancelled")
+            return
+
+        if action != "confirm":
+            await callback.answer("Unknown action", show_alert=True)
+            return
+
+        name = payload.get("name")
+        source_url = payload.get("source_url")
+        raw_ingredients = payload.get("ingredients")
+        target_recipe = payload.get("target_recipe")
+        if (
+            not isinstance(name, str)
+            or not isinstance(raw_ingredients, list)
+            or not isinstance(target_recipe, dict)
+        ):
+            await callback.answer("Invalid recipe confirmation", show_alert=True)
+            return
+        if source_url is not None and not isinstance(source_url, str):
+            await callback.answer("Invalid recipe confirmation", show_alert=True)
+            return
+        target_id = target_recipe.get("id")
+        target_normalized_name = target_recipe.get("normalized_name")
+        target_state_digest = target_recipe.get("state_digest")
+        if (
+            not isinstance(target_id, int)
+            or not isinstance(target_normalized_name, str)
+            or not isinstance(target_state_digest, str)
+            or normalize_item_name(name) != target_normalized_name
+        ):
+            await callback.answer("Invalid recipe confirmation", show_alert=True)
+            return
+
+        ingredients: list[tuple[str, str | None]] = []
+        for raw_ingredient in raw_ingredients:
+            if not isinstance(raw_ingredient, list) or len(raw_ingredient) != 2:
+                await callback.answer("Invalid recipe confirmation", show_alert=True)
+                return
+            ingredient_name, quantity = raw_ingredient
+            if not isinstance(ingredient_name, str):
+                await callback.answer("Invalid recipe confirmation", show_alert=True)
+                return
+            if quantity is not None and not isinstance(quantity, str):
+                await callback.answer("Invalid recipe confirmation", show_alert=True)
+                return
+            ingredients.append((ingredient_name, quantity))
+
+        claimed = await storage.claim_pending_confirmation(
+            confirmation_id=confirmation_id,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+            status="claiming_recipe_overwrite",
+        )
+        if claimed is None:
+            await callback.answer(
+                "This confirmation is no longer active", show_alert=True
+            )
+            return
+
+        async def mark_stale_recipe_overwrite() -> None:
+            updated = await storage.update_confirmation_status(
+                confirmation_id=confirmation_id,
+                chat_id=callback.message.chat.id,
+                current_status="claiming_recipe_overwrite",
+                status="stale_recipe_overwrite",
+            )
+            if not updated:
+                await callback.answer(
+                    "This confirmation is no longer active", show_alert=True
+                )
+                return
+            await callback.message.edit_text(
+                "Recipe replacement expired because the saved recipe changed. "
+                "Learn it again to replace the current recipe."
+            )
+            await callback.answer("Recipe changed; learn it again", show_alert=True)
+
+        try:
+            recipe = await service.save_recipe(
+                chat_id=callback.message.chat.id,
+                name=name,
+                source_url=source_url,
+                user_id=callback.from_user.id,
+                ingredients=ingredients,
+                overwrite=True,
+                expected_recipe_id=target_id,
+                expected_normalized_name=target_normalized_name,
+                expected_state_digest=target_state_digest,
+            )
+        except StaleRecipeOverwriteError:
+            await mark_stale_recipe_overwrite()
+            return
+
+        resolved = await storage.update_confirmation_status(
+            confirmation_id=confirmation_id,
+            chat_id=callback.message.chat.id,
+            current_status="claiming_recipe_overwrite",
+            status="confirmed_recipe_overwrite",
+        )
+        if not resolved:
+            await callback.answer(
+                "This confirmation is no longer active", show_alert=True
+            )
+            return
+        await callback.message.edit_text(format_recipe_saved(recipe))
+        await callback.answer("Replaced")
+
     @router.my_chat_member()
     async def on_my_chat_member(event: ChatMemberUpdated, bot: Bot) -> None:
         new_status = event.new_chat_member.status
@@ -1664,6 +1918,26 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             callback=callback,
             action=action,
             confirmation_id=int(raw_confirmation_id),
+        )
+
+    @router.callback_query(F.data.startswith("recipe_overwrite:"))
+    async def recipe_overwrite_callback(callback: CallbackQuery) -> None:
+        if callback.data is None:
+            return
+        parts = callback.data.split(":")
+        if len(parts) != 3:
+            await callback.answer("Invalid recipe confirmation", show_alert=True)
+            return
+        _, action, raw_confirmation_id = parts
+        try:
+            confirmation_id = int(raw_confirmation_id)
+        except ValueError:
+            await callback.answer("Invalid recipe confirmation", show_alert=True)
+            return
+        await apply_recipe_overwrite_confirmation(
+            callback=callback,
+            action=action,
+            confirmation_id=confirmation_id,
         )
 
     @router.callback_query(F.data.startswith("text_parse_mode:"))

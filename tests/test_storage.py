@@ -3,7 +3,12 @@ import sqlite3
 import pytest
 
 from honeybuy_tg.models import ItemIdentity, ItemStatus
-from honeybuy_tg.storage import Storage
+from honeybuy_tg.storage import (
+    RecipeAlreadyExistsError,
+    StaleRecipeOverwriteError,
+    Storage,
+    recipe_state_digest,
+)
 
 
 @pytest.mark.asyncio
@@ -123,6 +128,50 @@ async def test_pending_confirmation_lifecycle(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_pending_confirmation_claim_is_single_use(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+
+    confirmation_id = await storage.create_pending_confirmation(
+        chat_id=1,
+        user_id=10,
+        source_message_id=100,
+        items_json='["яйца", "масло"]',
+    )
+
+    claimed = await storage.claim_pending_confirmation(
+        confirmation_id=confirmation_id,
+        chat_id=1,
+        user_id=10,
+        status="claiming_recipe_overwrite",
+    )
+
+    assert claimed is not None
+    assert claimed["items_json"] == '["яйца", "масло"]'
+    assert (
+        await storage.get_pending_confirmation(
+            confirmation_id=confirmation_id,
+            chat_id=1,
+        )
+        is None
+    )
+    assert (
+        await storage.claim_pending_confirmation(
+            confirmation_id=confirmation_id,
+            chat_id=1,
+            user_id=10,
+            status="cancelled_recipe_overwrite",
+        )
+        is None
+    )
+    assert not await storage.resolve_pending_confirmation(
+        confirmation_id=confirmation_id,
+        chat_id=1,
+        status="confirmed_add",
+    )
+
+
+@pytest.mark.asyncio
 async def test_bot_message_lookup(tmp_path):
     storage = Storage(tmp_path / "test.sqlite3")
     await storage.init()
@@ -173,6 +222,101 @@ async def test_recipe_lifecycle(tmp_path):
         "60 g",
     ]
     assert [recipe.name for recipe in recipes] == ["Солянка"]
+
+
+@pytest.mark.asyncio
+async def test_save_recipe_requires_explicit_overwrite(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    await storage.save_recipe(
+        chat_id=1,
+        name="Pancakes",
+        source_url=None,
+        created_by=10,
+        ingredients=[("flour", "200 g")],
+    )
+
+    with pytest.raises(RecipeAlreadyExistsError) as error:
+        await storage.save_recipe(
+            chat_id=1,
+            name=" pancakes ",
+            source_url="https://example.com/pancakes",
+            created_by=20,
+            ingredients=[("milk", "300 ml")],
+        )
+
+    assert error.value.recipe.name == "Pancakes"
+    loaded = await storage.get_recipe(chat_id=1, name="pancakes")
+    assert loaded is not None
+    assert loaded.source_url is None
+    assert [(ingredient.name, ingredient.quantity_text) for ingredient in loaded.ingredients] == [
+        ("flour", "200 g")
+    ]
+
+    overwritten = await storage.save_recipe(
+        chat_id=1,
+        name=" pancakes ",
+        source_url="https://example.com/pancakes",
+        created_by=20,
+        ingredients=[("milk", "300 ml")],
+        overwrite=True,
+    )
+
+    assert overwritten.name == "pancakes"
+    assert overwritten.source_url == "https://example.com/pancakes"
+    assert [(ingredient.name, ingredient.quantity_text) for ingredient in overwritten.ingredients] == [
+        ("milk", "300 ml")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_guarded_recipe_overwrite_rejects_same_second_content_change(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        "honeybuy_tg.storage.utc_now",
+        lambda: "2026-05-03T12:00:00+00:00",
+    )
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    original = await storage.save_recipe(
+        chat_id=1,
+        name="Pancakes",
+        source_url=None,
+        created_by=10,
+        ingredients=[("flour", "200 g")],
+    )
+    original_digest = recipe_state_digest(original)
+
+    await storage.save_recipe(
+        chat_id=1,
+        name="Pancakes",
+        source_url=None,
+        created_by=20,
+        ingredients=[("eggs", "2")],
+        overwrite=True,
+    )
+
+    with pytest.raises(StaleRecipeOverwriteError):
+        await storage.save_recipe(
+            chat_id=1,
+            name="Pancakes",
+            source_url=None,
+            created_by=30,
+            ingredients=[("milk", "300 ml")],
+            overwrite=True,
+            expected_recipe_id=original.id,
+            expected_normalized_name=original.normalized_name,
+            expected_state_digest=original_digest,
+        )
+
+    loaded = await storage.get_recipe(chat_id=1, name="pancakes")
+    assert loaded is not None
+    assert loaded.updated_at == original.updated_at
+    assert [(ingredient.name, ingredient.quantity_text) for ingredient in loaded.ingredients] == [
+        ("eggs", "2")
+    ]
 
 
 @pytest.mark.asyncio

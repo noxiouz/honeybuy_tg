@@ -2,7 +2,7 @@ import pytest
 
 from honeybuy_tg.models import ItemIdentity
 from honeybuy_tg.service import ShoppingListService
-from honeybuy_tg.storage import Storage
+from honeybuy_tg.storage import RecipeAlreadyExistsError, Storage
 
 
 class FakeItemNormalizer:
@@ -91,6 +91,47 @@ async def test_service_saves_pasted_recipe_without_source_url(tmp_path):
     assert recipe.source_url is None
     assert [(ingredient.name, ingredient.quantity_text) for ingredient in recipe.ingredients] == [
         ("flour", "200 g")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_service_requires_explicit_recipe_overwrite(tmp_path):
+    service = ShoppingListService(Storage(tmp_path / "test.sqlite3"))
+    await service.storage.init()
+    await service.save_recipe(
+        chat_id=1,
+        name="Pancakes",
+        source_url=None,
+        user_id=10,
+        ingredients=[("flour", "200 g")],
+    )
+
+    with pytest.raises(RecipeAlreadyExistsError):
+        await service.save_recipe(
+            chat_id=1,
+            name=" pancakes ",
+            source_url=None,
+            user_id=20,
+            ingredients=[("milk", "300 ml")],
+        )
+
+    loaded = await service.get_recipe(chat_id=1, name="pancakes")
+    assert loaded is not None
+    assert [(ingredient.name, ingredient.quantity_text) for ingredient in loaded.ingredients] == [
+        ("flour", "200 g")
+    ]
+
+    overwritten = await service.save_recipe(
+        chat_id=1,
+        name=" pancakes ",
+        source_url=None,
+        user_id=20,
+        ingredients=[("milk", "300 ml")],
+        overwrite=True,
+    )
+
+    assert [(ingredient.name, ingredient.quantity_text) for ingredient in overwritten.ingredients] == [
+        ("milk", "300 ml")
     ]
 
 

@@ -1,3 +1,5 @@
+import hashlib
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -14,6 +16,16 @@ from honeybuy_tg.models import (
 )
 
 ShopSessionInput = tuple[int, str] | tuple[int, str, str | None]
+
+
+class RecipeAlreadyExistsError(ValueError):
+    def __init__(self, recipe: Recipe) -> None:
+        super().__init__(f"Recipe already exists: {recipe.name}")
+        self.recipe = recipe
+
+
+class StaleRecipeOverwriteError(ValueError):
+    pass
 
 
 def normalize_item_name(name: str) -> str:
@@ -35,6 +47,28 @@ def parse_dt(value: str | None) -> datetime | None:
     if value is None:
         return None
     return datetime.fromisoformat(value)
+
+
+def recipe_state_digest(recipe: Recipe) -> str:
+    state = {
+        "id": recipe.id,
+        "chat_id": recipe.chat_id,
+        "name": recipe.name,
+        "normalized_name": recipe.normalized_name,
+        "source_url": recipe.source_url,
+        "ingredients": [
+            {
+                "name": ingredient.name,
+                "quantity_text": ingredient.quantity_text,
+                "canonical_name": ingredient.canonical_name,
+                "canonical_key": ingredient.canonical_key,
+                "position": ingredient.position,
+            }
+            for ingredient in recipe.ingredients
+        ],
+    }
+    encoded = json.dumps(state, ensure_ascii=False, sort_keys=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class Storage:
@@ -432,36 +466,156 @@ class Storage:
         name: str,
         source_url: str | None,
         created_by: int,
-        ingredients: list[tuple[str, str | None] | tuple[str, str | None, str, str]],
+        ingredients: list[
+            tuple[str, str | None]
+            | tuple[str, str | None, str | None, str | None]
+        ],
+        overwrite: bool = False,
+        expected_recipe_id: int | None = None,
+        expected_normalized_name: str | None = None,
+        expected_state_digest: str | None = None,
     ) -> Recipe:
         now = utc_now()
         clean_name = " ".join(name.strip().split())
         normalized_name = normalize_item_name(clean_name)
+        if not overwrite and (
+            expected_recipe_id is not None
+            or expected_normalized_name is not None
+            or expected_state_digest is not None
+        ):
+            raise ValueError("Expected recipe state requires overwrite=True")
+        if overwrite and (
+            expected_recipe_id is not None
+            or expected_normalized_name is not None
+            or expected_state_digest is not None
+        ) and (
+            expected_recipe_id is None
+            or expected_normalized_name is None
+            or expected_state_digest is None
+        ):
+            raise ValueError("Expected recipe state is incomplete")
+        if (
+            overwrite
+            and expected_normalized_name is not None
+            and normalized_name != expected_normalized_name
+        ):
+            raise StaleRecipeOverwriteError("Recipe name changed before overwrite")
         with self.connect() as db:
-            cursor = db.execute(
-                """
-                INSERT INTO recipes (
-                    chat_id, name, normalized_name, source_url,
-                    created_by, created_at, updated_at
+            if overwrite and expected_recipe_id is not None:
+                db.execute("BEGIN IMMEDIATE")
+                recipe_row = db.execute(
+                    """
+                    SELECT * FROM recipes
+                    WHERE chat_id = ? AND id = ? AND normalized_name = ?
+                    """,
+                    (
+                        chat_id,
+                        expected_recipe_id,
+                        expected_normalized_name,
+                    ),
+                ).fetchone()
+                if recipe_row is None:
+                    raise StaleRecipeOverwriteError("Recipe changed before overwrite")
+                ingredient_rows = db.execute(
+                    """
+                    SELECT * FROM recipe_ingredients
+                    WHERE recipe_id = ?
+                    ORDER BY position, id
+                    """,
+                    (recipe_row["id"],),
+                ).fetchall()
+                if (
+                    recipe_state_digest(row_to_recipe(recipe_row, ingredient_rows))
+                    != expected_state_digest
+                ):
+                    raise StaleRecipeOverwriteError("Recipe changed before overwrite")
+                db.execute(
+                    """
+                    UPDATE recipes
+                    SET name = ?, normalized_name = ?, source_url = ?, updated_at = ?
+                    WHERE chat_id = ? AND id = ? AND normalized_name = ?
+                    """,
+                    (
+                        clean_name,
+                        normalized_name,
+                        source_url,
+                        now,
+                        chat_id,
+                        expected_recipe_id,
+                        expected_normalized_name,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id, normalized_name) DO UPDATE SET
-                    name = excluded.name,
-                    source_url = excluded.source_url,
-                    updated_at = excluded.updated_at
-                RETURNING id
-                """,
-                (
-                    chat_id,
-                    clean_name,
-                    normalized_name,
-                    source_url,
-                    created_by,
-                    now,
-                    now,
-                ),
-            )
-            recipe_id = cursor.fetchone()["id"]
+                recipe_id = recipe_row["id"]
+            elif overwrite:
+                cursor = db.execute(
+                    """
+                    INSERT INTO recipes (
+                        chat_id, name, normalized_name, source_url,
+                        created_by, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(chat_id, normalized_name) DO UPDATE SET
+                        name = excluded.name,
+                        source_url = excluded.source_url,
+                        updated_at = excluded.updated_at
+                    RETURNING id
+                    """,
+                    (
+                        chat_id,
+                        clean_name,
+                        normalized_name,
+                        source_url,
+                        created_by,
+                        now,
+                        now,
+                    ),
+                )
+                recipe_id = cursor.fetchone()["id"]
+            else:
+                try:
+                    cursor = db.execute(
+                        """
+                        INSERT INTO recipes (
+                            chat_id, name, normalized_name, source_url,
+                            created_by, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        RETURNING id
+                        """,
+                        (
+                            chat_id,
+                            clean_name,
+                            normalized_name,
+                            source_url,
+                            created_by,
+                            now,
+                            now,
+                        ),
+                    )
+                except sqlite3.IntegrityError as error:
+                    if "recipes.chat_id, recipes.normalized_name" not in str(error):
+                        raise
+                    existing_row = db.execute(
+                        """
+                        SELECT * FROM recipes
+                        WHERE chat_id = ? AND normalized_name = ?
+                        """,
+                        (chat_id, normalized_name),
+                    ).fetchone()
+                    if existing_row is None:
+                        raise
+                    existing_ingredients = db.execute(
+                        """
+                        SELECT * FROM recipe_ingredients
+                        WHERE recipe_id = ?
+                        ORDER BY position, id
+                        """,
+                        (existing_row["id"],),
+                    ).fetchall()
+                    raise RecipeAlreadyExistsError(
+                        row_to_recipe(existing_row, existing_ingredients)
+                    ) from error
+                recipe_id = cursor.fetchone()["id"]
             db.execute(
                 "DELETE FROM recipe_ingredients WHERE recipe_id = ?",
                 (recipe_id,),
@@ -719,6 +873,51 @@ class Storage:
                 (confirmation_id, chat_id),
             )
             return cursor.fetchone()
+
+    async def claim_pending_confirmation(
+        self,
+        *,
+        confirmation_id: int,
+        chat_id: int,
+        user_id: int,
+        status: str,
+    ) -> sqlite3.Row | None:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE pending_confirmations
+                SET status = ?, resolved_at = ?
+                WHERE id = ?
+                    AND chat_id = ?
+                    AND user_id = ?
+                    AND status = 'pending'
+                RETURNING *
+                """,
+                (status, utc_now(), confirmation_id, chat_id, user_id),
+            )
+            row = cursor.fetchone()
+            db.commit()
+            return row
+
+    async def update_confirmation_status(
+        self,
+        *,
+        confirmation_id: int,
+        chat_id: int,
+        current_status: str,
+        status: str,
+    ) -> bool:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE pending_confirmations
+                SET status = ?, resolved_at = ?
+                WHERE id = ? AND chat_id = ? AND status = ?
+                """,
+                (status, utc_now(), confirmation_id, chat_id, current_status),
+            )
+            db.commit()
+            return cursor.rowcount > 0
 
     async def resolve_pending_confirmation(
         self,
@@ -1084,7 +1283,10 @@ def row_to_recipe_ingredient(row: sqlite3.Row) -> RecipeIngredient:
 def recipe_ingredient_rows(
     *,
     recipe_id: int,
-    ingredients: list[tuple[str, str | None] | tuple[str, str | None, str, str]],
+    ingredients: list[
+        tuple[str, str | None]
+        | tuple[str, str | None, str | None, str | None]
+    ],
 ) -> list[tuple[int, str, str | None, str | None, str | None, int]]:
     rows = []
     for position, ingredient in enumerate(ingredients, start=1):

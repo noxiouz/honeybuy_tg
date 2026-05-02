@@ -77,7 +77,8 @@ stores state locally in SQLite.
   canonical AI identity, quantity/unit/note, status, and timestamps.
 - `events`: incoming message and parse history.
 - `bot_messages`: tracked bot messages for reply-context commands.
-- `pending_confirmations`: inline confirmation state for ambiguous voice input.
+- `pending_confirmations`: inline confirmation state for ambiguous voice input
+  and recipe overwrite confirmations.
 - `category_cache`: cached AI category labels.
 - `item_normalization_cache`: cached AI canonical grocery identities.
 - `recipes`: saved recipe headers scoped by chat.
@@ -148,7 +149,7 @@ Optional metrics:
 ### Product
 
 - [x] Recipe deletion.
-- [ ] Recipe overwrite confirmation.
+- [x] Recipe overwrite confirmation.
 - [ ] Recipe aliases, so one recipe can be recalled by several names.
 - [ ] Better due-date support in rendered lists.
 - [ ] Optional bought-item history view if it becomes useful.
