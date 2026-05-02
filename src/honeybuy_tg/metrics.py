@@ -1,4 +1,9 @@
+import asyncio
 import logging
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
+from time import perf_counter
 
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
@@ -75,7 +80,64 @@ def record_shopping_action(*, action: str, source: str, count: int = 1) -> None:
         SHOPPING_ACTIONS.labels(action=action, source=source).inc(count)
 
 
-def record_ai_request(*, operation: str, status: str, duration_seconds: float) -> None:
+@dataclass
+class AIRequestReport:
+    status: str = "ok"
+
+    def report_status(self, status: str) -> None:
+        self.status = status
+
+    def report_failure(self, status: str) -> None:
+        if self.status == "ok":
+            self.status = status
+
+
+@contextmanager
+def record_ai_request(*, operation: str) -> Iterator[AIRequestReport]:
+    report = AIRequestReport()
+    started_at = perf_counter()
+    try:
+        yield report
+    except asyncio.CancelledError:
+        report.report_failure("cancelled")
+        raise
+    except BaseException:
+        report.report_failure("error")
+        raise
+    finally:
+        _observe_ai_request(
+            operation=operation,
+            status=report.status,
+            duration_seconds=perf_counter() - started_at,
+        )
+
+
+@asynccontextmanager
+async def record_ai_request_async(*, operation: str) -> AsyncIterator[AIRequestReport]:
+    report = AIRequestReport()
+    started_at = perf_counter()
+    try:
+        yield report
+    except asyncio.CancelledError:
+        report.report_failure("cancelled")
+        raise
+    except Exception:
+        report.report_failure("error")
+        raise
+    except BaseException:
+        report.report_failure("error")
+        raise
+    finally:
+        _observe_ai_request(
+            operation=operation,
+            status=report.status,
+            duration_seconds=perf_counter() - started_at,
+        )
+
+
+def _observe_ai_request(
+    *, operation: str, status: str, duration_seconds: float
+) -> None:
     AI_REQUESTS.labels(operation=operation, status=status).inc()
     AI_REQUEST_SECONDS.labels(operation=operation).observe(duration_seconds)
 

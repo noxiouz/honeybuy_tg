@@ -1,11 +1,144 @@
 import json
 from pathlib import Path
-from time import perf_counter
+from typing import Literal, TypeVar
 
 from openai import AsyncOpenAI
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
-from honeybuy_tg.metrics import record_ai_request
+from honeybuy_tg.metrics import AIRequestReport, record_ai_request_async
 from honeybuy_tg.models import ItemIdentity
+
+
+ResponseModelT = TypeVar("ResponseModelT", bound="AIResponseModel")
+
+
+def clean_required_text(value: str) -> str:
+    value = " ".join(value.strip().split())
+    if not value:
+        raise ValueError("Field must not be empty")
+    return value
+
+
+class AIResponseModel(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+
+class CategorizedItemResponse(AIResponseModel):
+    id: int
+    category: str = Field(min_length=1)
+
+    @field_validator("category")
+    @classmethod
+    def clean_category(cls, value: str) -> str:
+        return clean_required_text(value)
+
+
+class CategoryParseResponse(AIResponseModel):
+    items: list[CategorizedItemResponse]
+
+
+class NormalizedItemResponse(AIResponseModel):
+    name: str = Field(min_length=1)
+    canonical_name: str = Field(min_length=1)
+    canonical_key: str = Field(min_length=1)
+
+    @field_validator("name", "canonical_name", "canonical_key")
+    @classmethod
+    def clean_text(cls, value: str) -> str:
+        return clean_required_text(value)
+
+
+class ItemNormalizationResponse(AIResponseModel):
+    items: list[NormalizedItemResponse]
+
+
+class ShoppingTextParseResponse(AIResponseModel):
+    action: Literal[
+        "add_items",
+        "remove_items",
+        "mark_bought",
+        "show_list",
+        "unknown",
+    ]
+    items: list[str]
+    needs_confirmation: bool
+    clarification_question: str | None
+
+    @field_validator("items")
+    @classmethod
+    def clean_items(cls, value: list[str]) -> list[str]:
+        return [" ".join(item.strip().split()) for item in value if item.strip()]
+
+    @model_validator(mode="after")
+    def require_items_for_mutating_actions(self) -> "ShoppingTextParseResponse":
+        if self.action in {"add_items", "remove_items", "mark_bought"} and not self.items:
+            raise ValueError("Mutating shopping action must include at least one item")
+        return self
+
+    @field_validator("clarification_question")
+    @classmethod
+    def clean_clarification(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = " ".join(value.strip().split())
+        return value or None
+
+
+class RecipeIngredientResponse(AIResponseModel):
+    name: str = Field(min_length=1)
+    quantity: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value: str) -> str:
+        return clean_required_text(value)
+
+    @field_validator("quantity")
+    @classmethod
+    def clean_quantity(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = " ".join(value.strip().split())
+        return value or None
+
+
+class RecipeExtractResponse(AIResponseModel):
+    name: str = Field(min_length=1)
+    ingredients: list[RecipeIngredientResponse] = Field(min_length=1)
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value: str) -> str:
+        return clean_required_text(value)
+
+
+class RecipeCommandParseResponse(AIResponseModel):
+    action: Literal["learn_recipe", "add_recipe", "unknown"]
+    recipe_name: str | None
+    url: str | None
+
+    @field_validator("recipe_name", "url")
+    @classmethod
+    def clean_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = " ".join(value.strip().split())
+        return value or None
+
+    @model_validator(mode="after")
+    def require_action_fields(self) -> "RecipeCommandParseResponse":
+        if self.action in {"learn_recipe", "add_recipe"} and self.recipe_name is None:
+            raise ValueError("Recipe command action must include recipe_name")
+        if self.action == "learn_recipe" and self.url is None:
+            raise ValueError("learn_recipe action must include url")
+        return self
 
 
 class VoiceTranscriber:
@@ -14,8 +147,7 @@ class VoiceTranscriber:
         self.model = model
 
     async def transcribe(self, audio_path: Path) -> str:
-        started_at = perf_counter()
-        try:
+        async with record_ai_request_async(operation="voice_transcription"):
             with audio_path.open("rb") as audio_file:
                 result = await self.client.audio.transcriptions.create(
                     file=audio_file,
@@ -23,18 +155,6 @@ class VoiceTranscriber:
                     language="ru",
                     prompt="Shopping list commands in Russian and English.",
                 )
-        except Exception:
-            record_ai_request(
-                operation="voice_transcription",
-                status="error",
-                duration_seconds=perf_counter() - started_at,
-            )
-            raise
-        record_ai_request(
-            operation="voice_transcription",
-            status="ok",
-            duration_seconds=perf_counter() - started_at,
-        )
 
         text = getattr(result, "text", None)
         if not text:
@@ -51,8 +171,7 @@ class ShoppingItemCategorizer:
         if not items:
             return {}
 
-        started_at = perf_counter()
-        try:
+        async with record_ai_request_async(operation="category_parse") as report:
             result = await self.client.responses.create(
                 model=self.model,
                 instructions=(
@@ -65,26 +184,14 @@ class ShoppingItemCategorizer:
                 temperature=0,
                 max_output_tokens=600,
             )
-        except Exception:
-            record_ai_request(
-                operation="category_parse",
-                status="error",
-                duration_seconds=perf_counter() - started_at,
+            parsed = parse_ai_json_response(
+                result,
+                CategoryParseResponse,
+                report=report,
             )
-            raise
-        record_ai_request(
-            operation="category_parse",
-            status="ok",
-            duration_seconds=perf_counter() - started_at,
-        )
-        payload = json.loads(response_text(result))
-        categorized_items = payload.get("items", [])
         categories: dict[int, str] = {}
-        for item in categorized_items:
-            item_id = item.get("id")
-            category = item.get("category")
-            if isinstance(item_id, int) and isinstance(category, str) and category:
-                categories[item_id] = category.strip()
+        for item in parsed.items:
+            categories[item.id] = item.category
         return categories
 
 
@@ -101,8 +208,7 @@ class ShoppingItemNormalizer:
         if not unique_names:
             return {}
 
-        started_at = perf_counter()
-        try:
+        async with record_ai_request_async(operation="item_normalize") as report:
             result = await self.client.responses.create(
                 model=self.model,
                 instructions=(
@@ -121,43 +227,19 @@ class ShoppingItemNormalizer:
                 temperature=0,
                 max_output_tokens=900,
             )
-        except Exception:
-            record_ai_request(
-                operation="item_normalize",
-                status="error",
-                duration_seconds=perf_counter() - started_at,
+            parsed = parse_ai_json_response(
+                result,
+                ItemNormalizationResponse,
+                report=report,
             )
-            raise
-        record_ai_request(
-            operation="item_normalize",
-            status="ok",
-            duration_seconds=perf_counter() - started_at,
-        )
 
-        payload = json.loads(response_text(result))
-        normalized_items = payload.get("items", [])
         identities: dict[str, ItemIdentity] = {}
-        if not isinstance(normalized_items, list):
-            return identities
-        for item in normalized_items:
-            if not isinstance(item, dict):
-                continue
-            raw_name = item.get("name")
-            canonical_name = item.get("canonical_name")
-            canonical_key = item.get("canonical_key")
-            if (
-                isinstance(raw_name, str)
-                and raw_name.strip()
-                and isinstance(canonical_name, str)
-                and canonical_name.strip()
-                and isinstance(canonical_key, str)
-                and canonical_key.strip()
-            ):
-                identities[raw_name] = ItemIdentity(
-                    raw_name=raw_name.strip(),
-                    canonical_name=canonical_name.strip(),
-                    canonical_key=canonical_key.strip(),
-                )
+        for item in parsed.items:
+            identities[item.name] = ItemIdentity(
+                raw_name=item.name,
+                canonical_name=item.canonical_name,
+                canonical_key=item.canonical_key,
+            )
         return identities
 
 
@@ -167,8 +249,7 @@ class ShoppingTextParser:
         self.model = model
 
     async def parse(self, text: str) -> dict[str, object]:
-        started_at = perf_counter()
-        try:
+        async with record_ai_request_async(operation="text_parse") as report:
             result = await self.client.responses.create(
                 model=self.model,
                 instructions=(
@@ -189,22 +270,12 @@ class ShoppingTextParser:
                 temperature=0,
                 max_output_tokens=700,
             )
-        except Exception:
-            record_ai_request(
-                operation="text_parse",
-                status="error",
-                duration_seconds=perf_counter() - started_at,
+            parsed = parse_ai_json_response(
+                result,
+                ShoppingTextParseResponse,
+                report=report,
             )
-            raise
-        record_ai_request(
-            operation="text_parse",
-            status="ok",
-            duration_seconds=perf_counter() - started_at,
-        )
-        payload = json.loads(response_text(result))
-        if not isinstance(payload, dict):
-            raise ValueError("AI parser returned non-object JSON")
-        return payload
+        return parsed.model_dump()
 
 
 class RecipeExtractor:
@@ -219,8 +290,7 @@ class RecipeExtractor:
         source_url: str,
         page_text: str,
     ) -> dict[str, object]:
-        started_at = perf_counter()
-        try:
+        async with record_ai_request_async(operation="recipe_extract") as report:
             result = await self.client.responses.create(
                 model=self.model,
                 instructions=(
@@ -243,22 +313,12 @@ class RecipeExtractor:
                 temperature=0,
                 max_output_tokens=2500,
             )
-        except Exception:
-            record_ai_request(
-                operation="recipe_extract",
-                status="error",
-                duration_seconds=perf_counter() - started_at,
+            parsed = parse_ai_json_response(
+                result,
+                RecipeExtractResponse,
+                report=report,
             )
-            raise
-        record_ai_request(
-            operation="recipe_extract",
-            status="ok",
-            duration_seconds=perf_counter() - started_at,
-        )
-        payload = json.loads(response_text(result))
-        if not isinstance(payload, dict):
-            raise ValueError("AI recipe extractor returned non-object JSON")
-        return payload
+        return parsed.model_dump()
 
 
 class RecipeCommandParser:
@@ -267,8 +327,7 @@ class RecipeCommandParser:
         self.model = model
 
     async def parse(self, text: str) -> dict[str, object]:
-        started_at = perf_counter()
-        try:
+        async with record_ai_request_async(operation="recipe_command_parse") as report:
             result = await self.client.responses.create(
                 model=self.model,
                 instructions=(
@@ -276,6 +335,7 @@ class RecipeCommandParser:
                     "valid JSON with shape: "
                     '{"action":"learn_recipe|add_recipe|unknown",'
                     '"recipe_name":"солянка","url":"https://example.com"}. '
+                    "Use null for missing recipe_name or url. "
                     "Use action 'learn_recipe' when the user asks to remember, learn, "
                     "save, or teach a recipe and provides a recipe URL. Use action "
                     "'add_recipe' when the user asks to add/buy ingredients/products "
@@ -288,22 +348,12 @@ class RecipeCommandParser:
                 temperature=0,
                 max_output_tokens=500,
             )
-        except Exception:
-            record_ai_request(
-                operation="recipe_command_parse",
-                status="error",
-                duration_seconds=perf_counter() - started_at,
+            parsed = parse_ai_json_response(
+                result,
+                RecipeCommandParseResponse,
+                report=report,
             )
-            raise
-        record_ai_request(
-            operation="recipe_command_parse",
-            status="ok",
-            duration_seconds=perf_counter() - started_at,
-        )
-        payload = json.loads(response_text(result))
-        if not isinstance(payload, dict):
-            raise ValueError("AI recipe command parser returned non-object JSON")
-        return payload
+        return parsed.model_dump()
 
 
 def response_text(result: object) -> str:
@@ -311,3 +361,19 @@ def response_text(result: object) -> str:
     if isinstance(text, str) and text.strip():
         return text.strip()
     return str(result).strip()
+
+
+def parse_ai_json_response(
+    result: object,
+    response_model: type[ResponseModelT],
+    *,
+    report: AIRequestReport | None = None,
+) -> ResponseModelT:
+    try:
+        return response_model.model_validate_json(response_text(result))
+    except ValidationError as error:
+        if report is not None:
+            report.report_status("invalid_response")
+        raise ValueError(
+            f"AI response did not match {response_model.__name__}"
+        ) from error
