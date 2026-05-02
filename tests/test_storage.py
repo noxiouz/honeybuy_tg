@@ -1,6 +1,6 @@
 import pytest
 
-from honeybuy_tg.models import ItemStatus
+from honeybuy_tg.models import ItemIdentity, ItemStatus
 from honeybuy_tg.storage import Storage
 
 
@@ -33,6 +33,36 @@ async def test_mark_item_bought_by_id(tmp_path):
     assert updated is not None
     assert updated.status == ItemStatus.BOUGHT
     assert updated.bought_at is not None
+
+
+@pytest.mark.asyncio
+async def test_item_identity_lifecycle(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+
+    item = await storage.add_item(
+        chat_id=1,
+        name="Tomato paste",
+        created_by=10,
+        canonical_name="томатная паста",
+        canonical_key="tomato_paste",
+    )
+
+    assert item.canonical_name == "томатная паста"
+    assert item.canonical_key == "tomato_paste"
+
+    updated = await storage.update_item_identity(
+        chat_id=1,
+        item_id=item.id,
+        identity=ItemIdentity(
+            raw_name="Tomato paste",
+            canonical_name="паста томатная",
+            canonical_key="tomato_paste",
+        ),
+    )
+
+    assert updated is not None
+    assert updated.canonical_name == "паста томатная"
 
 
 @pytest.mark.asyncio
@@ -180,6 +210,33 @@ async def test_category_cache_lifecycle(tmp_path):
     )
 
     assert await storage.get_cached_categories(["молоко"]) == {"молоко": "Молочка"}
+
+
+@pytest.mark.asyncio
+async def test_item_normalization_cache_lifecycle(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+
+    assert await storage.get_cached_item_identities(["tomato paste"]) == {}
+
+    await storage.set_cached_item_identities(
+        identities_by_name={
+            "tomato paste": ItemIdentity(
+                raw_name="tomato paste",
+                canonical_name="томатная паста",
+                canonical_key="tomato_paste",
+            )
+        },
+        ttl_seconds=60,
+    )
+
+    assert await storage.get_cached_item_identities(["Tomato Paste"]) == {
+        "tomato paste": ItemIdentity(
+            raw_name="tomato paste",
+            canonical_name="томатная паста",
+            canonical_key="tomato_paste",
+        )
+    }
 
 
 @pytest.mark.asyncio

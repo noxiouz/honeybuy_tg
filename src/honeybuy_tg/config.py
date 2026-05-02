@@ -55,6 +55,11 @@ class Settings(BaseSettings):
         gt=0,
         validation_alias="CATEGORY_CACHE_TTL_SECONDS",
     )
+    item_normalization_cache_ttl_seconds: int = Field(
+        default=7_776_000,
+        gt=0,
+        validation_alias="ITEM_NORMALIZATION_CACHE_TTL_SECONDS",
+    )
     metrics_enabled: bool = Field(default=False, validation_alias="METRICS_ENABLED")
     metrics_host: str = Field(default="127.0.0.1", validation_alias="METRICS_HOST")
     metrics_port: int = Field(

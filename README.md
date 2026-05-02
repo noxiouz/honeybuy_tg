@@ -23,7 +23,8 @@ Private Telegram shopping-list bot for one list per chat.
 - Recipe memory from public recipe links: teach a recipe, store ingredients
   locally, and later add everything for that recipe.
 - Recipe ingredient deduplication against active list items, including base-name
-  matches like `tomato paste` vs `tomato paste, 60 g`.
+  matches like `tomato paste` vs `tomato paste, 60 g`, plus AI-normalized
+  cross-language matches like `томатная паста` vs `tomato paste`.
 - Optional Prometheus metrics exporter for Grafana/Prometheus.
 - Ubuntu deployment files for `systemd`, `uv`, SQLite data, and `ffmpeg`.
 
@@ -139,7 +140,6 @@ env template lives at `deploy/ubuntu/env.example`.
 - `/reanalyze` - reanalyze a replied-to voice message.
 - `/text_parse_mode` - configure natural text parsing for the current chat.
 
-The bot also adds inline `Bought` and `Remove` buttons to list items.
 Use `/shop` when you are in the store: it posts a compact checklist with one
 `Got: item` button per active item. After each tap, the same message is updated
 with a green checkmark next to the bought item.
@@ -148,7 +148,9 @@ shopping list. Owner-only commands such as `/authorize`, `/clear`, and
 `/text_parse_mode` stay restricted to the configured owner.
 Shopping-list output is grouped by AI-selected grocery categories. Categories
 are cached by item name for `CATEGORY_CACHE_TTL_SECONDS` seconds to avoid
-repeated API calls for the same products.
+repeated API calls for the same products. AI item normalization is cached for
+`ITEM_NORMALIZATION_CACHE_TTL_SECONDS` seconds and is used to match equivalent
+items across languages, for example `green beans` and `зелёная фасоль`.
 
 Natural text parsing can react to messages like `яйца купил` and mark matching
 items as bought. Configure it per chat:

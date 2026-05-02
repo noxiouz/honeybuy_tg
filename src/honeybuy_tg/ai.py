@@ -5,6 +5,7 @@ from time import perf_counter
 from openai import AsyncOpenAI
 
 from honeybuy_tg.metrics import record_ai_request
+from honeybuy_tg.models import ItemIdentity
 
 
 class VoiceTranscriber:
@@ -85,6 +86,79 @@ class ShoppingItemCategorizer:
             if isinstance(item_id, int) and isinstance(category, str) and category:
                 categories[item_id] = category.strip()
         return categories
+
+
+class ShoppingItemNormalizer:
+    def __init__(self, *, api_key: str, model: str) -> None:
+        self.client = AsyncOpenAI(api_key=api_key)
+        self.model = model
+
+    async def normalize(self, names: list[str]) -> dict[str, ItemIdentity]:
+        if not names:
+            return {}
+
+        unique_names = list(dict.fromkeys(name for name in names if name.strip()))
+        if not unique_names:
+            return {}
+
+        started_at = perf_counter()
+        try:
+            result = await self.client.responses.create(
+                model=self.model,
+                instructions=(
+                    "Normalize grocery shopping-list items for deduplication across "
+                    "languages. Ignore quantities, units, packaging size, politeness, "
+                    "and filler. Return only valid JSON with this shape: "
+                    '{"items":[{"name":"tomato paste, 60 g",'
+                    '"canonical_name":"томатная паста",'
+                    '"canonical_key":"tomato_paste"}]}. '
+                    "canonical_name should be a short Russian grocery name when "
+                    "possible. canonical_key must be a stable lowercase English slug "
+                    "using a-z, 0-9, and underscores only. Different languages for the "
+                    "same product must have the same canonical_key."
+                ),
+                input=json.dumps({"items": unique_names}, ensure_ascii=False),
+                temperature=0,
+                max_output_tokens=900,
+            )
+        except Exception:
+            record_ai_request(
+                operation="item_normalize",
+                status="error",
+                duration_seconds=perf_counter() - started_at,
+            )
+            raise
+        record_ai_request(
+            operation="item_normalize",
+            status="ok",
+            duration_seconds=perf_counter() - started_at,
+        )
+
+        payload = json.loads(response_text(result))
+        normalized_items = payload.get("items", [])
+        identities: dict[str, ItemIdentity] = {}
+        if not isinstance(normalized_items, list):
+            return identities
+        for item in normalized_items:
+            if not isinstance(item, dict):
+                continue
+            raw_name = item.get("name")
+            canonical_name = item.get("canonical_name")
+            canonical_key = item.get("canonical_key")
+            if (
+                isinstance(raw_name, str)
+                and raw_name.strip()
+                and isinstance(canonical_name, str)
+                and canonical_name.strip()
+                and isinstance(canonical_key, str)
+                and canonical_key.strip()
+            ):
+                identities[raw_name] = ItemIdentity(
+                    raw_name=raw_name.strip(),
+                    canonical_name=canonical_name.strip(),
+                    canonical_key=canonical_key.strip(),
+                )
+        return identities
 
 
 class ShoppingTextParser:

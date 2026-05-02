@@ -25,6 +25,15 @@ class ShoppingItem:
     updated_at: datetime
     bought_at: datetime | None
     removed_at: datetime | None
+    canonical_name: str | None = None
+    canonical_key: str | None = None
+
+
+@dataclass(frozen=True)
+class ItemIdentity:
+    raw_name: str
+    canonical_name: str
+    canonical_key: str
 
 
 @dataclass(frozen=True)
@@ -34,6 +43,8 @@ class RecipeIngredient:
     name: str
     quantity_text: str | None
     position: int
+    canonical_name: str | None = None
+    canonical_key: str | None = None
 
 
 @dataclass(frozen=True)

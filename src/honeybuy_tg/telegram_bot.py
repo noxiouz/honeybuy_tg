@@ -27,6 +27,7 @@ from honeybuy_tg.ai import (
     RecipeCommandParser,
     RecipeExtractor,
     ShoppingItemCategorizer,
+    ShoppingItemNormalizer,
     ShoppingTextParser,
     VoiceTranscriber,
 )
@@ -246,7 +247,6 @@ def recipe_ingredients_from_ai(payload: dict[str, object]) -> list[tuple[str, st
 
 
 def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
-    service = ShoppingListService(storage)
     transcriber = (
         VoiceTranscriber(
             api_key=settings.openai_api_key,
@@ -286,6 +286,19 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         )
         if settings.openai_api_key
         else None
+    )
+    item_normalizer = (
+        ShoppingItemNormalizer(
+            api_key=settings.openai_api_key,
+            model=settings.openai_parse_model,
+        )
+        if settings.openai_api_key
+        else None
+    )
+    service = ShoppingListService(
+        storage,
+        item_normalizer=item_normalizer,
+        normalization_cache_ttl_seconds=settings.item_normalization_cache_ttl_seconds,
     )
     if transcriber is not None and not is_ffmpeg_available():
         logger.warning(
@@ -623,7 +636,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         return True
 
     async def send_list(message: Message) -> None:
-        items = await service.list_active(chat_id=message.chat.id)
+        items = await service.list_active_deduplicated(chat_id=message.chat.id)
         categories_by_item_id = await categorize_list_items(items)
         sent = await message.answer(
             format_items(
@@ -1259,7 +1272,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
     async def shop(message: Message) -> None:
         if not await require_allowed(message):
             return
-        items = await service.list_active(chat_id=message.chat.id)
+        items = await service.list_active_deduplicated(chat_id=message.chat.id)
         sent = await message.answer(
             format_shop_mode(items), reply_markup=shop_keyboard(items)
         )

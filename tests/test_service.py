@@ -1,7 +1,33 @@
 import pytest
 
+from honeybuy_tg.models import ItemIdentity
 from honeybuy_tg.service import ShoppingListService
 from honeybuy_tg.storage import Storage
+
+
+class FakeItemNormalizer:
+    async def normalize(self, names):
+        identities = {}
+        for name in names:
+            if name in {"tomato paste", "томатная паста", "tomato paste, 60 g"}:
+                identities[name] = ItemIdentity(
+                    raw_name=name,
+                    canonical_name="томатная паста",
+                    canonical_key="tomato_paste",
+                )
+            elif name in {"green beans", "зелёная фасоль"}:
+                identities[name] = ItemIdentity(
+                    raw_name=name,
+                    canonical_name="зелёная фасоль",
+                    canonical_key="green_beans",
+                )
+            elif name in {"water", "вода", "water, 1000 g"}:
+                identities[name] = ItemIdentity(
+                    raw_name=name,
+                    canonical_name="вода",
+                    canonical_key="water",
+                )
+        return identities
 
 
 @pytest.mark.asyncio
@@ -99,4 +125,70 @@ async def test_service_skips_recipe_ingredient_when_base_item_exists(tmp_path):
     assert [item.name for item in await service.list_active(chat_id=1)] == [
         "tomato paste",
         "lemon, 6 slices",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_service_skips_recipe_ingredient_with_cross_language_identity(tmp_path):
+    service = ShoppingListService(
+        Storage(tmp_path / "test.sqlite3"),
+        item_normalizer=FakeItemNormalizer(),
+    )
+    await service.storage.init()
+
+    await service.add_item(chat_id=1, name="томатная паста", user_id=10)
+    recipe = await service.save_recipe(
+        chat_id=1,
+        name="Солянка",
+        source_url=None,
+        user_id=10,
+        ingredients=[("tomato paste", "60 g"), ("green beans", None)],
+    )
+
+    added = await service.add_recipe_ingredients(
+        chat_id=1,
+        recipe=recipe,
+        user_id=10,
+    )
+
+    assert [item.name for item in added] == ["green beans"]
+    assert [item.name for item in await service.list_active(chat_id=1)] == [
+        "томатная паста",
+        "green beans",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_service_marks_bought_by_cross_language_identity(tmp_path):
+    service = ShoppingListService(
+        Storage(tmp_path / "test.sqlite3"),
+        item_normalizer=FakeItemNormalizer(),
+    )
+    await service.storage.init()
+
+    await service.add_item(chat_id=1, name="green beans", user_id=10)
+
+    bought = await service.mark_bought_by_name(chat_id=1, name="зелёная фасоль")
+
+    assert [item.name for item in bought] == ["green beans"]
+    assert await service.list_active(chat_id=1) == []
+
+
+@pytest.mark.asyncio
+async def test_service_deduplicates_existing_cross_language_active_items(tmp_path):
+    service = ShoppingListService(
+        Storage(tmp_path / "test.sqlite3"),
+        item_normalizer=FakeItemNormalizer(),
+    )
+    await service.storage.init()
+
+    await service.storage.add_item(chat_id=1, name="water", created_by=10)
+    await service.storage.add_item(chat_id=1, name="вода", created_by=10)
+    await service.storage.add_item(chat_id=1, name="water, 1000 g", created_by=10)
+
+    items = await service.list_active_deduplicated(chat_id=1)
+
+    assert [item.name for item in items] == ["water, 1000 g"]
+    assert [item.name for item in await service.list_active(chat_id=1)] == [
+        "water, 1000 g"
     ]

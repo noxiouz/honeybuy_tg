@@ -5,7 +5,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from honeybuy_tg.models import ItemStatus, Recipe, RecipeIngredient, ShoppingItem
+from honeybuy_tg.models import (
+    ItemIdentity,
+    ItemStatus,
+    Recipe,
+    RecipeIngredient,
+    ShoppingItem,
+)
 
 
 def normalize_item_name(name: str) -> str:
@@ -58,6 +64,8 @@ class Storage:
                     chat_id INTEGER NOT NULL,
                     name TEXT NOT NULL,
                     normalized_name TEXT NOT NULL,
+                    canonical_name TEXT,
+                    canonical_key TEXT,
                     quantity REAL,
                     unit TEXT,
                     note TEXT,
@@ -126,6 +134,14 @@ class Storage:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS item_normalization_cache (
+                    raw_normalized_name TEXT PRIMARY KEY,
+                    canonical_name TEXT NOT NULL,
+                    canonical_key TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS shop_sessions (
                     chat_id INTEGER NOT NULL,
                     message_id INTEGER NOT NULL,
@@ -154,6 +170,8 @@ class Storage:
                     recipe_id INTEGER NOT NULL,
                     name TEXT NOT NULL,
                     quantity_text TEXT,
+                    canonical_name TEXT,
+                    canonical_key TEXT,
                     position INTEGER NOT NULL,
                     FOREIGN KEY (recipe_id) REFERENCES recipes (id) ON DELETE CASCADE
                 );
@@ -162,7 +180,36 @@ class Storage:
                     ON recipes (chat_id, normalized_name);
                 """
             )
+            self._ensure_schema(db)
             db.commit()
+
+    def _ensure_schema(self, db: sqlite3.Connection) -> None:
+        self._ensure_column(db, "shopping_items", "canonical_name", "TEXT")
+        self._ensure_column(db, "shopping_items", "canonical_key", "TEXT")
+        self._ensure_column(db, "recipe_ingredients", "canonical_name", "TEXT")
+        self._ensure_column(db, "recipe_ingredients", "canonical_key", "TEXT")
+        db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_shopping_items_chat_canonical_key
+                ON shopping_items (chat_id, canonical_key)
+            """
+        )
+
+    def _ensure_column(
+        self,
+        db: sqlite3.Connection,
+        table_name: str,
+        column_name: str,
+        column_definition: str,
+    ) -> None:
+        columns = {
+            row["name"]
+            for row in db.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        if column_name not in columns:
+            db.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
+            )
 
     async def authorize_chat(
         self,
@@ -203,6 +250,8 @@ class Storage:
         chat_id: int,
         name: str,
         created_by: int,
+        canonical_name: str | None = None,
+        canonical_key: str | None = None,
         quantity: float | None = None,
         unit: str | None = None,
         note: str | None = None,
@@ -214,15 +263,18 @@ class Storage:
             cursor = db.execute(
                 """
                 INSERT INTO shopping_items (
-                    chat_id, name, normalized_name, quantity, unit, note, due_date,
-                    status, created_by, created_at, updated_at
+                    chat_id, name, normalized_name, canonical_name, canonical_key,
+                    quantity, unit, note, due_date, status, created_by, created_at,
+                    updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     chat_id,
                     clean_name,
                     normalize_item_name(clean_name),
+                    canonical_name,
+                    canonical_key,
                     quantity,
                     unit,
                     note,
@@ -252,6 +304,31 @@ class Storage:
             )
             row = cursor.fetchone()
         return row_to_item(row) if row is not None else None
+
+    async def update_item_identity(
+        self,
+        *,
+        chat_id: int,
+        item_id: int,
+        identity: ItemIdentity,
+    ) -> ShoppingItem | None:
+        with self.connect() as db:
+            db.execute(
+                """
+                UPDATE shopping_items
+                SET canonical_name = ?, canonical_key = ?, updated_at = ?
+                WHERE chat_id = ? AND id = ?
+                """,
+                (
+                    identity.canonical_name,
+                    identity.canonical_key,
+                    utc_now(),
+                    chat_id,
+                    item_id,
+                ),
+            )
+            db.commit()
+        return await self.get_item(chat_id=chat_id, item_id=item_id)
 
     async def list_items(
         self,
@@ -351,7 +428,7 @@ class Storage:
         name: str,
         source_url: str | None,
         created_by: int,
-        ingredients: list[tuple[str, str | None]],
+        ingredients: list[tuple[str, str | None] | tuple[str, str | None, str, str]],
     ) -> Recipe:
         now = utc_now()
         clean_name = " ".join(name.strip().split())
@@ -388,23 +465,12 @@ class Storage:
             db.executemany(
                 """
                 INSERT INTO recipe_ingredients (
-                    recipe_id, name, quantity_text, position
+                    recipe_id, name, quantity_text, canonical_name, canonical_key,
+                    position
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                [
-                    (
-                        recipe_id,
-                        " ".join(ingredient_name.strip().split()),
-                        " ".join(quantity.strip().split()) if quantity else None,
-                        position,
-                    )
-                    for position, (ingredient_name, quantity) in enumerate(
-                        ingredients,
-                        start=1,
-                    )
-                    if ingredient_name.strip()
-                ],
+                recipe_ingredient_rows(recipe_id=recipe_id, ingredients=ingredients),
             )
             db.commit()
 
@@ -729,6 +795,74 @@ class Storage:
             )
             db.commit()
 
+    async def get_cached_item_identities(
+        self,
+        names: list[str],
+    ) -> dict[str, ItemIdentity]:
+        normalized_names = sorted({normalize_item_name(name) for name in names if name})
+        if not normalized_names:
+            return {}
+
+        placeholders = ",".join("?" for _ in normalized_names)
+        with self.connect() as db:
+            cursor = db.execute(
+                f"""
+                SELECT raw_normalized_name, canonical_name, canonical_key
+                FROM item_normalization_cache
+                WHERE raw_normalized_name IN ({placeholders}) AND expires_at > ?
+                """,
+                (*normalized_names, utc_now()),
+            )
+            rows = cursor.fetchall()
+        return {
+            row["raw_normalized_name"]: ItemIdentity(
+                raw_name=row["raw_normalized_name"],
+                canonical_name=row["canonical_name"],
+                canonical_key=row["canonical_key"],
+            )
+            for row in rows
+        }
+
+    async def set_cached_item_identities(
+        self,
+        *,
+        identities_by_name: dict[str, ItemIdentity],
+        ttl_seconds: int,
+    ) -> None:
+        if not identities_by_name:
+            return
+
+        now = datetime.now(UTC)
+        expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat(
+            timespec="seconds"
+        )
+        with self.connect() as db:
+            db.executemany(
+                """
+                INSERT INTO item_normalization_cache (
+                    raw_normalized_name, canonical_name, canonical_key, expires_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(raw_normalized_name) DO UPDATE SET
+                    canonical_name = excluded.canonical_name,
+                    canonical_key = excluded.canonical_key,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    (
+                        normalize_item_name(name),
+                        identity.canonical_name,
+                        identity.canonical_key,
+                        expires_at,
+                        now.isoformat(timespec="seconds"),
+                    )
+                    for name, identity in identities_by_name.items()
+                ],
+            )
+            db.commit()
+
     async def create_shop_session(
         self,
         *,
@@ -870,6 +1004,8 @@ def row_to_item(row: sqlite3.Row) -> ShoppingItem:
         updated_at=datetime.fromisoformat(values["updated_at"]),
         bought_at=parse_dt(values["bought_at"]),
         removed_at=parse_dt(values["removed_at"]),
+        canonical_name=values.get("canonical_name"),
+        canonical_key=values.get("canonical_key"),
     )
 
 
@@ -899,4 +1035,32 @@ def row_to_recipe_ingredient(row: sqlite3.Row) -> RecipeIngredient:
         name=values["name"],
         quantity_text=values["quantity_text"],
         position=values["position"],
+        canonical_name=values.get("canonical_name"),
+        canonical_key=values.get("canonical_key"),
     )
+
+
+def recipe_ingredient_rows(
+    *,
+    recipe_id: int,
+    ingredients: list[tuple[str, str | None] | tuple[str, str | None, str, str]],
+) -> list[tuple[int, str, str | None, str | None, str | None, int]]:
+    rows = []
+    for position, ingredient in enumerate(ingredients, start=1):
+        ingredient_name = ingredient[0]
+        quantity = ingredient[1]
+        canonical_name = ingredient[2] if len(ingredient) > 2 else None
+        canonical_key = ingredient[3] if len(ingredient) > 3 else None
+        if not ingredient_name.strip():
+            continue
+        rows.append(
+            (
+                recipe_id,
+                " ".join(ingredient_name.strip().split()),
+                " ".join(quantity.strip().split()) if quantity else None,
+                canonical_name,
+                canonical_key,
+                position,
+            )
+        )
+    return rows

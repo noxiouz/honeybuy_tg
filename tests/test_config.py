@@ -19,6 +19,7 @@ def test_owner_username_bootstrap_is_supported():
     assert settings.max_transcript_characters == 4_000
     assert settings.text_parse_mode == "mention"
     assert settings.category_cache_ttl_seconds == 2_592_000
+    assert settings.item_normalization_cache_ttl_seconds == 7_776_000
     assert not settings.metrics_enabled
     assert settings.metrics_host == "127.0.0.1"
     assert settings.metrics_port == 9108
