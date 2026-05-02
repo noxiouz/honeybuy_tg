@@ -47,6 +47,7 @@ stores state locally in SQLite.
 - `/shop` renders a compact checklist and updates the same message with checked
   items.
 - Recipe memory from public recipe links: learn, store, list, and reuse recipes.
+- Pasted recipe text can be learned and saved without requiring a public URL.
 - Recipe ingredients are deduplicated against active shopping-list items.
 - AI item identity normalization deduplicates equivalent items across languages,
   such as `water` and `вода`, and improves bought/remove matching.
@@ -146,7 +147,6 @@ Optional metrics:
 
 ### Product
 
-- [ ] Pasted recipe text: learn recipes without a URL.
 - [ ] Recipe deletion.
 - [ ] Recipe overwrite confirmation.
 - [ ] Recipe aliases, so one recipe can be recalled by several names.
@@ -183,4 +183,4 @@ Optional metrics:
    those paths backfill canonical identities and remove duplicate active rows.
 3. Finish hardening AI response validation and AI metrics status reporting.
 4. Revisit the next product improvement after the current deployed behavior is
-   stable.
+   stable: recipe deletion, overwrite confirmation, and aliases.
