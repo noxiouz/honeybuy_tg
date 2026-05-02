@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 
 from honeybuy_tg.models import ItemIdentity, ItemStatus
@@ -262,12 +264,12 @@ async def test_shop_session_lifecycle(tmp_path):
     await storage.create_shop_session(
         chat_id=1,
         message_id=100,
-        items=[(1, "Milk"), (2, "Bread")],
+        items=[(1, "Milk", "Dairy"), (2, "Bread")],
     )
     assert [
-        (row["item_id"], row["item_text"], row["checked"])
+        (row["item_id"], row["item_text"], row["category"], row["checked"])
         for row in await storage.get_shop_session_items(chat_id=1, message_id=100)
-    ] == [(1, "Milk", 0), (2, "Bread", 0)]
+    ] == [(1, "Milk", "Dairy", 0), (2, "Bread", None, 0)]
 
     assert await storage.set_shop_session_item_checked(
         chat_id=1,
@@ -276,6 +278,61 @@ async def test_shop_session_lifecycle(tmp_path):
         checked=True,
     )
     assert [
-        (row["item_id"], row["item_text"], row["checked"])
+        (row["item_id"], row["item_text"], row["category"], row["checked"])
         for row in await storage.get_shop_session_items(chat_id=1, message_id=100)
-    ] == [(1, "Milk", 1), (2, "Bread", 0)]
+    ] == [(1, "Milk", "Dairy", 1), (2, "Bread", None, 0)]
+
+
+@pytest.mark.asyncio
+async def test_init_migrates_old_shop_sessions_table_without_category(tmp_path):
+    database_path = tmp_path / "test.sqlite3"
+    now = "2026-01-01T00:00:00+00:00"
+    with sqlite3.connect(database_path) as db:
+        db.execute(
+            """
+            CREATE TABLE shop_sessions (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                item_id INTEGER NOT NULL,
+                item_text TEXT NOT NULL,
+                checked INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, message_id, item_id)
+            )
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO shop_sessions (
+                chat_id, message_id, item_id, item_text, checked, created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (1, 100, 1, "Milk", 0, now, now),
+        )
+        db.commit()
+
+    storage = Storage(database_path)
+    await storage.init()
+
+    with storage.connect() as db:
+        columns = {
+            row["name"] for row in db.execute("PRAGMA table_info(shop_sessions)")
+        }
+    assert "category" in columns
+    assert [
+        (row["item_id"], row["item_text"], row["category"], row["checked"])
+        for row in await storage.get_shop_session_items(chat_id=1, message_id=100)
+    ] == [(1, "Milk", None, 0)]
+
+    await storage.create_shop_session(
+        chat_id=1,
+        message_id=101,
+        items=[(1, "Milk", "Dairy")],
+    )
+    assert [
+        (row["item_id"], row["item_text"], row["category"], row["checked"])
+        for row in await storage.get_shop_session_items(chat_id=1, message_id=101)
+    ] == [(1, "Milk", "Dairy", 0)]

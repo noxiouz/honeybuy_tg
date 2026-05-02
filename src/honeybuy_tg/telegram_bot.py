@@ -41,6 +41,10 @@ from honeybuy_tg.formatting import (
     format_shop_mode,
     format_shop_session,
     format_updated,
+    group_items_by_category,
+    group_shop_session_items,
+    has_shop_categories,
+    ShopSessionItem,
 )
 from honeybuy_tg.metrics import (
     observe_voice_transcript_chars,
@@ -246,6 +250,61 @@ def recipe_ingredients_from_ai(payload: dict[str, object]) -> list[tuple[str, st
     return ingredients
 
 
+def build_shop_keyboard(
+    items: list[ShoppingItem],
+    *,
+    categories_by_item_id: dict[int, str] | None = None,
+) -> InlineKeyboardMarkup | None:
+    if not items:
+        return None
+    keyboard_items = items
+    if categories_by_item_id:
+        keyboard_items = [
+            item
+            for _, category_items in group_items_by_category(
+                items,
+                categories_by_item_id=categories_by_item_id,
+            )
+            for item in category_items
+        ]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"Got: {item.name}",
+                    callback_data=f"shop_bought:{item.id}",
+                )
+            ]
+            for item in keyboard_items
+        ]
+    )
+
+
+def build_shop_session_keyboard(
+    items: list[ShopSessionItem],
+) -> InlineKeyboardMarkup | None:
+    rows = []
+    keyboard_items = items
+    if has_shop_categories(items):
+        keyboard_items = [
+            item
+            for _, category_items in group_shop_session_items(items)
+            for item in category_items
+        ]
+    for item_id, item_text, checked in (item[:3] for item in keyboard_items):
+        if checked:
+            continue
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"Got: {item_text}",
+                    callback_data=f"shop_bought:{item_id}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
 def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
     transcriber = (
         VoiceTranscriber(
@@ -368,54 +427,28 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             )
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    def shop_keyboard(items: list[ShoppingItem]) -> InlineKeyboardMarkup | None:
-        if not items:
-            return None
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text=f"Got: {item.name}",
-                        callback_data=f"shop_bought:{item.id}",
-                    )
-                ]
-                for item in items
-            ]
-        )
-
     async def refresh_shop_message(message: Message) -> None:
         session_items = await storage.get_shop_session_items(
             chat_id=message.chat.id,
             message_id=message.message_id,
         )
+        shop_items: list[ShopSessionItem] = [
+            (
+                row["item_id"],
+                row["item_text"],
+                bool(row["checked"]),
+                row["category"],
+            )
+            for row in session_items
+        ]
         try:
             await message.edit_text(
-                format_shop_session(
-                    [
-                        (row["item_id"], row["item_text"], bool(row["checked"]))
-                        for row in session_items
-                    ]
-                ),
-                reply_markup=shop_session_keyboard(session_items),
+                format_shop_session(shop_items),
+                reply_markup=build_shop_session_keyboard(shop_items),
             )
         except TelegramBadRequest as error:
             if "message is not modified" not in str(error):
                 raise
-
-    def shop_session_keyboard(items) -> InlineKeyboardMarkup | None:
-        rows = []
-        for row in items:
-            if row["checked"]:
-                continue
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"Got: {row['item_text']}",
-                        callback_data=f"shop_bought:{row['item_id']}",
-                    )
-                ]
-            )
-        return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
     def voice_confirmation_keyboard(confirmation_id: int) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
@@ -654,7 +687,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         )
 
     async def categorize_list_items(items: list[ShoppingItem]) -> dict[int, str]:
-        if not items or categorizer is None:
+        if not items:
             return {}
 
         cached_by_name = await storage.get_cached_categories(
@@ -670,7 +703,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             for item in items
             if item.id not in categories_by_item_id
         ]
-        if not uncached_items:
+        if not uncached_items or categorizer is None:
             return categories_by_item_id
 
         try:
@@ -1273,13 +1306,28 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         if not await require_allowed(message):
             return
         items = await service.list_active_deduplicated(chat_id=message.chat.id)
+        categories_by_item_id = await categorize_list_items(items)
         sent = await message.answer(
-            format_shop_mode(items), reply_markup=shop_keyboard(items)
+            format_shop_mode(
+                items,
+                categories_by_item_id=categories_by_item_id,
+            ),
+            reply_markup=build_shop_keyboard(
+                items,
+                categories_by_item_id=categories_by_item_id,
+            ),
         )
         await storage.create_shop_session(
             chat_id=message.chat.id,
             message_id=sent.message_id,
-            items=[(item.id, format_item_for_shop(item)) for item in items],
+            items=[
+                (
+                    item.id,
+                    format_item_for_shop(item),
+                    categories_by_item_id.get(item.id),
+                )
+                for item in items
+            ],
         )
         await storage.save_bot_message(
             chat_id=message.chat.id,

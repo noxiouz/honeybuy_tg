@@ -1,4 +1,18 @@
+from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
+
+from aiogram import Bot
+from aiogram.client.session.base import BaseSession
+from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
+from aiogram.types import Chat, Message, Update
+import pytest
+
+from honeybuy_tg.config import Settings
+from honeybuy_tg.parser import ParsedAction
+from honeybuy_tg.storage import Storage
 from honeybuy_tg.telegram_bot import (
+    build_dispatcher,
+    build_shop_session_keyboard,
     get_effective_text_parse_mode,
     is_explicit_voice_reanalysis_command,
     is_context_item_reference,
@@ -14,8 +28,42 @@ from honeybuy_tg.telegram_bot import (
     strip_bot_mention,
     voice_reply_context_message,
 )
-from honeybuy_tg.parser import ParsedAction
-import pytest
+
+
+class FakeTelegramSession(BaseSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests = []
+        self.next_message_id = 100
+
+    async def close(self) -> None:
+        pass
+
+    async def stream_content(
+        self,
+        url: str,
+        headers: dict[str, object] | None = None,
+        timeout: int = 30,
+        chunk_size: int = 65536,
+        raise_for_status: bool = True,
+    ) -> AsyncGenerator[bytes, None]:
+        if False:
+            yield b""
+
+    async def make_request(self, bot, method, timeout=None):
+        self.requests.append(method)
+        if isinstance(method, SendMessage):
+            self.next_message_id += 1
+            return Message(
+                message_id=self.next_message_id,
+                date=datetime.now(UTC),
+                chat=Chat(id=method.chat_id, type="private"),
+                text=method.text,
+                reply_markup=method.reply_markup,
+            )
+        if isinstance(method, EditMessageText | AnswerCallbackQuery):
+            return True
+        raise AssertionError(f"Unexpected Telegram method: {type(method).__name__}")
 
 
 def test_voice_reanalysis_request_matches_bot_mention():
@@ -212,3 +260,107 @@ async def test_effective_text_parse_mode_uses_default():
         )
         == "mention"
     )
+
+
+@pytest.mark.asyncio
+async def test_shop_command_creates_categorized_session(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    tomatoes = await storage.add_item(
+        chat_id=1,
+        name="Tomatoes",
+        created_by=42,
+        canonical_name="Tomatoes",
+        canonical_key="tomatoes",
+    )
+    milk = await storage.add_item(
+        chat_id=1,
+        name="Milk",
+        created_by=42,
+        canonical_name="Milk",
+        canonical_key="milk",
+    )
+    cucumber = await storage.add_item(
+        chat_id=1,
+        name="Cucumber",
+        created_by=42,
+        canonical_name="Cucumber",
+        canonical_key="cucumber",
+    )
+    await storage.set_cached_categories(
+        categories_by_name={
+            "Tomatoes": "Veg",
+            "Milk": "Dairy",
+            "Cucumber": "Veg",
+        },
+        ttl_seconds=60,
+    )
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+    update = Update.model_validate(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "date": int(datetime.now(UTC).timestamp()),
+                "chat": {"id": 1, "type": "private"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Owner"},
+                "text": "/shop",
+                "entities": [{"type": "bot_command", "offset": 0, "length": 5}],
+            },
+        }
+    )
+
+    await dispatcher.feed_update(bot, update)
+
+    sent = next(
+        request for request in session.requests if isinstance(request, SendMessage)
+    )
+    assert [
+        line
+        for line in sent.text.splitlines()
+        if line in {"Veg", "☐ Tomatoes", "☐ Cucumber", "Dairy", "☐ Milk"}
+    ] == ["Veg", "☐ Tomatoes", "☐ Cucumber", "Dairy", "☐ Milk"]
+    assert [
+        (row[0].callback_data, row[0].text)
+        for row in sent.reply_markup.inline_keyboard
+    ] == [
+        (f"shop_bought:{tomatoes.id}", "Got: Tomatoes"),
+        (f"shop_bought:{cucumber.id}", "Got: Cucumber"),
+        (f"shop_bought:{milk.id}", "Got: Milk"),
+    ]
+    assert [
+        (row["item_id"], row["item_text"], row["category"], row["checked"])
+        for row in await storage.get_shop_session_items(
+            chat_id=1,
+            message_id=session.next_message_id,
+        )
+    ] == [
+        (tomatoes.id, "Tomatoes", "Veg", 0),
+        (milk.id, "Milk", "Dairy", 0),
+        (cucumber.id, "Cucumber", "Veg", 0),
+    ]
+
+
+def test_shop_session_keyboard_keeps_refreshed_category_order():
+    keyboard = build_shop_session_keyboard(
+        [
+            (1, "Tomatoes", True, "Veg"),
+            (2, "Milk", False, "Dairy"),
+            (3, "Cucumber", False, "Veg"),
+        ]
+    )
+
+    assert keyboard is not None
+    assert [
+        (row[0].callback_data, row[0].text) for row in keyboard.inline_keyboard
+    ] == [
+        ("shop_bought:3", "Got: Cucumber"),
+        ("shop_bought:2", "Got: Milk"),
+    ]

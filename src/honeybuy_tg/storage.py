@@ -13,6 +13,8 @@ from honeybuy_tg.models import (
     ShoppingItem,
 )
 
+ShopSessionInput = tuple[int, str] | tuple[int, str, str | None]
+
 
 def normalize_item_name(name: str) -> str:
     return " ".join(name.casefold().strip().split())
@@ -147,6 +149,7 @@ class Storage:
                     message_id INTEGER NOT NULL,
                     item_id INTEGER NOT NULL,
                     item_text TEXT NOT NULL,
+                    category TEXT,
                     checked INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -188,6 +191,7 @@ class Storage:
         self._ensure_column(db, "shopping_items", "canonical_key", "TEXT")
         self._ensure_column(db, "recipe_ingredients", "canonical_name", "TEXT")
         self._ensure_column(db, "recipe_ingredients", "canonical_key", "TEXT")
+        self._ensure_column(db, "shop_sessions", "category", "TEXT")
         db.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_shopping_items_chat_canonical_key
@@ -868,21 +872,29 @@ class Storage:
         *,
         chat_id: int,
         message_id: int,
-        items: list[tuple[int, str]],
+        items: list[ShopSessionInput],
     ) -> None:
         now = utc_now()
         with self.connect() as db:
             db.executemany(
                 """
                 INSERT OR REPLACE INTO shop_sessions (
-                    chat_id, message_id, item_id, item_text, checked,
+                    chat_id, message_id, item_id, item_text, category, checked,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, 0, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?)
                 """,
                 [
-                    (chat_id, message_id, item_id, item_text, now, now)
-                    for item_id, item_text in items
+                    (
+                        chat_id,
+                        message_id,
+                        item[0],
+                        item[1],
+                        item[2] if len(item) > 2 else None,
+                        now,
+                        now,
+                    )
+                    for item in items
                 ],
             )
             db.commit()
@@ -896,7 +908,7 @@ class Storage:
         with self.connect() as db:
             cursor = db.execute(
                 """
-                SELECT item_id, item_text, checked FROM shop_sessions
+                SELECT item_id, item_text, category, checked FROM shop_sessions
                 WHERE chat_id = ? AND message_id = ?
                 ORDER BY rowid
                 """,

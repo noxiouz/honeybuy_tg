@@ -2,6 +2,8 @@ from html import escape
 
 from honeybuy_tg.models import Recipe, RecipeIngredient, ShoppingItem
 
+ShopSessionItem = tuple[int, str, bool] | tuple[int, str, bool, str | None]
+
 
 def format_item(item: ShoppingItem) -> str:
     parts = [item.name]
@@ -65,19 +67,46 @@ def format_updated(action: str, items: list[ShoppingItem]) -> str:
     return "\n".join(lines)
 
 
-def format_shop_mode(items: list[ShoppingItem]) -> str:
+def format_shop_mode(
+    items: list[ShoppingItem],
+    *,
+    categories_by_item_id: dict[int, str] | None = None,
+) -> str:
     if not items:
         return "Shopping checklist is empty."
-    return format_shop_session([(item.id, format_item(item), False) for item in items])
+    return format_shop_session(
+        [
+            (
+                item.id,
+                format_item(item),
+                False,
+                categories_by_item_id.get(item.id) if categories_by_item_id else None,
+            )
+            for item in items
+        ]
+    )
 
 
-def format_shop_session(items: list[tuple[int, str, bool]]) -> str:
+def format_shop_session(items: list[ShopSessionItem]) -> str:
     if not items:
         return "Shopping checklist is empty."
     lines = ["Shopping mode", "Tap an item after it is in the cart.", ""]
-    for _, item_text, checked in items:
-        marker = "✅" if checked else "☐"
-        lines.append(f"{marker} {item_text}")
+    if not has_shop_categories(items):
+        for item in items:
+            _, item_text, checked = item[:3]
+            marker = "✅" if checked else "☐"
+            lines.append(f"{marker} {item_text}")
+        return "\n".join(lines)
+
+    for category, category_items in group_shop_session_items(items):
+        lines.append(category)
+        for item in category_items:
+            _, item_text, checked = item[:3]
+            marker = "✅" if checked else "☐"
+            lines.append(f"{marker} {item_text}")
+        lines.append("")
+    if lines[-1] == "":
+        lines.pop()
     return "\n".join(lines)
 
 
@@ -117,4 +146,18 @@ def group_items_by_category(
         category = categories_by_item_id.get(item.id, "Другое")
         groups.setdefault(category, []).append(item)
 
+    return list(groups.items())
+
+
+def has_shop_categories(items: list[ShopSessionItem]) -> bool:
+    return any(len(item) > 3 and bool(item[3]) for item in items)
+
+
+def group_shop_session_items(
+    items: list[ShopSessionItem],
+) -> list[tuple[str, list[ShopSessionItem]]]:
+    groups: dict[str, list[ShopSessionItem]] = {}
+    for item in items:
+        category = item[3] if len(item) > 3 and item[3] else "Другое"
+        groups.setdefault(category, []).append(item)
     return list(groups.items())

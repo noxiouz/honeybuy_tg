@@ -97,6 +97,31 @@ def test_format_shop_mode():
     )
 
 
+def test_format_shop_mode_groups_by_category():
+    text = format_shop_mode(
+        [item(1, "помидоры"), item(2, "молоко"), item(3, "огурцы")],
+        categories_by_item_id={
+            1: "Овощи",
+            2: "Молочка",
+            3: "Овощи",
+        },
+    )
+
+    assert text == "\n".join(
+        [
+            "Shopping mode",
+            "Tap an item after it is in the cart.",
+            "",
+            "Овощи",
+            "☐ помидоры",
+            "☐ огурцы",
+            "",
+            "Молочка",
+            "☐ молоко",
+        ]
+    )
+
+
 def test_format_shop_session_with_checked_item():
     text = format_shop_session(
         [
@@ -111,6 +136,30 @@ def test_format_shop_session_with_checked_item():
             "Tap an item after it is in the cart.",
             "",
             "✅ помидоры",
+            "☐ молоко",
+        ]
+    )
+
+
+def test_format_shop_session_keeps_category_groups_after_checking():
+    text = format_shop_session(
+        [
+            (1, "помидоры", True, "Овощи"),
+            (2, "молоко", False, "Молочка"),
+            (3, "огурцы", True, "Овощи"),
+        ]
+    )
+
+    assert text == "\n".join(
+        [
+            "Shopping mode",
+            "Tap an item after it is in the cart.",
+            "",
+            "Овощи",
+            "✅ помидоры",
+            "✅ огурцы",
+            "",
+            "Молочка",
             "☐ молоко",
         ]
     )
