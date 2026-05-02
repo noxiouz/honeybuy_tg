@@ -123,8 +123,9 @@ class RecipeCommandParseResponse(AIResponseModel):
     action: Literal["learn_recipe", "add_recipe", "unknown"]
     recipe_name: str | None
     url: str | None
+    recipe_text: str | None = None
 
-    @field_validator("recipe_name", "url")
+    @field_validator("recipe_name", "url", "recipe_text")
     @classmethod
     def clean_optional_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -136,8 +137,6 @@ class RecipeCommandParseResponse(AIResponseModel):
     def require_action_fields(self) -> "RecipeCommandParseResponse":
         if self.action in {"learn_recipe", "add_recipe"} and self.recipe_name is None:
             raise ValueError("Recipe command action must include recipe_name")
-        if self.action == "learn_recipe" and self.url is None:
-            raise ValueError("learn_recipe action must include url")
         return self
 
 
@@ -287,15 +286,15 @@ class RecipeExtractor:
         self,
         *,
         requested_name: str,
-        source_url: str,
+        source_url: str | None,
         page_text: str,
     ) -> dict[str, object]:
         async with record_ai_request_async(operation="recipe_extract") as report:
             result = await self.client.responses.create(
                 model=self.model,
                 instructions=(
-                    "Extract a recipe from visible recipe-page text. Return only "
-                    "valid JSON with shape: "
+                    "Extract a recipe from visible recipe-page text or pasted recipe "
+                    "text. Return only valid JSON with shape: "
                     '{"name":"солянка","ingredients":[{"name":"carrot",'
                     '"quantity":"120 g"}]}. Use the requested name if it is a '
                     "reasonable alias. Ingredients must be grocery items only; omit "
@@ -334,11 +333,15 @@ class RecipeCommandParser:
                     "Parse commands that teach or reuse saved recipes. Return only "
                     "valid JSON with shape: "
                     '{"action":"learn_recipe|add_recipe|unknown",'
-                    '"recipe_name":"солянка","url":"https://example.com"}. '
-                    "Use null for missing recipe_name or url. "
+                    '"recipe_name":"солянка","url":"https://example.com",'
+                    '"recipe_text":null}. '
+                    "Use null for missing recipe_name, url, or recipe_text. "
                     "Use action 'learn_recipe' when the user asks to remember, learn, "
-                    "save, or teach a recipe and provides a recipe URL. Use action "
-                    "'add_recipe' when the user asks to add/buy ingredients/products "
+                    "save, or teach a recipe and provides either a recipe URL or "
+                    "pasted recipe text. Do not copy pasted recipe bodies into "
+                    "recipe_text; set recipe_text to null unless the recipe content "
+                    "is very short. Use action 'add_recipe' when the user asks to "
+                    "add/buy ingredients/products "
                     "for a saved recipe, even if phrased loosely, for example "
                     "'добавь для солянки', 'купи на солянку', 'ингредиенты для "
                     "солянки', or 'все для солянки'. Return unknown for ordinary "

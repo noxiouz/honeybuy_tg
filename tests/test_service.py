@@ -75,6 +75,26 @@ async def test_service_adds_recipe_ingredients(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_service_saves_pasted_recipe_without_source_url(tmp_path):
+    service = ShoppingListService(Storage(tmp_path / "test.sqlite3"))
+    await service.storage.init()
+
+    recipe = await service.save_recipe(
+        chat_id=1,
+        name=" Pasted   pancakes ",
+        source_url=None,
+        user_id=10,
+        ingredients=[(" flour ", " 200   g "), (" ", "bad")],
+    )
+
+    assert recipe.name == "Pasted pancakes"
+    assert recipe.source_url is None
+    assert [(ingredient.name, ingredient.quantity_text) for ingredient in recipe.ingredients] == [
+        ("flour", "200 g")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_service_skips_active_recipe_ingredient_duplicates(tmp_path):
     service = ShoppingListService(Storage(tmp_path / "test.sqlite3"))
     await service.storage.init()

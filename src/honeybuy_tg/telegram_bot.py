@@ -53,7 +53,7 @@ from honeybuy_tg.metrics import (
     record_shopping_action,
     record_voice_rejection,
 )
-from honeybuy_tg.models import ShoppingItem
+from honeybuy_tg.models import Recipe, ShoppingItem
 from honeybuy_tg.parser import (
     ParsedAction,
     ParsedCommand,
@@ -67,6 +67,7 @@ from honeybuy_tg.recipes import (
     LearnRecipeRequest,
     parse_add_recipe_request,
     parse_learn_recipe_request,
+    looks_like_pasted_recipe_text,
     looks_like_recipe_reuse_request,
     recipe_command_from_ai,
     should_try_ai_recipe_command,
@@ -248,6 +249,37 @@ def recipe_ingredients_from_ai(payload: dict[str, object]) -> list[tuple[str, st
             )
         )
     return ingredients
+
+
+async def learn_recipe_from_request(
+    *,
+    learn_request: LearnRecipeRequest,
+    recipe_extractor: RecipeExtractor,
+    service: ShoppingListService,
+    chat_id: int,
+    user_id: int,
+) -> Recipe:
+    if learn_request.recipe_text is not None:
+        page_text = learn_request.recipe_text
+        source_url = None
+    elif learn_request.url is not None:
+        page_text = await fetch_recipe_page_text(learn_request.url)
+        source_url = learn_request.url
+    else:
+        raise ValueError("Recipe learning needs a URL or pasted text")
+
+    payload = await recipe_extractor.extract(
+        requested_name=learn_request.name,
+        source_url=source_url,
+        page_text=page_text,
+    )
+    return await service.save_recipe(
+        chat_id=chat_id,
+        name=recipe_name_from_ai(payload, fallback=learn_request.name),
+        source_url=source_url,
+        user_id=user_id,
+        ingredients=recipe_ingredients_from_ai(payload),
+    )
 
 
 def build_shop_keyboard(
@@ -556,11 +588,16 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 if (
                     recipe_command.action == "learn_recipe"
                     and recipe_command.name is not None
-                    and recipe_command.url is not None
                 ):
+                    recipe_text = (
+                        text
+                        if looks_like_pasted_recipe_text(text)
+                        else recipe_command.recipe_text
+                    )
                     learn_request = LearnRecipeRequest(
                         name=recipe_command.name,
-                        url=recipe_command.url,
+                        url=None if recipe_text is not None else recipe_command.url,
+                        recipe_text=recipe_text,
                     )
                 elif (
                     recipe_command.action == "add_recipe"
@@ -583,24 +620,18 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         if learn_request is not None:
             if recipe_extractor is None:
                 await message.answer(
-                    "Recipe learning needs OPENAI_API_KEY because the page must be "
+                    "Recipe learning needs OPENAI_API_KEY because the recipe must be "
                     "converted into ingredients."
                 )
                 return True
 
             try:
-                page_text = await fetch_recipe_page_text(learn_request.url)
-                payload = await recipe_extractor.extract(
-                    requested_name=learn_request.name,
-                    source_url=learn_request.url,
-                    page_text=page_text,
-                )
-                recipe = await service.save_recipe(
+                recipe = await learn_recipe_from_request(
+                    learn_request=learn_request,
+                    recipe_extractor=recipe_extractor,
+                    service=service,
                     chat_id=message.chat.id,
-                    name=recipe_name_from_ai(payload, fallback=learn_request.name),
-                    source_url=learn_request.url,
                     user_id=message.from_user.id,
-                    ingredients=recipe_ingredients_from_ai(payload),
                 )
             except Exception as error:
                 logger.exception("Failed to learn recipe")
@@ -645,7 +676,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         if recipe is None:
             await message.answer(
                 f"I do not know recipe: {add_request.name}\n\n"
-                "Teach it first: выучи солянка https://..."
+                "Teach it first: выучи солянка https://... or paste the recipe text."
             )
             return True
 

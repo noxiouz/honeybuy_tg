@@ -211,6 +211,7 @@ async def test_recipe_command_parser_returns_validated_payload():
         "action": "learn_recipe",
         "recipe_name": "солянка",
         "url": "https://example.com/recipe",
+        "recipe_text": None,
     }
 
 
@@ -289,11 +290,42 @@ def test_recipe_response_models_validate_shape():
     assert recipe.ingredients[0].quantity == "120 g"
     assert command.recipe_name == "солянка"
     assert command.url is None
+    assert command.recipe_text is None
     assert unknown_command.model_dump() == {
         "action": "unknown",
         "recipe_name": None,
         "url": None,
+        "recipe_text": None,
     }
+
+
+def test_recipe_command_response_accepts_pasted_recipe_text():
+    command = RecipeCommandParseResponse.model_validate(
+        {
+            "action": "learn_recipe",
+            "recipe_name": "блины",
+            "url": None,
+            "recipe_text": " Ingredients: flour, milk ",
+        }
+    )
+
+    assert command.model_dump() == {
+        "action": "learn_recipe",
+        "recipe_name": "блины",
+        "url": None,
+        "recipe_text": "Ingredients: flour, milk",
+    }
+
+
+def test_recipe_command_response_accepts_learn_recipe_without_body_echo():
+    command = RecipeCommandParseResponse.model_validate(
+        {"action": "learn_recipe", "recipe_name": "блины", "url": None}
+    )
+
+    assert command.action == "learn_recipe"
+    assert command.recipe_name == "блины"
+    assert command.url is None
+    assert command.recipe_text is None
 
 
 def test_recipe_extract_response_rejects_empty_ingredients_as_invalid_response():
@@ -318,7 +350,6 @@ def test_recipe_extract_response_rejects_empty_ingredients_as_invalid_response()
             "recipe_name": None,
             "url": "https://example.com/recipe",
         },
-        {"action": "learn_recipe", "recipe_name": "солянка", "url": None},
         {
             "action": "learn_recipe",
             "recipe_name": "   ",

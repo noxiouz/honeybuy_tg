@@ -3,8 +3,8 @@ from datetime import UTC, datetime
 
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
-from aiogram.types import Chat, Message, Update
+from aiogram.methods import AnswerCallbackQuery, EditMessageText, GetMe, SendMessage
+from aiogram.types import Chat, Message, Update, User
 import pytest
 
 from honeybuy_tg.config import Settings
@@ -19,6 +19,7 @@ from honeybuy_tg.telegram_bot import (
     is_last_added_reference,
     is_undo_added_request,
     is_voice_reanalysis_request,
+    learn_recipe_from_request,
     parse_item_ids,
     parse_bare_voice_items,
     parse_text_command_with_ai_fallback,
@@ -28,6 +29,8 @@ from honeybuy_tg.telegram_bot import (
     strip_bot_mention,
     voice_reply_context_message,
 )
+from honeybuy_tg.recipes import LearnRecipeRequest
+from honeybuy_tg.service import ShoppingListService
 
 
 class FakeTelegramSession(BaseSession):
@@ -60,6 +63,13 @@ class FakeTelegramSession(BaseSession):
                 chat=Chat(id=method.chat_id, type="private"),
                 text=method.text,
                 reply_markup=method.reply_markup,
+            )
+        if isinstance(method, GetMe):
+            return User(
+                id=999,
+                is_bot=True,
+                first_name="Honeybuy",
+                username="HoneyBuyBot",
             )
         if isinstance(method, EditMessageText | AnswerCallbackQuery):
             return True
@@ -152,6 +162,32 @@ class FakeUnknownTextParser:
         }
 
 
+class FakeItemNormalizer:
+    def __init__(self, *, api_key, model):
+        pass
+
+    async def normalize(self, names):
+        return {}
+
+
+class FakeUnknownShoppingTextParser:
+    def __init__(self, *, api_key, model):
+        pass
+
+    async def parse(self, text):
+        return {
+            "action": "unknown",
+            "items": [],
+            "needs_confirmation": False,
+            "clarification_question": None,
+        }
+
+
+class FakeUnusedAIClient:
+    def __init__(self, *, api_key, model):
+        pass
+
+
 @pytest.mark.asyncio
 async def test_default_action_is_used_when_ai_parse_is_unknown():
     parsed = await parse_text_command_with_ai_fallback(
@@ -236,6 +272,396 @@ def test_recipe_ai_payload_helpers():
         ("fresh dill", "8 sprigs"),
         ("water", None),
     ]
+
+
+@pytest.mark.asyncio
+async def test_learn_recipe_from_pasted_text_saves_recipe(tmp_path):
+    class FakeRecipeExtractor:
+        async def extract(self, *, requested_name, source_url, page_text):
+            assert requested_name == "pancakes"
+            assert source_url is None
+            assert "flour 200 g" in page_text
+            return {
+                "name": "Pancakes",
+                "ingredients": [
+                    {"name": "flour", "quantity": "200 g"},
+                    {"name": "milk", "quantity": "300 ml"},
+                ],
+            }
+
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    service = ShoppingListService(storage)
+
+    recipe = await learn_recipe_from_request(
+        learn_request=LearnRecipeRequest(
+            name="pancakes",
+            recipe_text=(
+                "Запомни рецепт pancakes\n"
+                "Ingredients:\n"
+                "- flour 200 g\n"
+                "- milk 300 ml\n"
+                "Method:\n"
+                "Mix and fry."
+            ),
+        ),
+        recipe_extractor=FakeRecipeExtractor(),
+        service=service,
+        chat_id=1,
+        user_id=42,
+    )
+
+    loaded = await storage.get_recipe(chat_id=1, name="pancakes")
+    assert recipe.name == "Pancakes"
+    assert recipe.source_url is None
+    assert loaded is not None
+    assert [(ingredient.name, ingredient.quantity_text) for ingredient in loaded.ingredients] == [
+        ("flour", "200 g"),
+        ("milk", "300 ml"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_text_message_learns_pasted_recipe_with_url_without_source_url(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    class FakeRecipeExtractor:
+        def __init__(self, *, api_key, model):
+            pass
+
+        async def extract(self, *, requested_name, source_url, page_text):
+            calls.append(
+                {
+                    "requested_name": requested_name,
+                    "source_url": source_url,
+                    "page_text": page_text,
+                }
+            )
+            return {
+                "name": "Pancakes",
+                "ingredients": [
+                    {"name": "flour", "quantity": "200 g"},
+                    {"name": "milk", "quantity": "300 ml"},
+                ],
+            }
+
+    async def fail_fetch_recipe_page_text(url):
+        raise AssertionError("pasted recipe text should not fetch URLs")
+
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.RecipeExtractor",
+        FakeRecipeExtractor,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.fetch_recipe_page_text",
+        fail_fetch_recipe_page_text,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemNormalizer",
+        FakeItemNormalizer,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingTextParser",
+        FakeUnknownShoppingTextParser,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.RecipeCommandParser",
+        FakeUnusedAIClient,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemCategorizer",
+        FakeUnusedAIClient,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.VoiceTranscriber",
+        FakeUnusedAIClient,
+    )
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+        OPENAI_API_KEY="test",
+        TEXT_PARSE_MODE="all",
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+    update = Update.model_validate(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "date": int(datetime.now(UTC).timestamp()),
+                "chat": {"id": 1, "type": "private"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Owner"},
+                "text": (
+                    "Save recipe pancakes\n"
+                    "Source: https://example.com/pancakes\n"
+                    "Ingredients:\n"
+                    "- flour 200 g\n"
+                    "- milk 300 ml\n"
+                    "Method:\n"
+                    "Mix and fry."
+                ),
+            },
+        }
+    )
+
+    await dispatcher.feed_update(bot, update)
+
+    loaded = await storage.get_recipe(chat_id=1, name="pancakes")
+    sent_messages = [
+        request for request in session.requests if isinstance(request, SendMessage)
+    ]
+    assert calls == [
+        {
+            "requested_name": "pancakes",
+            "source_url": None,
+            "page_text": update.message.text,
+        }
+    ]
+    assert loaded is not None
+    assert loaded.name == "Pancakes"
+    assert loaded.source_url is None
+    assert [(ingredient.name, ingredient.quantity_text) for ingredient in loaded.ingredients] == [
+        ("flour", "200 g"),
+        ("milk", "300 ml"),
+    ]
+    assert sent_messages[-1].text.startswith("Saved recipe\nPancakes")
+
+
+@pytest.mark.asyncio
+async def test_text_message_learns_ai_pasted_recipe_without_body_echo(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    class FakeRecipeExtractor:
+        def __init__(self, *, api_key, model):
+            pass
+
+        async def extract(self, *, requested_name, source_url, page_text):
+            calls.append(
+                {
+                    "requested_name": requested_name,
+                    "source_url": source_url,
+                    "page_text": page_text,
+                }
+            )
+            return {
+                "name": "Pancakes",
+                "ingredients": [{"name": "flour", "quantity": "200 g"}],
+            }
+
+    class FakeRecipeCommandParser:
+        def __init__(self, *, api_key, model):
+            pass
+
+        async def parse(self, text):
+            return {
+                "action": "learn_recipe",
+                "recipe_name": "pancakes",
+                "url": None,
+                "recipe_text": None,
+            }
+
+    async def fail_fetch_recipe_page_text(url):
+        raise AssertionError("AI pasted recipe text should not fetch URLs")
+
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.RecipeExtractor",
+        FakeRecipeExtractor,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.fetch_recipe_page_text",
+        fail_fetch_recipe_page_text,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.RecipeCommandParser",
+        FakeRecipeCommandParser,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemNormalizer",
+        FakeItemNormalizer,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingTextParser",
+        FakeUnknownShoppingTextParser,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemCategorizer",
+        FakeUnusedAIClient,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.VoiceTranscriber",
+        FakeUnusedAIClient,
+    )
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+        OPENAI_API_KEY="test",
+        TEXT_PARSE_MODE="all",
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+    message_text = (
+        "Please remember this as pancakes\n"
+        "Ingredients:\n"
+        "flour 200 g\n"
+        "milk 300 ml\n"
+        "Method:\n"
+        "Mix and fry."
+    )
+    update = Update.model_validate(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "date": int(datetime.now(UTC).timestamp()),
+                "chat": {"id": 1, "type": "private"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Owner"},
+                "text": message_text,
+            },
+        }
+    )
+
+    await dispatcher.feed_update(bot, update)
+
+    loaded = await storage.get_recipe(chat_id=1, name="pancakes")
+    assert calls == [
+        {
+            "requested_name": "pancakes",
+            "source_url": None,
+            "page_text": message_text,
+        }
+    ]
+    assert loaded is not None
+    assert loaded.source_url is None
+
+
+@pytest.mark.asyncio
+async def test_text_message_ai_recipe_url_prefers_original_pasted_text(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    class FakeRecipeExtractor:
+        def __init__(self, *, api_key, model):
+            pass
+
+        async def extract(self, *, requested_name, source_url, page_text):
+            calls.append(
+                {
+                    "requested_name": requested_name,
+                    "source_url": source_url,
+                    "page_text": page_text,
+                }
+            )
+            return {
+                "name": "Pancakes",
+                "ingredients": [{"name": "flour", "quantity": "200 g"}],
+            }
+
+    class FakeRecipeCommandParser:
+        def __init__(self, *, api_key, model):
+            pass
+
+        async def parse(self, text):
+            return {
+                "action": "learn_recipe",
+                "recipe_name": "pancakes",
+                "url": "https://example.com/pancakes",
+                "recipe_text": None,
+            }
+
+    async def fail_fetch_recipe_page_text(url):
+        raise AssertionError("AI pasted recipe text should not fetch URLs")
+
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.RecipeExtractor",
+        FakeRecipeExtractor,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.fetch_recipe_page_text",
+        fail_fetch_recipe_page_text,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.RecipeCommandParser",
+        FakeRecipeCommandParser,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemNormalizer",
+        FakeItemNormalizer,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingTextParser",
+        FakeUnknownShoppingTextParser,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemCategorizer",
+        FakeUnusedAIClient,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.VoiceTranscriber",
+        FakeUnusedAIClient,
+    )
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+        OPENAI_API_KEY="test",
+        TEXT_PARSE_MODE="all",
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+    message_text = (
+        "Please remember this as pancakes\n"
+        "Source: https://example.com/pancakes\n"
+        "Ingredients:\n"
+        "- flour 200 g\n"
+        "- milk 300 ml\n"
+        "Method:\n"
+        "Mix and fry."
+    )
+    update = Update.model_validate(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "date": int(datetime.now(UTC).timestamp()),
+                "chat": {"id": 1, "type": "private"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Owner"},
+                "text": message_text,
+            },
+        }
+    )
+
+    await dispatcher.feed_update(bot, update)
+
+    loaded = await storage.get_recipe(chat_id=1, name="pancakes")
+    assert calls == [
+        {
+            "requested_name": "pancakes",
+            "source_url": None,
+            "page_text": message_text,
+        }
+    ]
+    assert loaded is not None
+    assert loaded.source_url is None
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,8 @@ URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 @dataclass(frozen=True)
 class LearnRecipeRequest:
     name: str
-    url: str
+    url: str | None = None
+    recipe_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,7 @@ class RecipeCommand:
     action: Literal["learn_recipe", "add_recipe", "unknown"]
     name: str | None = None
     url: str | None = None
+    recipe_text: str | None = None
 
 
 def recipe_command_from_ai(payload: dict[str, Any]) -> RecipeCommand:
@@ -38,42 +40,121 @@ def recipe_command_from_ai(payload: dict[str, Any]) -> RecipeCommand:
     if not isinstance(recipe_name, str) or not recipe_name.strip():
         return RecipeCommand(action="unknown")
 
-    url = payload.get("url")
-    if action == "learn_recipe" and not isinstance(url, str):
-        return RecipeCommand(action="unknown")
+    url = clean_optional_recipe_text(payload.get("url"))
+    recipe_text = clean_optional_recipe_text(payload.get("recipe_text"))
 
     return RecipeCommand(
         action=action,
         name=recipe_name.strip(),
-        url=url.strip() if isinstance(url, str) else None,
+        url=url,
+        recipe_text=recipe_text,
     )
 
 
 def parse_learn_recipe_request(text: str) -> LearnRecipeRequest | None:
+    pasted_request = parse_pasted_recipe_request(text)
+    if pasted_request is not None:
+        return pasted_request
+
     match = URL_RE.search(text)
     if match is None:
         return None
 
     prefix = text[: match.start()]
     url = match.group(0).rstrip(".,)")
-    normalized_prefix = normalize_recipe_command_text(prefix)
-    if not normalized_prefix.startswith(("выучи", "запомни")):
+    name = learn_recipe_name_from_command_text(prefix)
+    if name is None:
+        return None
+    return LearnRecipeRequest(name=name, url=url)
+
+
+def parse_pasted_recipe_request(text: str) -> LearnRecipeRequest | None:
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    if not lines:
         return None
 
-    name = normalized_prefix
+    name = learn_recipe_name_from_command_text(lines[0])
+    if name is None:
+        return None
+
+    recipe_text = text.strip()
+    if not looks_like_pasted_recipe_text(recipe_text):
+        return None
+
+    if not name and len(lines) > 1 and not is_ingredient_heading(lines[1]):
+        candidate_name = lines[1].strip(" -:,.")
+        if 1 <= len(candidate_name) <= 80:
+            name = candidate_name
+    if not name:
+        return None
+
+    return LearnRecipeRequest(name=name, recipe_text=recipe_text)
+
+
+def learn_recipe_name_from_command_text(text: str) -> str | None:
+    text = URL_RE.sub("", text)
+    normalized = normalize_recipe_command_text(text)
+    if not normalized.startswith(
+        ("выучи", "запомни", "learn", "remember", "save", "teach")
+    ):
+        return None
+
+    name = normalized
     for leading in (
         "выучи рецепт",
         "выучи",
         "запомни рецепт",
         "запомни",
+        "learn recipe",
+        "learn",
+        "remember recipe",
+        "remember",
+        "save recipe",
+        "save",
+        "teach recipe",
+        "teach",
     ):
         if name.startswith(leading):
             name = name[len(leading) :].strip(" -:,.")
             break
-    name = name.replace("вот ссылка", "").strip(" -:,.")
-    if not name:
+    name = name.replace("вот ссылка", "").replace("вот рецепт", "").strip(" -:,.")
+    return name
+
+
+def looks_like_pasted_recipe_text(text: str) -> bool:
+    if len(text) < 50 or "\n" not in text:
+        return False
+    normalized = normalize_recipe_command_text(text)
+    if any(
+        marker in normalized
+        for marker in (
+            "ингредиент",
+            "ingredients",
+            "состав",
+            "приготовление",
+            "instructions",
+            "method",
+        )
+    ):
+        return True
+    return (
+        sum(
+            1 for line in text.splitlines() if line.strip().startswith(("-", "•"))
+        )
+        >= 2
+    )
+
+
+def is_ingredient_heading(text: str) -> bool:
+    normalized = normalize_recipe_command_text(text).strip(" -:,.")
+    return normalized in {"ингредиенты", "ingredients", "состав"}
+
+
+def clean_optional_recipe_text(value: Any) -> str | None:
+    if not isinstance(value, str):
         return None
-    return LearnRecipeRequest(name=name, url=url)
+    value = " ".join(value.strip().split())
+    return value or None
 
 
 def parse_add_recipe_request(text: str) -> AddRecipeRequest | None:
@@ -105,8 +186,14 @@ def should_try_ai_recipe_command(text: str) -> bool:
         for marker in (
             "рецепт",
             "ингредиент",
+            "ingredient",
             "продукт",
+            "recipe",
             "готов",
+            "learn",
+            "remember",
+            "save",
+            "teach",
             "выучи",
             "запомни",
             "для ",
