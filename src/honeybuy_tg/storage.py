@@ -24,6 +24,13 @@ class RecipeAlreadyExistsError(ValueError):
         self.recipe = recipe
 
 
+class RecipeAliasConflictError(ValueError):
+    def __init__(self, *, alias: str, recipe: Recipe) -> None:
+        super().__init__(f"Recipe alias already exists: {alias}")
+        self.alias = alias
+        self.recipe = recipe
+
+
 class StaleRecipeOverwriteError(ValueError):
     pass
 
@@ -213,8 +220,23 @@ class Storage:
                     FOREIGN KEY (recipe_id) REFERENCES recipes (id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS recipe_aliases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    recipe_id INTEGER NOT NULL,
+                    alias TEXT NOT NULL,
+                    normalized_alias TEXT NOT NULL,
+                    created_by INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (chat_id, normalized_alias),
+                    FOREIGN KEY (recipe_id) REFERENCES recipes (id) ON DELETE CASCADE
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_recipes_chat_name
                     ON recipes (chat_id, normalized_name);
+
+                CREATE INDEX IF NOT EXISTS idx_recipe_aliases_recipe
+                    ON recipe_aliases (recipe_id);
                 """
             )
             self._ensure_schema(db)
@@ -230,6 +252,27 @@ class Storage:
             """
             CREATE INDEX IF NOT EXISTS idx_shopping_items_chat_canonical_key
                 ON shopping_items (chat_id, canonical_key)
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recipe_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                recipe_id INTEGER NOT NULL,
+                alias TEXT NOT NULL,
+                normalized_alias TEXT NOT NULL,
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (chat_id, normalized_alias),
+                FOREIGN KEY (recipe_id) REFERENCES recipes (id) ON DELETE CASCADE
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_recipe_aliases_recipe
+                ON recipe_aliases (recipe_id)
             """
         )
 
@@ -467,8 +510,7 @@ class Storage:
         source_url: str | None,
         created_by: int,
         ingredients: list[
-            tuple[str, str | None]
-            | tuple[str, str | None, str | None, str | None]
+            tuple[str, str | None] | tuple[str, str | None, str | None, str | None]
         ],
         overwrite: bool = False,
         expected_recipe_id: int | None = None,
@@ -484,14 +526,18 @@ class Storage:
             or expected_state_digest is not None
         ):
             raise ValueError("Expected recipe state requires overwrite=True")
-        if overwrite and (
-            expected_recipe_id is not None
-            or expected_normalized_name is not None
-            or expected_state_digest is not None
-        ) and (
-            expected_recipe_id is None
-            or expected_normalized_name is None
-            or expected_state_digest is None
+        if (
+            overwrite
+            and (
+                expected_recipe_id is not None
+                or expected_normalized_name is not None
+                or expected_state_digest is not None
+            )
+            and (
+                expected_recipe_id is None
+                or expected_normalized_name is None
+                or expected_state_digest is None
+            )
         ):
             raise ValueError("Expected recipe state is incomplete")
         if (
@@ -501,8 +547,25 @@ class Storage:
         ):
             raise StaleRecipeOverwriteError("Recipe name changed before overwrite")
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            allowed_recipe_id = expected_recipe_id
+            if allowed_recipe_id is None:
+                existing_recipe = db.execute(
+                    """
+                    SELECT id FROM recipes
+                    WHERE chat_id = ? AND normalized_name = ?
+                    """,
+                    (chat_id, normalized_name),
+                ).fetchone()
+                if existing_recipe is not None:
+                    allowed_recipe_id = existing_recipe["id"]
+            self._raise_if_recipe_name_conflicts_with_alias(
+                db=db,
+                chat_id=chat_id,
+                normalized_name=normalized_name,
+                allowed_recipe_id=allowed_recipe_id,
+            )
             if overwrite and expected_recipe_id is not None:
-                db.execute("BEGIN IMMEDIATE")
                 recipe_row = db.execute(
                     """
                     SELECT * FROM recipes
@@ -525,7 +588,12 @@ class Storage:
                     (recipe_row["id"],),
                 ).fetchall()
                 if (
-                    recipe_state_digest(row_to_recipe(recipe_row, ingredient_rows))
+                    recipe_state_digest(
+                        row_to_recipe(
+                            recipe_row,
+                            ingredient_rows,
+                        )
+                    )
                     != expected_state_digest
                 ):
                     raise StaleRecipeOverwriteError("Recipe changed before overwrite")
@@ -612,8 +680,17 @@ class Storage:
                         """,
                         (existing_row["id"],),
                     ).fetchall()
+                    existing_aliases = self._recipe_alias_rows(
+                        db,
+                        chat_id=chat_id,
+                        recipe_id=existing_row["id"],
+                    )
                     raise RecipeAlreadyExistsError(
-                        row_to_recipe(existing_row, existing_ingredients)
+                        row_to_recipe(
+                            existing_row,
+                            existing_ingredients,
+                            aliases=alias_names(existing_aliases),
+                        )
                     ) from error
                 recipe_id = cursor.fetchone()["id"]
             db.execute(
@@ -639,22 +716,13 @@ class Storage:
 
     async def get_recipe(self, *, chat_id: int, name: str) -> Recipe | None:
         with self.connect() as db:
-            cursor = db.execute(
-                """
-                SELECT * FROM recipes
-                WHERE chat_id = ? AND normalized_name = ?
-                """,
-                (chat_id, normalize_item_name(name)),
+            row = self._find_recipe_by_name_or_alias(
+                db=db,
+                chat_id=chat_id,
+                name=name,
             )
-            row = cursor.fetchone()
             if row is None:
-                row = self._find_recipe_by_lookup_name(
-                    db=db,
-                    chat_id=chat_id,
-                    name=name,
-                )
-                if row is None:
-                    return None
+                return None
             ingredients = db.execute(
                 """
                 SELECT * FROM recipe_ingredients
@@ -663,7 +731,197 @@ class Storage:
                 """,
                 (row["id"],),
             ).fetchall()
-        return row_to_recipe(row, ingredients)
+            aliases = self._recipe_alias_rows(
+                db,
+                chat_id=chat_id,
+                recipe_id=row["id"],
+            )
+        return row_to_recipe(row, ingredients, aliases=alias_names(aliases))
+
+    async def add_recipe_alias(
+        self,
+        *,
+        chat_id: int,
+        recipe_name: str,
+        alias: str,
+        created_by: int,
+    ) -> Recipe | None:
+        clean_recipe_name = " ".join(recipe_name.strip().split())
+        clean_alias = " ".join(alias.strip().split())
+        if not clean_recipe_name:
+            raise ValueError("Recipe name is required")
+        if not clean_alias:
+            raise ValueError("Recipe alias is required")
+        normalized_alias = normalize_item_name(clean_alias)
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            recipe_row = self._find_recipe_by_name_or_alias(
+                db=db,
+                chat_id=chat_id,
+                name=clean_recipe_name,
+            )
+            if recipe_row is None:
+                return None
+
+            name_conflict = db.execute(
+                """
+                SELECT * FROM recipes
+                WHERE chat_id = ? AND normalized_name = ?
+                """,
+                (chat_id, normalized_alias),
+            ).fetchone()
+            if name_conflict is not None:
+                conflict_ingredients = self._recipe_ingredient_rows(
+                    db,
+                    recipe_id=name_conflict["id"],
+                )
+                conflict_aliases = self._recipe_alias_rows(
+                    db,
+                    chat_id=chat_id,
+                    recipe_id=name_conflict["id"],
+                )
+                raise RecipeAliasConflictError(
+                    alias=clean_alias,
+                    recipe=row_to_recipe(
+                        name_conflict,
+                        conflict_ingredients,
+                        aliases=alias_names(conflict_aliases),
+                    ),
+                )
+
+            loose_name_conflict = self._find_recipe_by_lookup_name(
+                db=db,
+                chat_id=chat_id,
+                name=clean_alias,
+            )
+            if (
+                loose_name_conflict is not None
+                and loose_name_conflict["id"] != recipe_row["id"]
+            ):
+                conflict_ingredients = self._recipe_ingredient_rows(
+                    db,
+                    recipe_id=loose_name_conflict["id"],
+                )
+                conflict_aliases = self._recipe_alias_rows(
+                    db,
+                    chat_id=chat_id,
+                    recipe_id=loose_name_conflict["id"],
+                )
+                raise RecipeAliasConflictError(
+                    alias=clean_alias,
+                    recipe=row_to_recipe(
+                        loose_name_conflict,
+                        conflict_ingredients,
+                        aliases=alias_names(conflict_aliases),
+                    ),
+                )
+
+            existing_alias = db.execute(
+                """
+                SELECT * FROM recipe_aliases
+                WHERE chat_id = ? AND normalized_alias = ?
+                """,
+                (chat_id, normalized_alias),
+            ).fetchone()
+            if (
+                existing_alias is not None
+                and existing_alias["recipe_id"] != recipe_row["id"]
+            ):
+                conflict_row = self._recipe_row_by_id(
+                    db,
+                    chat_id=chat_id,
+                    recipe_id=existing_alias["recipe_id"],
+                )
+                if conflict_row is None:
+                    raise RuntimeError("Recipe alias points to a missing recipe")
+                conflict_ingredients = self._recipe_ingredient_rows(
+                    db,
+                    recipe_id=conflict_row["id"],
+                )
+                conflict_aliases = self._recipe_alias_rows(
+                    db,
+                    chat_id=chat_id,
+                    recipe_id=conflict_row["id"],
+                )
+                raise RecipeAliasConflictError(
+                    alias=clean_alias,
+                    recipe=row_to_recipe(
+                        conflict_row,
+                        conflict_ingredients,
+                        aliases=alias_names(conflict_aliases),
+                    ),
+                )
+
+            if existing_alias is None:
+                try:
+                    db.execute(
+                        """
+                        INSERT INTO recipe_aliases (
+                            chat_id, recipe_id, alias, normalized_alias,
+                            created_by, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            chat_id,
+                            recipe_row["id"],
+                            clean_alias,
+                            normalized_alias,
+                            created_by,
+                            utc_now(),
+                        ),
+                    )
+                except sqlite3.IntegrityError as error:
+                    if (
+                        "recipe_aliases.chat_id, recipe_aliases.normalized_alias"
+                        not in str(error)
+                    ):
+                        raise
+                    existing_alias = db.execute(
+                        """
+                        SELECT * FROM recipe_aliases
+                        WHERE chat_id = ? AND normalized_alias = ?
+                        """,
+                        (chat_id, normalized_alias),
+                    ).fetchone()
+                    if existing_alias is None:
+                        raise
+                    if existing_alias["recipe_id"] != recipe_row["id"]:
+                        conflict_row = self._recipe_row_by_id(
+                            db,
+                            chat_id=chat_id,
+                            recipe_id=existing_alias["recipe_id"],
+                        )
+                        if conflict_row is None:
+                            raise RuntimeError(
+                                "Recipe alias points to a missing recipe"
+                            ) from error
+                        conflict_ingredients = self._recipe_ingredient_rows(
+                            db,
+                            recipe_id=conflict_row["id"],
+                        )
+                        conflict_aliases = self._recipe_alias_rows(
+                            db,
+                            chat_id=chat_id,
+                            recipe_id=conflict_row["id"],
+                        )
+                        raise RecipeAliasConflictError(
+                            alias=clean_alias,
+                            recipe=row_to_recipe(
+                                conflict_row,
+                                conflict_ingredients,
+                                aliases=alias_names(conflict_aliases),
+                            ),
+                        ) from error
+                db.commit()
+
+            ingredients = self._recipe_ingredient_rows(db, recipe_id=recipe_row["id"])
+            aliases = self._recipe_alias_rows(
+                db,
+                chat_id=chat_id,
+                recipe_id=recipe_row["id"],
+            )
+        return row_to_recipe(recipe_row, ingredients, aliases=alias_names(aliases))
 
     async def delete_recipe(self, *, chat_id: int, name: str) -> Recipe | None:
         with self.connect() as db:
@@ -684,6 +942,11 @@ class Storage:
                 """,
                 (row["id"],),
             ).fetchall()
+            aliases = self._recipe_alias_rows(
+                db,
+                chat_id=chat_id,
+                recipe_id=row["id"],
+            )
             cursor = db.execute(
                 """
                 DELETE FROM recipes
@@ -692,7 +955,45 @@ class Storage:
                 (chat_id, row["id"]),
             )
             db.commit()
-        return row_to_recipe(row, ingredients) if cursor.rowcount else None
+        return (
+            row_to_recipe(row, ingredients, aliases=alias_names(aliases))
+            if cursor.rowcount
+            else None
+        )
+
+    def _find_recipe_by_name_or_alias(
+        self,
+        *,
+        db: sqlite3.Connection,
+        chat_id: int,
+        name: str,
+    ) -> sqlite3.Row | None:
+        normalized_name = normalize_item_name(name)
+        row = db.execute(
+            """
+            SELECT * FROM recipes
+            WHERE chat_id = ? AND normalized_name = ?
+            """,
+            (chat_id, normalized_name),
+        ).fetchone()
+        if row is not None:
+            return row
+
+        row = db.execute(
+            """
+            SELECT recipes.*
+            FROM recipe_aliases
+            JOIN recipes ON recipes.id = recipe_aliases.recipe_id
+            WHERE recipe_aliases.chat_id = ?
+                AND recipes.chat_id = recipe_aliases.chat_id
+                AND recipe_aliases.normalized_alias = ?
+            """,
+            (chat_id, normalized_name),
+        ).fetchone()
+        if row is not None:
+            return row
+
+        return self._find_recipe_by_lookup_name(db=db, chat_id=chat_id, name=name)
 
     def _find_recipe_by_lookup_name(
         self,
@@ -702,17 +1003,134 @@ class Storage:
         name: str,
     ) -> sqlite3.Row | None:
         lookup_name = normalize_recipe_lookup_name(name)
-        cursor = db.execute(
+        recipe_rows = db.execute(
             """
             SELECT * FROM recipes
             WHERE chat_id = ?
+            ORDER BY id
             """,
             (chat_id,),
-        )
-        for row in cursor.fetchall():
+        ).fetchall()
+        for row in recipe_rows:
             if normalize_recipe_lookup_name(row["name"]) == lookup_name:
                 return row
+        alias_rows = db.execute(
+            """
+            SELECT recipe_aliases.alias, recipes.*
+            FROM recipe_aliases
+            JOIN recipes ON recipes.id = recipe_aliases.recipe_id
+            WHERE recipe_aliases.chat_id = ?
+                AND recipes.chat_id = recipe_aliases.chat_id
+            ORDER BY recipe_aliases.id
+            """,
+            (chat_id,),
+        ).fetchall()
+        for row in alias_rows:
+            if normalize_recipe_lookup_name(row["alias"]) == lookup_name:
+                return row
         return None
+
+    def _raise_if_recipe_name_conflicts_with_alias(
+        self,
+        *,
+        db: sqlite3.Connection,
+        chat_id: int,
+        normalized_name: str,
+        allowed_recipe_id: int | None,
+    ) -> None:
+        row = db.execute(
+            """
+            SELECT * FROM recipe_aliases
+            WHERE chat_id = ? AND normalized_alias = ?
+            """,
+            (chat_id, normalized_name),
+        ).fetchone()
+        if row is None or row["recipe_id"] == allowed_recipe_id:
+            alias_rows = db.execute(
+                """
+                SELECT * FROM recipe_aliases
+                WHERE chat_id = ?
+                ORDER BY id
+                """,
+                (chat_id,),
+            ).fetchall()
+            lookup_name = normalize_recipe_lookup_name(normalized_name)
+            for alias_row in alias_rows:
+                if alias_row["recipe_id"] == allowed_recipe_id:
+                    continue
+                if normalize_recipe_lookup_name(alias_row["alias"]) != lookup_name:
+                    continue
+                row = alias_row
+                break
+            else:
+                return
+        recipe_row = self._recipe_row_by_id(
+            db,
+            chat_id=chat_id,
+            recipe_id=row["recipe_id"],
+        )
+        if recipe_row is None:
+            return
+        ingredients = self._recipe_ingredient_rows(db, recipe_id=recipe_row["id"])
+        aliases = self._recipe_alias_rows(
+            db,
+            chat_id=chat_id,
+            recipe_id=recipe_row["id"],
+        )
+        raise RecipeAliasConflictError(
+            alias=row["alias"],
+            recipe=row_to_recipe(
+                recipe_row,
+                ingredients,
+                aliases=alias_names(aliases),
+            ),
+        )
+
+    def _recipe_row_by_id(
+        self,
+        db: sqlite3.Connection,
+        *,
+        chat_id: int,
+        recipe_id: int,
+    ) -> sqlite3.Row | None:
+        return db.execute(
+            """
+            SELECT * FROM recipes
+            WHERE chat_id = ? AND id = ?
+            """,
+            (chat_id, recipe_id),
+        ).fetchone()
+
+    def _recipe_ingredient_rows(
+        self,
+        db: sqlite3.Connection,
+        *,
+        recipe_id: int,
+    ) -> list[sqlite3.Row]:
+        return db.execute(
+            """
+            SELECT * FROM recipe_ingredients
+            WHERE recipe_id = ?
+            ORDER BY position, id
+            """,
+            (recipe_id,),
+        ).fetchall()
+
+    def _recipe_alias_rows(
+        self,
+        db: sqlite3.Connection,
+        *,
+        chat_id: int,
+        recipe_id: int,
+    ) -> list[sqlite3.Row]:
+        return db.execute(
+            """
+            SELECT * FROM recipe_aliases
+            WHERE chat_id = ? AND recipe_id = ?
+            ORDER BY alias, id
+            """,
+            (chat_id, recipe_id),
+        ).fetchall()
 
     async def list_recipes(self, *, chat_id: int) -> list[Recipe]:
         with self.connect() as db:
@@ -737,14 +1155,31 @@ class Storage:
                 """,
                 recipe_ids,
             ).fetchall()
+            alias_rows = db.execute(
+                f"""
+                SELECT * FROM recipe_aliases
+                WHERE chat_id = ? AND recipe_id IN ({placeholders})
+                ORDER BY recipe_id, alias, id
+                """,
+                [chat_id, *recipe_ids],
+            ).fetchall()
 
         ingredients_by_recipe_id: dict[int, list[sqlite3.Row]] = {}
         for ingredient_row in ingredient_rows:
             ingredients_by_recipe_id.setdefault(ingredient_row["recipe_id"], []).append(
                 ingredient_row
             )
+        aliases_by_recipe_id: dict[int, list[str]] = {}
+        for alias_row in alias_rows:
+            aliases_by_recipe_id.setdefault(alias_row["recipe_id"], []).append(
+                alias_row["alias"]
+            )
         return [
-            row_to_recipe(row, ingredients_by_recipe_id.get(row["id"], []))
+            row_to_recipe(
+                row,
+                ingredients_by_recipe_id.get(row["id"], []),
+                aliases=aliases_by_recipe_id.get(row["id"], ()),
+            )
             for row in rows
         ]
 
@@ -1252,6 +1687,8 @@ def row_to_item(row: sqlite3.Row) -> ShoppingItem:
 def row_to_recipe(
     row: sqlite3.Row,
     ingredient_rows: list[sqlite3.Row],
+    *,
+    aliases: list[str] | tuple[str, ...] = (),
 ) -> Recipe:
     values: dict[str, Any] = dict(row)
     return Recipe(
@@ -1263,6 +1700,7 @@ def row_to_recipe(
         created_by=values["created_by"],
         created_at=datetime.fromisoformat(values["created_at"]),
         updated_at=datetime.fromisoformat(values["updated_at"]),
+        aliases=tuple(aliases),
         ingredients=tuple(row_to_recipe_ingredient(row) for row in ingredient_rows),
     )
 
@@ -1284,8 +1722,7 @@ def recipe_ingredient_rows(
     *,
     recipe_id: int,
     ingredients: list[
-        tuple[str, str | None]
-        | tuple[str, str | None, str | None, str | None]
+        tuple[str, str | None] | tuple[str, str | None, str | None, str | None]
     ],
 ) -> list[tuple[int, str, str | None, str | None, str | None, int]]:
     rows = []
@@ -1307,3 +1744,7 @@ def recipe_ingredient_rows(
             )
         )
     return rows
+
+
+def alias_names(rows: list[sqlite3.Row]) -> list[str]:
+    return [row["alias"] for row in rows]

@@ -1,9 +1,11 @@
+import asyncio
 import sqlite3
 
 import pytest
 
 from honeybuy_tg.models import ItemIdentity, ItemStatus
 from honeybuy_tg.storage import (
+    RecipeAliasConflictError,
     RecipeAlreadyExistsError,
     StaleRecipeOverwriteError,
     Storage,
@@ -249,9 +251,9 @@ async def test_save_recipe_requires_explicit_overwrite(tmp_path):
     loaded = await storage.get_recipe(chat_id=1, name="pancakes")
     assert loaded is not None
     assert loaded.source_url is None
-    assert [(ingredient.name, ingredient.quantity_text) for ingredient in loaded.ingredients] == [
-        ("flour", "200 g")
-    ]
+    assert [
+        (ingredient.name, ingredient.quantity_text) for ingredient in loaded.ingredients
+    ] == [("flour", "200 g")]
 
     overwritten = await storage.save_recipe(
         chat_id=1,
@@ -264,9 +266,57 @@ async def test_save_recipe_requires_explicit_overwrite(tmp_path):
 
     assert overwritten.name == "pancakes"
     assert overwritten.source_url == "https://example.com/pancakes"
-    assert [(ingredient.name, ingredient.quantity_text) for ingredient in overwritten.ingredients] == [
-        ("milk", "300 ml")
-    ]
+    assert [
+        (ingredient.name, ingredient.quantity_text)
+        for ingredient in overwritten.ingredients
+    ] == [("milk", "300 ml")]
+
+
+@pytest.mark.asyncio
+async def test_save_recipe_allows_own_loose_alias_on_relearn_and_overwrite(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    original = await storage.save_recipe(
+        chat_id=1,
+        name="Солянка",
+        source_url=None,
+        created_by=10,
+        ingredients=[("fresh dill", "8 sprigs")],
+    )
+    await storage.add_recipe_alias(
+        chat_id=1,
+        recipe_name="солянка",
+        alias="солянки",
+        created_by=10,
+    )
+
+    with pytest.raises(RecipeAlreadyExistsError) as error:
+        await storage.save_recipe(
+            chat_id=1,
+            name="Солянка",
+            source_url=None,
+            created_by=20,
+            ingredients=[("tomato paste", "60 g")],
+        )
+
+    assert error.value.recipe.id == original.id
+    assert error.value.recipe.aliases == ("солянки",)
+
+    overwritten = await storage.save_recipe(
+        chat_id=1,
+        name="Солянка",
+        source_url=None,
+        created_by=20,
+        ingredients=[("tomato paste", "60 g")],
+        overwrite=True,
+    )
+
+    assert overwritten.id == original.id
+    assert overwritten.aliases == ("солянки",)
+    assert [
+        (ingredient.name, ingredient.quantity_text)
+        for ingredient in overwritten.ingredients
+    ] == [("tomato paste", "60 g")]
 
 
 @pytest.mark.asyncio
@@ -314,9 +364,51 @@ async def test_guarded_recipe_overwrite_rejects_same_second_content_change(
     loaded = await storage.get_recipe(chat_id=1, name="pancakes")
     assert loaded is not None
     assert loaded.updated_at == original.updated_at
-    assert [(ingredient.name, ingredient.quantity_text) for ingredient in loaded.ingredients] == [
-        ("eggs", "2")
-    ]
+    assert [
+        (ingredient.name, ingredient.quantity_text) for ingredient in loaded.ingredients
+    ] == [("eggs", "2")]
+
+
+@pytest.mark.asyncio
+async def test_recipe_state_digest_ignores_aliases_for_overwrite_guard(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    original = await storage.save_recipe(
+        chat_id=1,
+        name="Pancakes",
+        source_url=None,
+        created_by=10,
+        ingredients=[("flour", "200 g")],
+    )
+    original_digest = recipe_state_digest(original)
+
+    aliased = await storage.add_recipe_alias(
+        chat_id=1,
+        recipe_name="pancakes",
+        alias="breakfast",
+        created_by=10,
+    )
+
+    assert aliased is not None
+    assert recipe_state_digest(aliased) == original_digest
+
+    overwritten = await storage.save_recipe(
+        chat_id=1,
+        name="Pancakes",
+        source_url=None,
+        created_by=20,
+        ingredients=[("milk", "300 ml")],
+        overwrite=True,
+        expected_recipe_id=original.id,
+        expected_normalized_name=original.normalized_name,
+        expected_state_digest=original_digest,
+    )
+
+    assert overwritten.aliases == ("breakfast",)
+    assert [
+        (ingredient.name, ingredient.quantity_text)
+        for ingredient in overwritten.ingredients
+    ] == [("milk", "300 ml")]
 
 
 @pytest.mark.asyncio
@@ -355,6 +447,341 @@ async def test_delete_recipe_is_scoped_by_chat_and_cascades_ingredients(tmp_path
             (chat_1_recipe.id,),
         ).fetchone()[0]
     assert ingredient_count == 0
+
+
+@pytest.mark.asyncio
+async def test_recipe_aliases_are_scoped_and_listed(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+
+    await storage.save_recipe(
+        chat_id=1,
+        name="Солянка",
+        source_url=None,
+        created_by=10,
+        ingredients=[("fresh dill", "8 sprigs")],
+    )
+    await storage.save_recipe(
+        chat_id=2,
+        name="Солянка",
+        source_url=None,
+        created_by=20,
+        ingredients=[("tomato paste", "60 g")],
+    )
+
+    recipe = await storage.add_recipe_alias(
+        chat_id=1,
+        recipe_name="солянка",
+        alias="soup",
+        created_by=10,
+    )
+    loaded = await storage.get_recipe(chat_id=1, name="soup")
+    other_chat_loaded = await storage.get_recipe(chat_id=2, name="soup")
+    recipes = await storage.list_recipes(chat_id=1)
+
+    assert recipe is not None
+    assert recipe.aliases == ("soup",)
+    assert loaded is not None
+    assert loaded.name == "Солянка"
+    assert other_chat_loaded is None
+    assert recipes[0].aliases == ("soup",)
+    assert await storage.delete_recipe(chat_id=1, name="soup") is None
+    assert await storage.get_recipe(chat_id=1, name="soup") is not None
+
+
+@pytest.mark.asyncio
+async def test_recipe_alias_reads_ignore_cross_chat_alias_rows(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    pancakes = await storage.save_recipe(
+        chat_id=1,
+        name="Pancakes",
+        source_url=None,
+        created_by=10,
+        ingredients=[("flour", "200 g")],
+    )
+    await storage.save_recipe(
+        chat_id=2,
+        name="Waffles",
+        source_url=None,
+        created_by=20,
+        ingredients=[("eggs", "2")],
+    )
+    with storage.connect() as db:
+        db.execute(
+            """
+            INSERT INTO recipe_aliases (
+                chat_id, recipe_id, alias, normalized_alias, created_by, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (2, pancakes.id, "breakfast", "breakfast", 20, "2026-05-03T12:00:00+00:00"),
+        )
+        db.commit()
+
+    assert await storage.get_recipe(chat_id=2, name="breakfast") is None
+
+    loaded = await storage.get_recipe(chat_id=1, name="pancakes")
+    recipes = await storage.list_recipes(chat_id=1)
+
+    assert loaded is not None
+    assert loaded.aliases == ()
+    assert recipes[0].aliases == ()
+
+
+@pytest.mark.asyncio
+async def test_recipe_alias_conflicts_with_recipe_names_and_other_aliases(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    await storage.save_recipe(
+        chat_id=1,
+        name="Pancakes",
+        source_url=None,
+        created_by=10,
+        ingredients=[("flour", "200 g")],
+    )
+    await storage.save_recipe(
+        chat_id=1,
+        name="Waffles",
+        source_url=None,
+        created_by=10,
+        ingredients=[("flour", "200 g")],
+    )
+
+    first = await storage.add_recipe_alias(
+        chat_id=1,
+        recipe_name="pancakes",
+        alias="breakfast",
+        created_by=10,
+    )
+    idempotent = await storage.add_recipe_alias(
+        chat_id=1,
+        recipe_name="pancakes",
+        alias="breakfast",
+        created_by=10,
+    )
+
+    assert first is not None
+    assert idempotent is not None
+    assert idempotent.aliases == ("breakfast",)
+
+    with pytest.raises(RecipeAliasConflictError) as alias_error:
+        await storage.add_recipe_alias(
+            chat_id=1,
+            recipe_name="waffles",
+            alias="breakfast",
+            created_by=10,
+        )
+    assert alias_error.value.recipe.name == "Pancakes"
+
+    with pytest.raises(RecipeAliasConflictError) as name_error:
+        await storage.add_recipe_alias(
+            chat_id=1,
+            recipe_name="pancakes",
+            alias="waffles",
+            created_by=10,
+        )
+    assert name_error.value.recipe.name == "Waffles"
+
+    with pytest.raises(RecipeAliasConflictError):
+        await storage.save_recipe(
+            chat_id=1,
+            name="breakfast",
+            source_url=None,
+            created_by=10,
+            ingredients=[("eggs", "2")],
+        )
+
+
+@pytest.mark.asyncio
+async def test_recipe_alias_duplicate_race_converts_to_alias_conflict(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    pancakes = await storage.save_recipe(
+        chat_id=1,
+        name="Pancakes",
+        source_url=None,
+        created_by=10,
+        ingredients=[("flour", "200 g")],
+    )
+    await storage.save_recipe(
+        chat_id=1,
+        name="Waffles",
+        source_url=None,
+        created_by=10,
+        ingredients=[("flour", "200 g")],
+    )
+
+    db = sqlite3.connect(storage.database_path)
+    try:
+        db.execute("PRAGMA foreign_keys = ON")
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            """
+            INSERT INTO recipe_aliases (
+                chat_id, recipe_id, alias, normalized_alias, created_by, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                1,
+                pancakes.id,
+                "breakfast",
+                "breakfast",
+                20,
+                "2026-05-03T12:00:00+00:00",
+            ),
+        )
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                lambda: asyncio.run(
+                    storage.add_recipe_alias(
+                        chat_id=1,
+                        recipe_name="waffles",
+                        alias="breakfast",
+                        created_by=30,
+                    )
+                )
+            )
+        )
+        await asyncio.sleep(0.05)
+        db.commit()
+    finally:
+        db.close()
+
+    with pytest.raises(RecipeAliasConflictError) as error:
+        await asyncio.wait_for(task, timeout=2)
+    assert error.value.recipe.name == "Pancakes"
+
+
+@pytest.mark.asyncio
+async def test_recipe_alias_conflicts_with_loose_recipe_lookup_names(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    await storage.save_recipe(
+        chat_id=1,
+        name="Солянка",
+        source_url=None,
+        created_by=10,
+        ingredients=[("fresh dill", "8 sprigs")],
+    )
+    await storage.save_recipe(
+        chat_id=1,
+        name="Борщ",
+        source_url=None,
+        created_by=10,
+        ingredients=[("beetroot", "2")],
+    )
+
+    with pytest.raises(RecipeAliasConflictError) as error:
+        await storage.add_recipe_alias(
+            chat_id=1,
+            recipe_name="борщ",
+            alias="солянки",
+            created_by=10,
+        )
+
+    assert error.value.recipe.name == "Солянка"
+    loaded = await storage.get_recipe(chat_id=1, name="солянки")
+    assert loaded is not None
+    assert loaded.name == "Солянка"
+
+
+@pytest.mark.asyncio
+async def test_save_recipe_conflicts_with_loose_alias_lookup_names(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    await storage.save_recipe(
+        chat_id=1,
+        name="Борщ",
+        source_url=None,
+        created_by=10,
+        ingredients=[("beetroot", "2")],
+    )
+    await storage.add_recipe_alias(
+        chat_id=1,
+        recipe_name="борщ",
+        alias="солянки",
+        created_by=10,
+    )
+
+    with pytest.raises(RecipeAliasConflictError) as error:
+        await storage.save_recipe(
+            chat_id=1,
+            name="Солянка",
+            source_url=None,
+            created_by=10,
+            ingredients=[("fresh dill", "8 sprigs")],
+        )
+
+    assert error.value.alias == "солянки"
+    assert error.value.recipe.name == "Борщ"
+
+
+@pytest.mark.asyncio
+async def test_save_recipe_name_waits_for_alias_write_before_conflict_check(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    borscht = await storage.save_recipe(
+        chat_id=1,
+        name="Борщ",
+        source_url=None,
+        created_by=10,
+        ingredients=[("beetroot", "2")],
+    )
+
+    db = sqlite3.connect(storage.database_path)
+    try:
+        db.execute("PRAGMA foreign_keys = ON")
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            """
+            INSERT INTO recipe_aliases (
+                chat_id, recipe_id, alias, normalized_alias, created_by, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                1,
+                borscht.id,
+                "солянки",
+                "солянки",
+                20,
+                "2026-05-03T12:00:00+00:00",
+            ),
+        )
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                lambda: asyncio.run(
+                    storage.save_recipe(
+                        chat_id=1,
+                        name="Солянка",
+                        source_url=None,
+                        created_by=30,
+                        ingredients=[("fresh dill", "8 sprigs")],
+                    )
+                )
+            )
+        )
+        await asyncio.sleep(0.05)
+        db.commit()
+    finally:
+        db.close()
+
+    with pytest.raises(RecipeAliasConflictError) as error:
+        await asyncio.wait_for(task, timeout=2)
+
+    assert error.value.alias == "солянки"
+    assert error.value.recipe.name == "Борщ"
+    with storage.connect() as check_db:
+        saved_conflict_name = check_db.execute(
+            """
+            SELECT COUNT(*) FROM recipes
+            WHERE chat_id = ? AND normalized_name = ?
+            """,
+            (1, "солянка"),
+        ).fetchone()[0]
+    assert saved_conflict_name == 0
 
 
 @pytest.mark.asyncio

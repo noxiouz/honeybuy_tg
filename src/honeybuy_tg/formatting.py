@@ -132,7 +132,10 @@ def format_recipe_list(recipes: list[Recipe]) -> str:
         return "No saved recipes yet."
     lines = ["Saved recipes"]
     for recipe in recipes:
-        lines.append(f"• {recipe.name} ({len(recipe.ingredients)} ingredients)")
+        alias_text = f" aliases: {', '.join(recipe.aliases)}" if recipe.aliases else ""
+        lines.append(
+            f"• {recipe.name} ({len(recipe.ingredients)} ingredients){alias_text}"
+        )
     return "\n".join(lines)
 
 

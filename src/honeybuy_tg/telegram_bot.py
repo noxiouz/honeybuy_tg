@@ -67,6 +67,8 @@ from honeybuy_tg.recipes import (
     fetch_recipe_page_text,
     LearnRecipeRequest,
     parse_add_recipe_request,
+    parse_recipe_alias_argument,
+    parse_recipe_alias_request,
     parse_learn_recipe_request,
     looks_like_pasted_recipe_text,
     looks_like_recipe_reuse_request,
@@ -75,6 +77,7 @@ from honeybuy_tg.recipes import (
 )
 from honeybuy_tg.service import ShoppingListService
 from honeybuy_tg.storage import (
+    RecipeAliasConflictError,
     RecipeAlreadyExistsError,
     StaleRecipeOverwriteError,
     Storage,
@@ -657,10 +660,12 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
 
         learn_request = parse_learn_recipe_request(text)
         add_request = parse_add_recipe_request(text)
+        alias_request = parse_recipe_alias_request(text)
         tried_ai_recipe_command = False
         if (
             learn_request is None
             and add_request is None
+            and alias_request is None
             and recipe_command_parser is not None
             and should_try_ai_recipe_command(text)
         ):
@@ -691,6 +696,32 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                     and recipe_command.name is not None
                 ):
                     add_request = AddRecipeRequest(name=recipe_command.name)
+
+        if alias_request is not None:
+            try:
+                recipe = await service.add_recipe_alias(
+                    chat_id=message.chat.id,
+                    recipe_name=alias_request.recipe_name,
+                    alias=alias_request.alias,
+                    user_id=message.from_user.id,
+                )
+            except RecipeAliasConflictError as error:
+                await message.answer(
+                    f"Alias already points to recipe: {error.recipe.name}"
+                )
+                return True
+            except ValueError:
+                await message.answer("Usage: /recipe_alias pancakes = breakfast")
+                return True
+            if recipe is None:
+                await message.answer(
+                    f"I do not know recipe: {alias_request.recipe_name}"
+                )
+                return True
+            await message.answer(
+                f"Saved alias for {recipe.name}: {alias_request.alias}"
+            )
+            return True
 
         if (
             learn_request is None
@@ -729,6 +760,12 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                     message=message,
                     existing_recipe=error.recipe,
                     extracted_recipe=extracted_recipe,
+                )
+                return True
+            except RecipeAliasConflictError as error:
+                await message.answer(
+                    f"Recipe name conflicts with alias: {error.alias}\n"
+                    f"Alias already points to recipe: {error.recipe.name}"
                 )
                 return True
             except Exception as error:
@@ -1470,7 +1507,11 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             )
             return
 
-        async def mark_stale_recipe_overwrite() -> None:
+        async def mark_stale_recipe_overwrite(
+            *,
+            message_text: str,
+            callback_text: str,
+        ) -> None:
             updated = await storage.update_confirmation_status(
                 confirmation_id=confirmation_id,
                 chat_id=callback.message.chat.id,
@@ -1482,11 +1523,8 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                     "This confirmation is no longer active", show_alert=True
                 )
                 return
-            await callback.message.edit_text(
-                "Recipe replacement expired because the saved recipe changed. "
-                "Learn it again to replace the current recipe."
-            )
-            await callback.answer("Recipe changed; learn it again", show_alert=True)
+            await callback.message.edit_text(message_text)
+            await callback.answer(callback_text, show_alert=True)
 
         try:
             recipe = await service.save_recipe(
@@ -1501,7 +1539,24 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 expected_state_digest=target_state_digest,
             )
         except StaleRecipeOverwriteError:
-            await mark_stale_recipe_overwrite()
+            await mark_stale_recipe_overwrite(
+                message_text=(
+                    "Recipe replacement expired because the saved recipe changed. "
+                    "Learn it again to replace the current recipe."
+                ),
+                callback_text="Recipe changed; learn it again",
+            )
+            return
+        except RecipeAliasConflictError as error:
+            await mark_stale_recipe_overwrite(
+                message_text=(
+                    "Recipe replacement expired because the name now matches "
+                    f"alias: {error.alias}\n"
+                    f"Alias already points to recipe: {error.recipe.name}\n"
+                    "Learn it again to replace the current recipe."
+                ),
+                callback_text="Recipe name now points to another recipe",
+            )
             return
 
         resolved = await storage.update_confirmation_status(
@@ -1714,6 +1769,34 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         if not await require_allowed(message):
             return
         await message.answer(format_recipe_list(await service.list_recipes(chat_id=message.chat.id)))
+
+    @router.message(Command("recipe_alias"))
+    async def recipe_alias(message: Message) -> None:
+        if message.from_user is None or not await require_allowed(message):
+            return
+        alias_request = parse_recipe_alias_argument(
+            command_argument(message.text, "/recipe_alias")
+        )
+        if alias_request is None:
+            await message.answer("Usage: /recipe_alias pancakes = breakfast")
+            return
+        try:
+            recipe = await service.add_recipe_alias(
+                chat_id=message.chat.id,
+                recipe_name=alias_request.recipe_name,
+                alias=alias_request.alias,
+                user_id=message.from_user.id,
+            )
+        except RecipeAliasConflictError as error:
+            await message.answer(f"Alias already points to recipe: {error.recipe.name}")
+            return
+        except ValueError:
+            await message.answer("Usage: /recipe_alias pancakes = breakfast")
+            return
+        if recipe is None:
+            await message.answer(f"I do not know recipe: {alias_request.recipe_name}")
+            return
+        await message.answer(f"Saved alias for {recipe.name}: {alias_request.alias}")
 
     @router.message(Command("delete_recipe"))
     async def delete_recipe(message: Message) -> None:
@@ -2067,6 +2150,7 @@ def help_text() -> str:
             "/clear_bought - clear bought items",
             "/clear - clear the whole active list with confirmation",
             "/recipes - show saved recipes",
+            "/recipe_alias pancakes = breakfast - add a recipe alias",
             "/delete_recipe solyanka - delete a saved recipe",
             "/text_parse_mode - configure natural text parsing in this chat",
             "Reply to a voice message with @bot_username to reanalyze it",
@@ -2139,6 +2223,7 @@ async def set_bot_commands(bot: Bot) -> None:
             BotCommand(command="clear_bought", description="Clear bought items"),
             BotCommand(command="clear", description="Clear active list"),
             BotCommand(command="recipes", description="Show saved recipes"),
+            BotCommand(command="recipe_alias", description="Add a recipe alias"),
             BotCommand(command="delete_recipe", description="Delete a saved recipe"),
             BotCommand(command="reanalyze", description="Reanalyze replied voice"),
             BotCommand(command="text_parse_mode", description="Set text parsing mode"),

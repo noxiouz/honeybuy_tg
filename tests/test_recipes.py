@@ -1,6 +1,8 @@
 from honeybuy_tg.recipes import (
     html_to_text,
     parse_add_recipe_request,
+    parse_recipe_alias_argument,
+    parse_recipe_alias_request,
     parse_learn_recipe_request,
     looks_like_recipe_reuse_request,
     recipe_command_from_ai,
@@ -98,6 +100,24 @@ def test_parse_add_recipe_request():
 
     assert parsed is not None
     assert parsed.name == "солянки"
+
+
+def test_parse_recipe_alias_request():
+    parsed = parse_recipe_alias_request("alias recipe pancakes as breakfast")
+
+    assert parsed is not None
+    assert parsed.recipe_name == "pancakes"
+    assert parsed.alias == "breakfast"
+
+    natural = parse_recipe_alias_request("add alias breakfast to pancakes")
+    assert natural is not None
+    assert natural.recipe_name == "pancakes"
+    assert natural.alias == "breakfast"
+
+    command_arg = parse_recipe_alias_argument("солянка = суп")
+    assert command_arg is not None
+    assert command_arg.recipe_name == "солянка"
+    assert command_arg.alias == "суп"
 
 
 def test_ai_recipe_command_detection_is_selective():

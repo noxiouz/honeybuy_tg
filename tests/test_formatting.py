@@ -1,7 +1,12 @@
 from datetime import UTC, datetime
 
-from honeybuy_tg.formatting import format_items, format_shop_mode, format_shop_session
-from honeybuy_tg.models import ItemStatus, ShoppingItem
+from honeybuy_tg.formatting import (
+    format_items,
+    format_recipe_list,
+    format_shop_mode,
+    format_shop_session,
+)
+from honeybuy_tg.models import ItemStatus, Recipe, ShoppingItem
 
 
 def item(item_id: int, name: str) -> ShoppingItem:
@@ -21,6 +26,22 @@ def item(item_id: int, name: str) -> ShoppingItem:
         updated_at=now,
         bought_at=None,
         removed_at=None,
+    )
+
+
+def recipe(name: str, aliases: tuple[str, ...] = ()) -> Recipe:
+    now = datetime.now(UTC)
+    return Recipe(
+        id=1,
+        chat_id=1,
+        name=name,
+        normalized_name=name.casefold(),
+        source_url=None,
+        created_by=1,
+        created_at=now,
+        updated_at=now,
+        aliases=aliases,
+        ingredients=(),
     )
 
 
@@ -81,6 +102,12 @@ def test_format_items_can_use_html_for_telegram():
             "• сыр &lt;брынза&gt;",
         ]
     )
+
+
+def test_format_recipe_list_includes_aliases():
+    text = format_recipe_list([recipe("Pancakes", aliases=("breakfast", "brunch"))])
+
+    assert text == "Saved recipes\n• Pancakes (0 ingredients) aliases: breakfast, brunch"
 
 
 def test_format_shop_mode():

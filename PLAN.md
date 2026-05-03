@@ -1,6 +1,6 @@
 # Honeybuy Telegram Bot Plan
 
-Last updated: 2026-05-02
+Last updated: 2026-05-03
 
 ## Goal
 
@@ -33,7 +33,7 @@ stores state locally in SQLite.
 - Telegram slash command suggestions are registered on bot startup.
 - Commands: `/whoami`, `/start`, `/help`, `/authorize`, `/list`, `/shop`,
   `/add`, `/remove`, `/bought`, `/clear_bought`, `/clear`, `/recipes`,
-  `/delete_recipe`, `/reanalyze`, and `/text_parse_mode`.
+  `/recipe_alias`, `/delete_recipe`, `/reanalyze`, and `/text_parse_mode`.
 - `/clear` requires inline-button confirmation.
 - Natural text parsing modes per chat: `off`, `mention`, or `all`.
 - Voice transcription with duration, file-size, and transcript-length limits.
@@ -48,6 +48,7 @@ stores state locally in SQLite.
   items.
 - Recipe memory from public recipe links: learn, store, list, delete, and reuse recipes.
 - Pasted recipe text can be learned and saved without requiring a public URL.
+- Saved recipes can have chat-scoped aliases and be reused by any alias.
 - Recipe ingredients are deduplicated against active shopping-list items.
 - AI item identity normalization deduplicates equivalent items across languages,
   such as `water` and `вода`, and improves bought/remove matching.
@@ -82,6 +83,7 @@ stores state locally in SQLite.
 - `category_cache`: cached AI category labels.
 - `item_normalization_cache`: cached AI canonical grocery identities.
 - `recipes`: saved recipe headers scoped by chat.
+- `recipe_aliases`: chat-scoped alternate names for saved recipes.
 - `recipe_ingredients`: saved grocery ingredients with optional canonical
   identities.
 - `shop_sessions` and `shop_session_items`: checklist state for `/shop`.
@@ -150,7 +152,7 @@ Optional metrics:
 
 - [x] Recipe deletion.
 - [x] Recipe overwrite confirmation.
-- [ ] Recipe aliases, so one recipe can be recalled by several names.
+- [x] Recipe aliases, so one recipe can be recalled by several names.
 - [ ] Better due-date support in rendered lists.
 - [ ] Optional bought-item history view if it becomes useful.
 - [ ] Decide retention policy for old bought/removed items.
@@ -184,4 +186,4 @@ Optional metrics:
    those paths backfill canonical identities and remove duplicate active rows.
 3. Finish hardening AI response validation and AI metrics status reporting.
 4. Revisit the next product improvement after the current deployed behavior is
-   stable: recipe overwrite confirmation and aliases.
+   stable: better due-date support in rendered lists.

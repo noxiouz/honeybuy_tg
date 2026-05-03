@@ -2,7 +2,11 @@ import pytest
 
 from honeybuy_tg.models import ItemIdentity
 from honeybuy_tg.service import ShoppingListService
-from honeybuy_tg.storage import RecipeAlreadyExistsError, Storage
+from honeybuy_tg.storage import (
+    RecipeAliasConflictError,
+    RecipeAlreadyExistsError,
+    Storage,
+)
 
 
 class FakeItemNormalizer:
@@ -136,6 +140,83 @@ async def test_service_requires_explicit_recipe_overwrite(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_service_allows_recipe_overwrite_with_own_loose_alias(tmp_path):
+    service = ShoppingListService(Storage(tmp_path / "test.sqlite3"))
+    await service.storage.init()
+    original = await service.save_recipe(
+        chat_id=1,
+        name="Солянка",
+        source_url=None,
+        user_id=10,
+        ingredients=[("fresh dill", "8 sprigs")],
+    )
+    await service.add_recipe_alias(
+        chat_id=1,
+        recipe_name="солянка",
+        alias="солянки",
+        user_id=10,
+    )
+
+    with pytest.raises(RecipeAlreadyExistsError) as error:
+        await service.save_recipe(
+            chat_id=1,
+            name="Солянка",
+            source_url=None,
+            user_id=20,
+            ingredients=[("tomato paste", "60 g")],
+        )
+
+    assert error.value.recipe.id == original.id
+    assert error.value.recipe.aliases == ("солянки",)
+
+    overwritten = await service.save_recipe(
+        chat_id=1,
+        name="Солянка",
+        source_url=None,
+        user_id=20,
+        ingredients=[("tomato paste", "60 g")],
+        overwrite=True,
+    )
+
+    assert overwritten.id == original.id
+    assert overwritten.aliases == ("солянки",)
+    assert [(ingredient.name, ingredient.quantity_text) for ingredient in overwritten.ingredients] == [
+        ("tomato paste", "60 g")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_service_rejects_recipe_name_matching_other_recipe_loose_alias(tmp_path):
+    service = ShoppingListService(Storage(tmp_path / "test.sqlite3"))
+    await service.storage.init()
+    await service.save_recipe(
+        chat_id=1,
+        name="Борщ",
+        source_url=None,
+        user_id=10,
+        ingredients=[("beetroot", "2")],
+    )
+    await service.add_recipe_alias(
+        chat_id=1,
+        recipe_name="борщ",
+        alias="солянки",
+        user_id=10,
+    )
+
+    with pytest.raises(RecipeAliasConflictError) as error:
+        await service.save_recipe(
+            chat_id=1,
+            name="Солянка",
+            source_url=None,
+            user_id=20,
+            ingredients=[("fresh dill", "8 sprigs")],
+        )
+
+    assert error.value.alias == "солянки"
+    assert error.value.recipe.name == "Борщ"
+
+
+@pytest.mark.asyncio
 async def test_service_deletes_recipe(tmp_path):
     service = ShoppingListService(Storage(tmp_path / "test.sqlite3"))
     await service.storage.init()
@@ -152,6 +233,37 @@ async def test_service_deletes_recipe(tmp_path):
     assert deleted is not None
     assert deleted.name == "Pancakes"
     assert await service.get_recipe(chat_id=1, name="pancakes") is None
+
+
+@pytest.mark.asyncio
+async def test_service_reuses_recipe_by_alias(tmp_path):
+    service = ShoppingListService(Storage(tmp_path / "test.sqlite3"))
+    await service.storage.init()
+    await service.save_recipe(
+        chat_id=1,
+        name="Pancakes",
+        source_url=None,
+        user_id=10,
+        ingredients=[("flour", "200 g")],
+    )
+
+    aliased = await service.add_recipe_alias(
+        chat_id=1,
+        recipe_name="pancakes",
+        alias="breakfast",
+        user_id=10,
+    )
+    recipe = await service.get_recipe(chat_id=1, name="breakfast")
+
+    assert aliased is not None
+    assert aliased.aliases == ("breakfast",)
+    assert recipe is not None
+    added = await service.add_recipe_ingredients(
+        chat_id=1,
+        recipe=recipe,
+        user_id=10,
+    )
+    assert [item.name for item in added] == ["flour, 200 g"]
 
 
 @pytest.mark.asyncio

@@ -57,4 +57,5 @@ class Recipe:
     created_by: int
     created_at: datetime
     updated_at: datetime
+    aliases: tuple[str, ...] = ()
     ingredients: tuple[RecipeIngredient, ...] = ()

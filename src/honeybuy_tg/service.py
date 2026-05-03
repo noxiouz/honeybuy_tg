@@ -147,6 +147,27 @@ class ShoppingListService:
             raise ValueError("Recipe name is required")
         return await self.storage.delete_recipe(chat_id=chat_id, name=clean_name)
 
+    async def add_recipe_alias(
+        self,
+        *,
+        chat_id: int,
+        recipe_name: str,
+        alias: str,
+        user_id: int,
+    ) -> Recipe | None:
+        clean_recipe_name = " ".join(recipe_name.strip().split())
+        clean_alias = " ".join(alias.strip().split())
+        if not clean_recipe_name:
+            raise ValueError("Recipe name is required")
+        if not clean_alias:
+            raise ValueError("Recipe alias is required")
+        return await self.storage.add_recipe_alias(
+            chat_id=chat_id,
+            recipe_name=clean_recipe_name,
+            alias=clean_alias,
+            created_by=user_id,
+        )
+
     async def add_recipe_ingredients(
         self,
         *,

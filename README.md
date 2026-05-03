@@ -22,6 +22,8 @@ Private Telegram shopping-list bot for one list per chat.
   voice equivalents.
 - Recipe memory from public recipe links or pasted recipe text: teach a recipe,
   store ingredients locally, and later add everything for that recipe.
+- Chat-scoped recipe aliases, so one saved recipe can be reused by several
+  names.
 - Recipe ingredient deduplication against active list items, including base-name
   matches like `tomato paste` vs `tomato paste, 60 g`, plus AI-normalized
   cross-language matches like `томатная паста` vs `tomato paste`.
@@ -137,6 +139,7 @@ env template lives at `deploy/ubuntu/env.example`.
 - `/clear_bought` - remove bought items from active history.
 - `/clear` - clear the whole active list in the current chat, with confirmation.
 - `/recipes` - show saved recipes.
+- `/recipe_alias pancakes = breakfast` - add another name for a saved recipe.
 - `/delete_recipe solyanka` - delete a saved recipe from the current chat.
 - `/reanalyze` - reanalyze a replied-to voice message.
 - `/text_parse_mode` - configure natural text parsing for the current chat.
@@ -229,13 +232,20 @@ Then reuse it later:
 ингредиенты для солянки
 ```
 
+Add extra names for a saved recipe with:
+
+```text
+/recipe_alias солянка = суп
+alias recipe pancakes as breakfast
+```
+
 For URL learning, the bot fetches the recipe page; for pasted text, it uses the
 pasted body as the source. In both cases OpenAI extracts grocery ingredients,
 the bot stores them in SQLite for the current chat, and later adds them to the
 shopping list when requested. Voice reuse commands use AI as a fallback, so the
-wording does not need to match exactly. Delete a saved recipe from the current
-chat with `/delete_recipe солянка`; deletion uses the saved recipe name, not
-loose recipe-reuse matching.
+wording does not need to match exactly. `/recipes` lists saved aliases. Delete a
+saved recipe from the current chat with `/delete_recipe солянка`; deletion uses
+the saved recipe name, not aliases or loose recipe-reuse matching.
 
 ## Metrics
 

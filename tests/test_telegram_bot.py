@@ -1,5 +1,6 @@
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
+import json
 
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
@@ -9,7 +10,7 @@ import pytest
 
 from honeybuy_tg.config import Settings
 from honeybuy_tg.parser import ParsedAction
-from honeybuy_tg.storage import Storage
+from honeybuy_tg.storage import Storage, recipe_state_digest
 from honeybuy_tg.telegram_bot import (
     build_dispatcher,
     build_shop_session_keyboard,
@@ -436,6 +437,104 @@ async def test_text_message_learns_pasted_recipe_with_url_without_source_url(
 
 
 @pytest.mark.asyncio
+async def test_text_message_learn_recipe_reports_alias_conflict(
+    monkeypatch,
+    tmp_path,
+):
+    class FakeRecipeExtractor:
+        def __init__(self, *, api_key, model):
+            pass
+
+        async def extract(self, *, requested_name, source_url, page_text):
+            assert requested_name == "breakfast"
+            assert source_url is None
+            assert "flour 200 g" in page_text
+            return {
+                "name": "Breakfast",
+                "ingredients": [{"name": "flour", "quantity": "200 g"}],
+            }
+
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.RecipeExtractor",
+        FakeRecipeExtractor,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemNormalizer",
+        FakeItemNormalizer,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingTextParser",
+        FakeUnknownShoppingTextParser,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.RecipeCommandParser",
+        FakeUnusedAIClient,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemCategorizer",
+        FakeUnusedAIClient,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.VoiceTranscriber",
+        FakeUnusedAIClient,
+    )
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    await storage.save_recipe(
+        chat_id=1,
+        name="Pancakes",
+        source_url=None,
+        created_by=42,
+        ingredients=[("flour", "200 g")],
+    )
+    await storage.add_recipe_alias(
+        chat_id=1,
+        recipe_name="pancakes",
+        alias="breakfast",
+        created_by=42,
+    )
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+        OPENAI_API_KEY="test",
+        TEXT_PARSE_MODE="all",
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+    update = Update.model_validate(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "date": int(datetime.now(UTC).timestamp()),
+                "chat": {"id": 1, "type": "private"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Owner"},
+                "text": (
+                    "Save recipe breakfast\n"
+                    "Ingredients:\n"
+                    "- flour 200 g\n"
+                    "- milk 300 ml\n"
+                    "Method:\n"
+                    "Mix and fry."
+                ),
+            },
+        }
+    )
+
+    await dispatcher.feed_update(bot, update)
+
+    sent = [
+        request for request in session.requests if isinstance(request, SendMessage)
+    ][-1]
+    assert sent.text == (
+        "Recipe name conflicts with alias: breakfast\n"
+        "Alias already points to recipe: Pancakes"
+    )
+
+
+@pytest.mark.asyncio
 async def test_text_message_confirms_recipe_overwrite_by_requester(
     monkeypatch,
     tmp_path,
@@ -807,6 +906,116 @@ async def test_recipe_overwrite_confirmation_expires_after_delete_and_relearn(
 
 
 @pytest.mark.asyncio
+async def test_recipe_overwrite_confirmation_expires_when_name_becomes_alias(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    original = await storage.save_recipe(
+        chat_id=1,
+        name="Pancakes",
+        source_url=None,
+        created_by=42,
+        ingredients=[("flour", "200 g")],
+    )
+    confirmation_id = await storage.create_pending_confirmation(
+        chat_id=1,
+        user_id=42,
+        source_message_id=10,
+        items_json=json.dumps(
+            {
+                "type": "recipe_overwrite",
+                "name": "Pancakes",
+                "source_url": None,
+                "ingredients": [("milk", "300 ml")],
+                "target_recipe": {
+                    "id": original.id,
+                    "normalized_name": original.normalized_name,
+                    "state_digest": recipe_state_digest(original),
+                },
+            }
+        ),
+    )
+    await storage.delete_recipe(chat_id=1, name="pancakes")
+    await storage.save_recipe(
+        chat_id=1,
+        name="Waffles",
+        source_url=None,
+        created_by=7,
+        ingredients=[("eggs", "2")],
+    )
+    await storage.add_recipe_alias(
+        chat_id=1,
+        recipe_name="waffles",
+        alias="pancakes",
+        created_by=7,
+    )
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+
+    await dispatcher.feed_update(
+        bot,
+        Update.model_validate(
+            {
+                "update_id": 1,
+                "callback_query": {
+                    "id": "owner",
+                    "from": {"id": 42, "is_bot": False, "first_name": "Owner"},
+                    "chat_instance": "chat-1",
+                    "message": {
+                        "message_id": 101,
+                        "date": int(datetime.now(UTC).timestamp()),
+                        "chat": {"id": 1, "type": "private"},
+                        "text": "Recipe already exists: Pancakes",
+                    },
+                    "data": f"recipe_overwrite:confirm:{confirmation_id}",
+                },
+            }
+        ),
+    )
+
+    answers = [
+        request for request in session.requests if isinstance(request, AnswerCallbackQuery)
+    ]
+    assert answers[-1].text == "Recipe name now points to another recipe"
+    assert answers[-1].show_alert is True
+    edited = [
+        request for request in session.requests if isinstance(request, EditMessageText)
+    ]
+    assert edited[-1].text == (
+        "Recipe replacement expired because the name now matches alias: pancakes\n"
+        "Alias already points to recipe: Waffles\n"
+        "Learn it again to replace the current recipe."
+    )
+    assert (
+        await storage.get_pending_confirmation(
+            confirmation_id=confirmation_id,
+            chat_id=1,
+        )
+        is None
+    )
+    with storage.connect() as db:
+        status = db.execute(
+            "SELECT status FROM pending_confirmations WHERE id = ?",
+            (confirmation_id,),
+        ).fetchone()["status"]
+    assert status == "stale_recipe_overwrite"
+    recipes = await storage.list_recipes(chat_id=1)
+    assert [(recipe.name, recipe.aliases) for recipe in recipes] == [
+        ("Waffles", ("pancakes",))
+    ]
+    loaded = await storage.get_recipe(chat_id=1, name="waffles")
+    assert loaded is not None
+    assert [(ingredient.name, ingredient.quantity_text) for ingredient in loaded.ingredients] == [
+        ("eggs", "2")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_recipe_overwrite_callback_rejects_malformed_data(tmp_path):
     storage = Storage(tmp_path / "test.sqlite3")
     await storage.init()
@@ -1140,6 +1349,50 @@ async def test_delete_recipe_command_deletes_saved_recipe(tmp_path):
     )
     assert sent.text == "Deleted recipe: Pancakes"
     assert await storage.get_recipe(chat_id=1, name="pancakes") is None
+
+
+@pytest.mark.asyncio
+async def test_recipe_alias_command_adds_alias_for_reuse(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    await storage.save_recipe(
+        chat_id=1,
+        name="Pancakes",
+        source_url=None,
+        created_by=42,
+        ingredients=[("flour", "200 g")],
+    )
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+    update = Update.model_validate(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "date": int(datetime.now(UTC).timestamp()),
+                "chat": {"id": 1, "type": "private"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Owner"},
+                "text": "/recipe_alias pancakes = breakfast",
+                "entities": [{"type": "bot_command", "offset": 0, "length": 13}],
+            },
+        }
+    )
+
+    await dispatcher.feed_update(bot, update)
+
+    sent = next(
+        request for request in session.requests if isinstance(request, SendMessage)
+    )
+    loaded = await storage.get_recipe(chat_id=1, name="breakfast")
+    assert sent.text == "Saved alias for Pancakes: breakfast"
+    assert loaded is not None
+    assert loaded.name == "Pancakes"
 
 
 @pytest.mark.asyncio

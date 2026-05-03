@@ -24,6 +24,12 @@ class AddRecipeRequest:
 
 
 @dataclass(frozen=True)
+class RecipeAliasRequest:
+    recipe_name: str
+    alias: str
+
+
+@dataclass(frozen=True)
 class RecipeCommand:
     action: Literal["learn_recipe", "add_recipe", "unknown"]
     name: str | None = None
@@ -138,10 +144,7 @@ def looks_like_pasted_recipe_text(text: str) -> bool:
     ):
         return True
     return (
-        sum(
-            1 for line in text.splitlines() if line.strip().startswith(("-", "•"))
-        )
-        >= 2
+        sum(1 for line in text.splitlines() if line.strip().startswith(("-", "•"))) >= 2
     )
 
 
@@ -176,6 +179,56 @@ def parse_add_recipe_request(text: str) -> AddRecipeRequest | None:
             name = normalized[len(prefix) :].strip(" -:,.")
             if name:
                 return AddRecipeRequest(name=name)
+    return None
+
+
+def parse_recipe_alias_request(text: str) -> RecipeAliasRequest | None:
+    normalized = normalize_recipe_command_text(text)
+    for prefix in (
+        "add recipe alias",
+        "recipe alias",
+        "alias recipe",
+        "add alias",
+        "alias",
+        "добавь псевдоним",
+        "добавить псевдоним",
+        "псевдоним",
+        "добавь алиас",
+        "добавить алиас",
+        "алиас",
+    ):
+        if normalized.startswith(prefix + " "):
+            argument = normalized[len(prefix) :]
+            if prefix == "add alias":
+                alias_first = parse_recipe_alias_to_argument(argument)
+                if alias_first is not None:
+                    return alias_first
+            return parse_recipe_alias_argument(argument)
+    return None
+
+
+def parse_recipe_alias_argument(text: str) -> RecipeAliasRequest | None:
+    normalized = normalize_recipe_command_text(text).strip(" -:,.")
+    for separator in (" = ", " as ", " to ", " как "):
+        recipe_name, found, alias = normalized.partition(separator)
+        if not found:
+            continue
+        recipe_name = recipe_name.strip(" -:,.")
+        alias = alias.strip(" -:,.")
+        if recipe_name and alias:
+            return RecipeAliasRequest(recipe_name=recipe_name, alias=alias)
+    return None
+
+
+def parse_recipe_alias_to_argument(text: str) -> RecipeAliasRequest | None:
+    normalized = normalize_recipe_command_text(text).strip(" -:,.")
+    alias, found, recipe_name = normalized.partition(" to ")
+    if not found:
+        return None
+    alias = alias.strip(" -:,.")
+    recipe_name = recipe_name.strip(" -:,.")
+    if recipe_name and alias:
+        return RecipeAliasRequest(recipe_name=recipe_name, alias=alias)
     return None
 
 
