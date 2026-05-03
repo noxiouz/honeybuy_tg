@@ -299,10 +299,11 @@ async def test_mention_reply_to_text_parses_replied_text(tmp_path):
         for request in session.requests
         if isinstance(request, SetMessageReaction)
     ]
-    assert len(reactions) == 1
-    assert reactions[0].chat_id == 1
-    assert reactions[0].message_id == 10
-    assert reactions[0].reaction[0].emoji == "👀"
+    assert [(reaction.chat_id, reaction.message_id) for reaction in reactions] == [
+        (1, 11),
+        (1, 10),
+    ]
+    assert [reaction.reaction[0].emoji for reaction in reactions] == ["👀", "👀"]
     assert all(
         request.text != "Reply to a voice message and mention me."
         for request in sent_messages
@@ -402,10 +403,107 @@ async def test_mention_reply_to_external_voice_reprocesses_voice(
     items = await storage.list_items(chat_id=1)
     assert [item.name for item in items] == ["молоко"]
     assert sent_messages[-1].text.startswith("Transcript: купи молоко\n\nAdded")
+    reactions = [
+        request
+        for request in session.requests
+        if isinstance(request, SetMessageReaction)
+    ]
+    assert [(reaction.chat_id, reaction.message_id) for reaction in reactions] == [
+        (1, 10)
+    ]
+    assert reactions[0].reaction[0].emoji == "👀"
     assert all(
         request.text != "Reply to a voice message and mention me."
         for request in sent_messages
     )
+
+
+@pytest.mark.asyncio
+async def test_mention_reply_to_voice_reacts_to_command_and_voice_source(
+    monkeypatch,
+    tmp_path,
+):
+    async def fake_convert_voice_to_webm(*, source_path, webm_path):
+        webm_path.write_bytes(source_path.read_bytes())
+
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.VoiceTranscriber",
+        FakeVoiceTranscriber,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.convert_voice_to_webm",
+        fake_convert_voice_to_webm,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemNormalizer",
+        FakeItemNormalizer,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingTextParser",
+        FakeAddShoppingTextParser,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.RecipeCommandParser",
+        FakeUnusedAIClient,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemCategorizer",
+        FakeUnusedAIClient,
+    )
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+        OPENAI_API_KEY="test",
+        TEXT_PARSE_MODE="all",
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+    now = int(datetime.now(UTC).timestamp())
+
+    await dispatcher.feed_update(
+        bot,
+        Update.model_validate(
+            {
+                "update_id": 1,
+                "message": {
+                    "message_id": 11,
+                    "date": now,
+                    "chat": {"id": 1, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Owner"},
+                    "text": "@HoneyBuyBot",
+                    "reply_to_message": {
+                        "message_id": 10,
+                        "date": now,
+                        "chat": {"id": 1, "type": "private"},
+                        "from": {"id": 7, "is_bot": False, "first_name": "Sender"},
+                        "voice": {
+                            "file_id": "voice-file",
+                            "file_unique_id": "voice-unique",
+                            "duration": 1,
+                            "file_size": 10,
+                        },
+                    },
+                },
+            }
+        ),
+    )
+
+    reactions = [
+        request
+        for request in session.requests
+        if isinstance(request, SetMessageReaction)
+    ]
+    items = await storage.list_items(chat_id=1)
+    assert [item.name for item in items] == ["молоко"]
+    assert [(reaction.chat_id, reaction.message_id) for reaction in reactions] == [
+        (1, 11),
+        (1, 10),
+    ]
+    assert [reaction.reaction[0].emoji for reaction in reactions] == ["👀", "👀"]
 
 
 @pytest.mark.asyncio

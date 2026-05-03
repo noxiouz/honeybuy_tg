@@ -1164,7 +1164,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         source_message: VoiceSourceMessage,
         fallback_chat_id: int,
     ) -> None:
-        message_id = source_message.message_id
+        message_id = getattr(source_message, "message_id", None)
         if message_id is None:
             return
         chat = getattr(source_message, "chat", None)
@@ -1182,6 +1182,24 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 message_id,
                 exc_info=True,
             )
+
+    async def react_to_handled_messages(
+        *,
+        bot: Bot,
+        command_message: Message,
+        source_message: VoiceSourceMessage,
+    ) -> None:
+        if source_message is not command_message:
+            await react_to_source_message(
+                bot=bot,
+                source_message=command_message,
+                fallback_chat_id=command_message.chat.id,
+            )
+        await react_to_source_message(
+            bot=bot,
+            source_message=source_message,
+            fallback_chat_id=command_message.chat.id,
+        )
 
     async def process_voice_source(
         *,
@@ -1247,10 +1265,10 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 "OPENAI_API_KEY is not configured for voice messages."
             )
             return
-        await react_to_source_message(
+        await react_to_handled_messages(
             bot=bot,
+            command_message=command_message,
             source_message=voice_message,
-            fallback_chat_id=command_message.chat.id,
         )
 
         try:
@@ -1984,10 +2002,10 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                     source_message = reply_source
                     parsed_text = source_message_text(reply_source)
             if await apply_recipe_command(message, parsed_text, source="text"):
-                await react_to_source_message(
+                await react_to_handled_messages(
                     bot=bot,
+                    command_message=message,
                     source_message=source_message,
-                    fallback_chat_id=message.chat.id,
                 )
                 return
             parsed = await parse_text_with_ai_fallback(parsed_text)
@@ -1997,17 +2015,17 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 text=parsed_text,
             )
             if handled_reply_context:
-                await react_to_source_message(
+                await react_to_handled_messages(
                     bot=bot,
+                    command_message=message,
                     source_message=source_message,
-                    fallback_chat_id=message.chat.id,
                 )
                 return
             if parsed.action != ParsedAction.UNKNOWN:
-                await react_to_source_message(
+                await react_to_handled_messages(
                     bot=bot,
+                    command_message=message,
                     source_message=source_message,
-                    fallback_chat_id=message.chat.id,
                 )
                 await apply_parsed_command(message, parsed)
                 await storage.log_event(
