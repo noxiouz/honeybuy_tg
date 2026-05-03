@@ -157,6 +157,57 @@ def test_mention_text_can_be_parsed_as_bought_message():
 
 
 @pytest.mark.asyncio
+async def test_mention_reply_to_text_parses_replied_text(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+        OPENAI_API_KEY=None,
+        TEXT_PARSE_MODE="mention",
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+    now = int(datetime.now(UTC).timestamp())
+
+    await dispatcher.feed_update(
+        bot,
+        Update.model_validate(
+            {
+                "update_id": 1,
+                "message": {
+                    "message_id": 11,
+                    "date": now,
+                    "chat": {"id": 1, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Owner"},
+                    "text": "@HoneyBuyBot",
+                    "reply_to_message": {
+                        "message_id": 10,
+                        "date": now,
+                        "chat": {"id": 1, "type": "private"},
+                        "from": {"id": 7, "is_bot": False, "first_name": "Sender"},
+                        "text": "купи молоко",
+                    },
+                },
+            }
+        ),
+    )
+
+    sent_messages = [
+        request for request in session.requests if isinstance(request, SendMessage)
+    ]
+    items = await storage.list_items(chat_id=1)
+    assert [item.name for item in items] == ["молоко"]
+    assert sent_messages[-1].text.startswith("Added")
+    assert all(
+        request.text != "Reply to a voice message and mention me."
+        for request in sent_messages
+    )
+
+
+@pytest.mark.asyncio
 async def test_mention_reply_to_external_voice_reprocesses_voice(
     monkeypatch,
     tmp_path,

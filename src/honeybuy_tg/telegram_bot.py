@@ -258,6 +258,14 @@ def voice_reanalysis_source_message(message: Message) -> VoiceSourceMessage | No
     return None
 
 
+def reply_text_parse_source(message: Message) -> str | None:
+    for reply in (message.reply_to_message, message.external_reply):
+        text = getattr(reply, "text", None)
+        if isinstance(text, str) and text.strip():
+            return text
+    return None
+
+
 def has_reply_context(message: Message) -> bool:
     return message.reply_to_message is not None or message.external_reply is not None
 
@@ -1908,16 +1916,17 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             bot_username=bot_user.username,
         ) and has_reply_context(message):
             voice_source = voice_reanalysis_source_message(message)
-            if voice_source is None:
+            if voice_source is not None:
+                await process_voice_source(
+                    command_message=message,
+                    voice_message=voice_source,
+                    bot=bot,
+                    source="reply_mention",
+                )
+                return
+            if is_explicit_voice_reanalysis_command(message.text):
                 await message.answer("Reply to a voice message and mention me.")
                 return
-            await process_voice_source(
-                command_message=message,
-                voice_message=voice_source,
-                bot=bot,
-                source="reply_mention",
-            )
-            return
 
         if is_explicit_voice_reanalysis_command(message.text):
             await message.answer("Reply to a voice message and mention me.")
@@ -1931,6 +1940,8 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             if not await require_allowed(message):
                 return
             parsed_text = strip_bot_mention(message.text, bot_username=bot_user.username)
+            if not parsed_text:
+                parsed_text = reply_text_parse_source(message) or parsed_text
             if await apply_recipe_command(message, parsed_text, source="text"):
                 return
             parsed = await parse_text_with_ai_fallback(parsed_text)
