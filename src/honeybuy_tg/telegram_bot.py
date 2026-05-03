@@ -22,6 +22,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    ReactionTypeEmoji,
     TelegramObject,
 )
 
@@ -89,6 +90,7 @@ from honeybuy_tg.storage import (
 logger = logging.getLogger(__name__)
 
 LAST_ADDED_REFERENCE = "__last_added__"
+HANDLED_MESSAGE_REACTION = "👀"
 
 CONTEXT_ITEM_REFERENCES = {
     "это",
@@ -258,12 +260,17 @@ def voice_reanalysis_source_message(message: Message) -> VoiceSourceMessage | No
     return None
 
 
-def reply_text_parse_source(message: Message) -> str | None:
+def reply_text_parse_source_message(message: Message) -> VoiceSourceMessage | None:
     for reply in (message.reply_to_message, message.external_reply):
         text = getattr(reply, "text", None)
         if isinstance(text, str) and text.strip():
-            return text
+            return reply
     return None
+
+
+def source_message_text(source_message: VoiceSourceMessage) -> str:
+    text = getattr(source_message, "text", None)
+    return text.strip() if isinstance(text, str) else ""
 
 
 def has_reply_context(message: Message) -> bool:
@@ -1151,6 +1158,31 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             default_action=default_action,
         )
 
+    async def react_to_source_message(
+        *,
+        bot: Bot,
+        source_message: VoiceSourceMessage,
+        fallback_chat_id: int,
+    ) -> None:
+        message_id = source_message.message_id
+        if message_id is None:
+            return
+        chat = getattr(source_message, "chat", None)
+        chat_id = chat.id if chat is not None else fallback_chat_id
+        try:
+            await bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=[ReactionTypeEmoji(emoji=HANDLED_MESSAGE_REACTION)],
+            )
+        except Exception:
+            logger.warning(
+                "Telegram rejected handled-message reaction chat_id=%s message_id=%s",
+                chat_id,
+                message_id,
+                exc_info=True,
+            )
+
     async def process_voice_source(
         *,
         command_message: Message,
@@ -1215,6 +1247,11 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 "OPENAI_API_KEY is not configured for voice messages."
             )
             return
+        await react_to_source_message(
+            bot=bot,
+            source_message=voice_message,
+            fallback_chat_id=command_message.chat.id,
+        )
 
         try:
             with TemporaryDirectory() as temp_dir:
@@ -1939,10 +1976,19 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         ):
             if not await require_allowed(message):
                 return
+            source_message: VoiceSourceMessage = message
             parsed_text = strip_bot_mention(message.text, bot_username=bot_user.username)
             if not parsed_text:
-                parsed_text = reply_text_parse_source(message) or parsed_text
+                reply_source = reply_text_parse_source_message(message)
+                if reply_source is not None:
+                    source_message = reply_source
+                    parsed_text = source_message_text(reply_source)
             if await apply_recipe_command(message, parsed_text, source="text"):
+                await react_to_source_message(
+                    bot=bot,
+                    source_message=source_message,
+                    fallback_chat_id=message.chat.id,
+                )
                 return
             parsed = await parse_text_with_ai_fallback(parsed_text)
             handled_reply_context = await apply_reply_context_command(
@@ -1951,8 +1997,18 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 text=parsed_text,
             )
             if handled_reply_context:
+                await react_to_source_message(
+                    bot=bot,
+                    source_message=source_message,
+                    fallback_chat_id=message.chat.id,
+                )
                 return
             if parsed.action != ParsedAction.UNKNOWN:
+                await react_to_source_message(
+                    bot=bot,
+                    source_message=source_message,
+                    fallback_chat_id=message.chat.id,
+                )
                 await apply_parsed_command(message, parsed)
                 await storage.log_event(
                     chat_id=message.chat.id,

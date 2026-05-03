@@ -10,6 +10,7 @@ from aiogram.methods import (
     GetFile,
     GetMe,
     SendMessage,
+    SetMessageReaction,
 )
 from aiogram.types import Chat, File, Message, Update, User
 import pytest
@@ -45,6 +46,7 @@ class FakeTelegramSession(BaseSession):
         super().__init__()
         self.requests = []
         self.next_message_id = 100
+        self.fail_reactions = False
 
     async def close(self) -> None:
         pass
@@ -83,6 +85,10 @@ class FakeTelegramSession(BaseSession):
                 file_unique_id="voice-unique",
                 file_path="voice.ogg",
             )
+        if isinstance(method, SetMessageReaction):
+            if self.fail_reactions:
+                raise RuntimeError("reaction failed")
+            return True
         if isinstance(method, EditMessageText | AnswerCallbackQuery):
             return True
         raise AssertionError(f"Unexpected Telegram method: {type(method).__name__}")
@@ -157,6 +163,93 @@ def test_mention_text_can_be_parsed_as_bought_message():
 
 
 @pytest.mark.asyncio
+async def test_text_message_reacts_to_processed_message(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+        OPENAI_API_KEY=None,
+        TEXT_PARSE_MODE="all",
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+    now = int(datetime.now(UTC).timestamp())
+
+    await dispatcher.feed_update(
+        bot,
+        Update.model_validate(
+            {
+                "update_id": 1,
+                "message": {
+                    "message_id": 10,
+                    "date": now,
+                    "chat": {"id": 1, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Owner"},
+                    "text": "купи молоко",
+                },
+            }
+        ),
+    )
+
+    reactions = [
+        request
+        for request in session.requests
+        if isinstance(request, SetMessageReaction)
+    ]
+    assert len(reactions) == 1
+    assert reactions[0].chat_id == 1
+    assert reactions[0].message_id == 10
+    assert reactions[0].reaction[0].emoji == "👀"
+
+
+@pytest.mark.asyncio
+async def test_text_message_reaction_failure_does_not_block_processing(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+        OPENAI_API_KEY=None,
+        TEXT_PARSE_MODE="all",
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    session.fail_reactions = True
+    bot = Bot(settings.telegram_bot_token, session=session)
+    now = int(datetime.now(UTC).timestamp())
+
+    await dispatcher.feed_update(
+        bot,
+        Update.model_validate(
+            {
+                "update_id": 1,
+                "message": {
+                    "message_id": 10,
+                    "date": now,
+                    "chat": {"id": 1, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Owner"},
+                    "text": "купи молоко",
+                },
+            }
+        ),
+    )
+
+    items = await storage.list_items(chat_id=1)
+    sent_messages = [
+        request for request in session.requests if isinstance(request, SendMessage)
+    ]
+    assert [item.name for item in items] == ["молоко"]
+    assert sent_messages[-1].text.startswith("Added")
+    assert any(
+        isinstance(request, SetMessageReaction) for request in session.requests
+    )
+
+
+@pytest.mark.asyncio
 async def test_mention_reply_to_text_parses_replied_text(tmp_path):
     storage = Storage(tmp_path / "test.sqlite3")
     await storage.init()
@@ -201,6 +294,15 @@ async def test_mention_reply_to_text_parses_replied_text(tmp_path):
     items = await storage.list_items(chat_id=1)
     assert [item.name for item in items] == ["молоко"]
     assert sent_messages[-1].text.startswith("Added")
+    reactions = [
+        request
+        for request in session.requests
+        if isinstance(request, SetMessageReaction)
+    ]
+    assert len(reactions) == 1
+    assert reactions[0].chat_id == 1
+    assert reactions[0].message_id == 10
+    assert reactions[0].reaction[0].emoji == "👀"
     assert all(
         request.text != "Reply to a voice message and mention me."
         for request in sent_messages
@@ -304,6 +406,85 @@ async def test_mention_reply_to_external_voice_reprocesses_voice(
         request.text != "Reply to a voice message and mention me."
         for request in sent_messages
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_voice_message_reacts_to_voice_source(
+    monkeypatch,
+    tmp_path,
+):
+    async def fake_convert_voice_to_webm(*, source_path, webm_path):
+        webm_path.write_bytes(source_path.read_bytes())
+
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.VoiceTranscriber",
+        FakeVoiceTranscriber,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.convert_voice_to_webm",
+        fake_convert_voice_to_webm,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemNormalizer",
+        FakeItemNormalizer,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingTextParser",
+        FakeAddShoppingTextParser,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.RecipeCommandParser",
+        FakeUnusedAIClient,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemCategorizer",
+        FakeUnusedAIClient,
+    )
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+        OPENAI_API_KEY="test",
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+    now = int(datetime.now(UTC).timestamp())
+
+    await dispatcher.feed_update(
+        bot,
+        Update.model_validate(
+            {
+                "update_id": 1,
+                "message": {
+                    "message_id": 10,
+                    "date": now,
+                    "chat": {"id": 1, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Owner"},
+                    "voice": {
+                        "file_id": "voice-file",
+                        "file_unique_id": "voice-unique",
+                        "duration": 1,
+                        "file_size": 10,
+                    },
+                },
+            }
+        ),
+    )
+
+    reactions = [
+        request
+        for request in session.requests
+        if isinstance(request, SetMessageReaction)
+    ]
+    items = await storage.list_items(chat_id=1)
+    assert [item.name for item in items] == ["молоко"]
+    assert len(reactions) == 1
+    assert reactions[0].chat_id == 1
+    assert reactions[0].message_id == 10
+    assert reactions[0].reaction[0].emoji == "👀"
 
 
 class FakeStorage:
