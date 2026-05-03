@@ -21,7 +21,8 @@ stores state locally in SQLite.
   normalization.
 - Prometheus metrics can be enabled for Grafana dashboards.
 - Item-normalization and active-list deduplication work is committed. Watch the
-  first production `/list` and `/shop` runs after deploy because they can
+  first identity-touching smoke run against old rows after deploy, explicitly
+  including `/list`, `/shop`, `/remove`, and `/bought`, because those paths can
   backfill canonical identities and remove duplicate active rows.
 
 ## Shipped Features
@@ -143,7 +144,17 @@ Optional metrics:
 - [ ] Manual Telegram group-chat smoke test after each deploy.
 - [ ] Manual unauthorized-user check after auth changes.
 - [ ] Manual voice test after transcription/parser changes.
-- [ ] Manual recipe-link test after recipe extraction changes.
+- [ ] Manual recipe-link smoke test after recipe-flow changes touching parser,
+  bot handlers, service logic, extraction/storage, overwrite confirmations,
+  aliases, or recipe commands.
+- [ ] Manual pasted-recipe smoke test after recipe-flow changes touching parser,
+  bot handlers, service logic, extraction/storage, or confirmations.
+- [ ] Manual recipe delete smoke test after recipe-flow changes touching bot
+  handlers, service logic, storage, or confirmations.
+- [ ] Manual recipe overwrite confirmation smoke test after recipe-flow changes
+  touching bot handlers, service logic, storage, extraction, or confirmations.
+- [ ] Manual recipe alias smoke test after recipe-flow changes touching parser,
+  bot handlers, service logic, storage, aliases, or recipe commands.
 - [ ] Manual `/shop` checklist test after formatting/callback changes.
 
 ## Backlog
@@ -180,10 +191,16 @@ Optional metrics:
 
 ## Current Next Steps
 
-1. Deploy the normalization, cross-language matching, and active-list dedupe
+1. Deploy the current local commits, including the completed code hardening,
+   recipe-flow, normalization, cross-language matching, and active-list dedupe
    work.
-2. Watch production logs after `/list` or `/shop` runs against old rows, because
-   those paths backfill canonical identities and remove duplicate active rows.
-3. Finish hardening AI response validation and AI metrics status reporting.
-4. Revisit the next product improvement after the current deployed behavior is
-   stable: better due-date support in rendered lists.
+2. Watch production logs during the first identity-touching smoke run against
+   old rows, explicitly including `/list`, `/shop`, `/remove`, and `/bought`,
+   because those paths can backfill canonical identities and remove duplicate
+   active rows.
+3. Run manual Telegram smoke checks in private chat and group chat:
+   authorization, `/add`, `/list`, `/shop`, `/remove`, `/bought`, voice input,
+   recipe link learning, pasted recipe learning, recipe delete, overwrite
+   confirmation, and recipe aliases.
+4. Keep product work paused until deploy and smoke checks are complete. The next
+   product candidate remains better due-date support in rendered lists.
