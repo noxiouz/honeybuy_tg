@@ -1,8 +1,16 @@
 import asyncio
+import shutil
 import sqlite3
+from collections.abc import Iterable
+from pathlib import Path
 
 import pytest
 
+from honeybuy_tg.migrations import (
+    CURRENT_SCHEMA_VERSION,
+    migrate_database_path,
+    run_migrations,
+)
 from honeybuy_tg.models import ItemIdentity, ItemStatus
 from honeybuy_tg.storage import (
     RecipeAliasConflictError,
@@ -11,6 +19,9 @@ from honeybuy_tg.storage import (
     Storage,
     recipe_state_digest,
 )
+
+
+REMOTE_DB_FIXTURE = Path("/tmp/honeybuy_remote.sqlite3")
 
 
 @pytest.mark.asyncio
@@ -89,6 +100,46 @@ async def test_authorized_chat(tmp_path):
     )
 
     assert await storage.is_chat_authorized(100)
+
+
+@pytest.mark.asyncio
+async def test_init_creates_current_schema_version(tmp_path):
+    database_path = tmp_path / "test.sqlite3"
+    storage = Storage(database_path)
+
+    await storage.init()
+
+    with sqlite3.connect(database_path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+        assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        tables = _table_names(db)
+        assert {
+            "shopping_items",
+            "category_cache",
+            "item_normalization_cache",
+            "recipe_aliases",
+            "shop_sessions",
+        } <= tables
+        assert {"canonical_name", "canonical_key"} <= _column_names(
+            db, "shopping_items"
+        )
+        assert {"canonical_name", "canonical_key"} <= _column_names(
+            db, "recipe_ingredients"
+        )
+        assert "category" in _column_names(db, "shop_sessions")
+
+
+def test_run_migrations_reads_user_version_after_begin_immediate():
+    statements: list[str] = []
+    with sqlite3.connect(":memory:") as db:
+        db.set_trace_callback(statements.append)
+
+        run_migrations(db)
+
+    begin_index = statements.index("BEGIN IMMEDIATE")
+    user_version_index = statements.index("PRAGMA user_version")
+
+    assert begin_index < user_version_index
 
 
 @pytest.mark.asyncio
@@ -927,10 +978,21 @@ async def test_init_migrates_old_shop_sessions_table_without_category(tmp_path):
     await storage.init()
 
     with storage.connect() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
         columns = {
             row["name"] for row in db.execute("PRAGMA table_info(shop_sessions)")
         }
+        tables = {
+            row["name"]
+            for row in db.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                """
+            )
+        }
     assert "category" in columns
+    assert "recipe_aliases" in tables
     assert [
         (row["item_id"], row["item_text"], row["category"], row["checked"])
         for row in await storage.get_shop_session_items(chat_id=1, message_id=100)
@@ -945,3 +1007,137 @@ async def test_init_migrates_old_shop_sessions_table_without_category(tmp_path):
         (row["item_id"], row["item_text"], row["category"], row["checked"])
         for row in await storage.get_shop_session_items(chat_id=1, message_id=101)
     ] == [(1, "Milk", "Dairy", 0)]
+
+
+def test_migrates_old_shopping_items_table_without_canonical_columns(tmp_path):
+    database_path = tmp_path / "test.sqlite3"
+    now = "2026-01-01T00:00:00+00:00"
+    with sqlite3.connect(database_path) as db:
+        db.execute(
+            """
+            CREATE TABLE shopping_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                quantity REAL,
+                unit TEXT,
+                note TEXT,
+                due_date TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                bought_at TEXT,
+                removed_at TEXT
+            )
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO shopping_items (
+                chat_id, name, normalized_name, status, created_by, created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (1, "Milk", "milk", "active", 10, now, now),
+        )
+        db.commit()
+
+    result = migrate_database_path(database_path)
+
+    assert result.old_version == 0
+    assert result.new_version == CURRENT_SCHEMA_VERSION
+    assert result.integrity_check == "ok"
+    assert result.applied_versions == (1,)
+
+    with sqlite3.connect(database_path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+        assert {"canonical_name", "canonical_key"} <= _column_names(
+            db, "shopping_items"
+        )
+        assert "idx_shopping_items_chat_canonical_key" in _index_names(
+            db, "shopping_items"
+        )
+        rows = db.execute(
+            """
+            SELECT name, canonical_name, canonical_key
+            FROM shopping_items
+            """
+        ).fetchall()
+
+    assert rows == [("Milk", None, None)]
+
+
+def test_migrates_copied_remote_database_fixture(tmp_path):
+    if not REMOTE_DB_FIXTURE.exists():
+        pytest.skip(f"{REMOTE_DB_FIXTURE} is not available")
+
+    database_path = tmp_path / "remote.sqlite3"
+    shutil.copy2(REMOTE_DB_FIXTURE, database_path)
+
+    with sqlite3.connect(database_path) as db:
+        old_version = db.execute("PRAGMA user_version").fetchone()[0]
+        before_counts = _table_counts(db)
+
+    result = migrate_database_path(database_path)
+
+    assert result.old_version == old_version
+    assert result.new_version == CURRENT_SCHEMA_VERSION
+    assert result.integrity_check == "ok"
+    if old_version < CURRENT_SCHEMA_VERSION:
+        assert result.changed
+        assert result.applied_versions == (CURRENT_SCHEMA_VERSION,)
+    else:
+        assert not result.changed
+        assert result.applied_versions == ()
+
+    with sqlite3.connect(database_path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+        assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert _table_counts(db, before_counts.keys()) == before_counts
+        tables = _table_names(db)
+        assert {
+            "recipe_aliases",
+            "category_cache",
+            "item_normalization_cache",
+        } <= tables
+        assert {"canonical_name", "canonical_key"} <= _column_names(
+            db, "shopping_items"
+        )
+        assert {"canonical_name", "canonical_key"} <= _column_names(
+            db, "recipe_ingredients"
+        )
+        assert "category" in _column_names(db, "shop_sessions")
+        assert "idx_shopping_items_chat_canonical_key" in _index_names(
+            db, "shopping_items"
+        )
+
+
+def _table_names(db: sqlite3.Connection) -> set[str]:
+    return {
+        row[0]
+        for row in db.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+            """
+        )
+    }
+
+
+def _table_counts(
+    db: sqlite3.Connection,
+    table_names: Iterable[str] | None = None,
+) -> dict[str, int]:
+    names = sorted(table_names if table_names is not None else _table_names(db))
+    return {name: db.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0] for name in names}
+
+
+def _column_names(db: sqlite3.Connection, table_name: str) -> set[str]:
+    return {row[1] for row in db.execute(f"PRAGMA table_info({table_name})")}
+
+
+def _index_names(db: sqlite3.Connection, table_name: str) -> set[str]:
+    return {row[1] for row in db.execute(f"PRAGMA index_list({table_name})")}

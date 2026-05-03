@@ -16,6 +16,10 @@ stores state locally in SQLite.
 - Local dependency management and command execution use `uv`.
 - SQLite is the source of truth for auth, lists, recipes, bot message context,
   AI caches, and event history.
+- SQLite schema changes are handled by explicit `PRAGMA user_version`
+  migrations. Normal bot startup runs migrations before polling, and
+  `uv run python -m honeybuy_tg migrate` runs them as a deployment step and
+  exits.
 - OpenAI is used for voice transcription, natural command parsing, grocery
   categories, recipe extraction, recipe command fallback, and item identity
   normalization.
@@ -87,7 +91,7 @@ stores state locally in SQLite.
 - `recipe_aliases`: chat-scoped alternate names for saved recipes.
 - `recipe_ingredients`: saved grocery ingredients with optional canonical
   identities.
-- `shop_sessions` and `shop_session_items`: checklist state for `/shop`.
+- `shop_sessions`: checklist state for `/shop`.
 
 ## Runtime Configuration
 
@@ -128,7 +132,19 @@ Optional metrics:
   before transcription.
 - Deployment currently copies the working tree and optionally copies the local
   SQLite database to the server.
-- Before replacing the remote database, create a timestamped remote backup.
+- The current server is copy-deployed. Use `git pull` only after converting
+  `/opt/honeybuy-tg` back to a git checkout.
+- Before changing the remote database, create a timestamped remote backup.
+- Deployment process for schema-bearing changes:
+  1. Copy/sync the app files under `/opt/honeybuy-tg`, or run `git pull` only
+     on a server directory that is a real git checkout.
+  2. Run `sudo uv sync --frozen` from `/opt/honeybuy-tg`.
+  3. Stop or otherwise quiesce `honeybuy-tg` so SQLite is not being written.
+  4. Back up `/var/lib/honeybuy-tg/honeybuy.sqlite3`.
+  5. Run the migration command with the service environment:
+     `uv run python -m honeybuy_tg migrate`.
+  6. Start or restart `honeybuy-tg`.
+  7. Watch `sudo journalctl -u honeybuy-tg -f`.
 - Keep the metrics exporter bound to localhost unless it is behind a trusted
   network or reverse proxy.
 
@@ -136,6 +152,8 @@ Optional metrics:
 
 - [x] Unit tests use temporary SQLite databases.
 - [x] Storage tests cover chat isolation and cleanup.
+- [x] Migration tests cover empty SQLite databases, old additive schema repair,
+  and the copied remote database fixture when present.
 - [x] Service tests cover add, remove, bought, recipes, dedupe, and matching.
 - [x] Config tests cover defaults for metrics and normalization.
 - [x] `ruff check .` passes.
@@ -183,7 +201,8 @@ Optional metrics:
 
 ### Operations
 
-- [ ] Add a documented backup/restore command for SQLite.
+- [x] Document backup and migration commands for SQLite deploys.
+- [ ] Add a documented restore command for SQLite.
 - [ ] Add log rotation notes or config for the Ubuntu service.
 - [ ] Add a lightweight health check command.
 - [ ] Decide whether webhook mode is worth adding later.
@@ -191,16 +210,19 @@ Optional metrics:
 
 ## Current Next Steps
 
-1. Deploy the current local commits, including the completed code hardening,
-   recipe-flow, normalization, cross-language matching, and active-list dedupe
-   work.
-2. Watch production logs during the first identity-touching smoke run against
+1. Copy-deploy the current local tree, including the completed code hardening,
+   recipe-flow, normalization, cross-language matching, active-list dedupe, and
+   migration work.
+2. Stop or quiesce `honeybuy-tg`, back up the remote SQLite database, run
+   `uv run python -m honeybuy_tg migrate` with the service environment, start or
+   restart `honeybuy-tg`, and watch production logs.
+3. Watch production logs during the first identity-touching smoke run against
    old rows, explicitly including `/list`, `/shop`, `/remove`, and `/bought`,
    because those paths can backfill canonical identities and remove duplicate
    active rows.
-3. Run manual Telegram smoke checks in private chat and group chat:
+4. Run manual Telegram smoke checks in private chat and group chat:
    authorization, `/add`, `/list`, `/shop`, `/remove`, `/bought`, voice input,
    recipe link learning, pasted recipe learning, recipe delete, overwrite
    confirmation, and recipe aliases.
-4. Keep product work paused until deploy and smoke checks are complete. The next
+5. Keep product work paused until deploy and smoke checks are complete. The next
    product candidate remains better due-date support in rendered lists.

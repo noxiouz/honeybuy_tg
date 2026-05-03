@@ -113,15 +113,55 @@ sudo journalctl -u honeybuy-tg -f
 The installer also installs `ffmpeg`, installs `uv` to `/usr/local/bin` when
 missing, creates the `honeybuy` system user, and enables the service.
 
-To update:
+To update a git-checkout deployment:
 
 ```sh
 cd /opt/honeybuy-tg
 sudo git pull
 sudo uv sync --frozen
-sudo systemctl restart honeybuy-tg
+```
+
+The current production server is copy-deployed into `/opt/honeybuy-tg`. For that
+server, copy or sync the checked-out tree first instead of running `git pull`,
+then refresh dependencies:
+
+```sh
+# Example from the local checkout; replace host/path details for your server.
+rsync -a --delete \
+  --exclude .git \
+  --exclude .env \
+  --exclude data/ \
+  --exclude .venv/ \
+  --exclude .uv-cache/ \
+  --exclude .pytest_cache/ \
+  --exclude .ruff_cache/ \
+  --exclude __pycache__/ \
+  --exclude '*.pyc' \
+  ./ <server>:/opt/honeybuy-tg/
+
+cd /opt/honeybuy-tg
+sudo uv sync --frozen
+```
+
+For schema-bearing updates, stop the bot before taking the SQLite backup and
+running migrations:
+
+```sh
+sudo systemctl stop honeybuy-tg
+sudo cp /var/lib/honeybuy-tg/honeybuy.sqlite3 \
+  /var/lib/honeybuy-tg/honeybuy.sqlite3.$(date -u +%Y%m%dT%H%M%SZ).bak
+sudo systemd-run --wait --pipe --collect \
+  --uid=honeybuy --gid=honeybuy \
+  --working-directory=/opt/honeybuy-tg \
+  --property=EnvironmentFile=/etc/honeybuy-tg/env \
+  --setenv=UV_CACHE_DIR=/var/cache/honeybuy-tg/uv \
+  /usr/local/bin/uv run python -m honeybuy_tg migrate
+sudo systemctl start honeybuy-tg
 sudo journalctl -u honeybuy-tg -f
 ```
+
+The bot still starts with no module arguments, and the explicit `migrate`
+command runs SQLite migrations and exits.
 
 The service template lives at `deploy/systemd/honeybuy-tg.service`. The runtime
 env template lives at `deploy/ubuntu/env.example`.
