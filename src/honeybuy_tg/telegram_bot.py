@@ -18,6 +18,7 @@ from aiogram.types import (
     BotCommand,
     CallbackQuery,
     ChatMemberUpdated,
+    ExternalReplyInfo,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -243,8 +244,37 @@ def parse_item_ids(raw_item_ids: str | None) -> tuple[int, ...]:
     return tuple(item_ids)
 
 
-def voice_reply_context_message(*, voice_message: Message) -> Message | None:
-    return voice_message.reply_to_message
+VoiceSourceMessage = Message | ExternalReplyInfo
+
+
+def voice_reanalysis_source_message(message: Message) -> VoiceSourceMessage | None:
+    if (
+        message.reply_to_message is not None
+        and message.reply_to_message.voice is not None
+    ):
+        return message.reply_to_message
+    if message.external_reply is not None and message.external_reply.voice is not None:
+        return message.external_reply
+    return None
+
+
+def has_reply_context(message: Message) -> bool:
+    return message.reply_to_message is not None or message.external_reply is not None
+
+
+def voice_message_id(
+    *,
+    voice_message: VoiceSourceMessage,
+    fallback_message: Message,
+) -> int:
+    message_id = voice_message.message_id
+    if message_id is not None:
+        return message_id
+    return fallback_message.message_id
+
+
+def voice_reply_context_message(*, voice_message: VoiceSourceMessage) -> Message | None:
+    return getattr(voice_message, "reply_to_message", None)
 
 
 def recipe_name_from_ai(payload: dict[str, object], *, fallback: str) -> str:
@@ -1078,7 +1108,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
     async def ask_voice_items_confirmation(
         *,
         message: Message,
-        voice_message: Message,
+        voice_message: VoiceSourceMessage,
         transcript: str,
         items: tuple[str, ...],
     ) -> None:
@@ -1087,7 +1117,10 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         confirmation_id = await storage.create_pending_confirmation(
             chat_id=message.chat.id,
             user_id=message.from_user.id,
-            source_message_id=voice_message.message_id,
+            source_message_id=voice_message_id(
+                voice_message=voice_message,
+                fallback_message=message,
+            ),
             items_json=json.dumps(list(items), ensure_ascii=False),
         )
         await message.answer(
@@ -1113,19 +1146,23 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
     async def process_voice_source(
         *,
         command_message: Message,
-        voice_message: Message,
+        voice_message: VoiceSourceMessage,
         bot: Bot,
         source: str,
     ) -> None:
         if command_message.from_user is None or voice_message.voice is None:
             return
+        source_message_id = voice_message_id(
+            voice_message=voice_message,
+            fallback_message=command_message,
+        )
         logger.info(
             "Received voice processing request source=%s chat_id=%s user_id=%s "
             "voice_message_id=%s duration=%s file_size=%s",
             source,
             command_message.chat.id,
             command_message.from_user.id,
-            voice_message.message_id,
+            source_message_id,
             voice_message.voice.duration,
             voice_message.voice.file_size,
         )
@@ -1174,12 +1211,10 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         try:
             with TemporaryDirectory() as temp_dir:
                 source_path = (
-                    Path(temp_dir)
-                    / f"telegram_voice_{voice_message.message_id}_{source}.ogg"
+                    Path(temp_dir) / f"telegram_voice_{source_message_id}_{source}.ogg"
                 )
                 webm_path = (
-                    Path(temp_dir)
-                    / f"telegram_voice_{voice_message.message_id}_{source}.webm"
+                    Path(temp_dir) / f"telegram_voice_{source_message_id}_{source}.webm"
                 )
                 await bot.download(voice_message.voice.file_id, destination=source_path)
                 await convert_voice_to_webm(
@@ -1217,7 +1252,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 await storage.log_event(
                     chat_id=command_message.chat.id,
                     user_id=command_message.from_user.id,
-                    telegram_message_id=voice_message.message_id,
+                    telegram_message_id=source_message_id,
                     input_type="voice",
                     raw_text=transcript,
                     ai_result_json=json.dumps(
@@ -1253,7 +1288,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             await storage.log_event(
                 chat_id=command_message.chat.id,
                 user_id=command_message.from_user.id,
-                telegram_message_id=voice_message.message_id,
+                telegram_message_id=source_message_id,
                 input_type="voice",
                 raw_text=transcript,
                 ai_result_json=json.dumps(
@@ -1282,7 +1317,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             await storage.log_event(
                 chat_id=command_message.chat.id,
                 user_id=command_message.from_user.id,
-                telegram_message_id=voice_message.message_id,
+                telegram_message_id=source_message_id,
                 input_type="voice",
                 status="error",
                 error=str(error),
@@ -1868,19 +1903,17 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             chat_id=message.chat.id,
             default_mode=settings.text_parse_mode,
         )
-        if (
-            is_voice_reanalysis_request(
-                message.text,
-                bot_username=bot_user.username,
-            )
-            and message.reply_to_message is not None
-        ):
-            if message.reply_to_message.voice is None:
+        if is_voice_reanalysis_request(
+            message.text,
+            bot_username=bot_user.username,
+        ) and has_reply_context(message):
+            voice_source = voice_reanalysis_source_message(message)
+            if voice_source is None:
                 await message.answer("Reply to a voice message and mention me.")
                 return
             await process_voice_source(
                 command_message=message,
-                voice_message=message.reply_to_message,
+                voice_message=voice_source,
                 bot=bot,
                 source="reply_mention",
             )

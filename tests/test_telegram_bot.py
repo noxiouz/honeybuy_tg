@@ -4,8 +4,14 @@ import json
 
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import AnswerCallbackQuery, EditMessageText, GetMe, SendMessage
-from aiogram.types import Chat, Message, Update, User
+from aiogram.methods import (
+    AnswerCallbackQuery,
+    EditMessageText,
+    GetFile,
+    GetMe,
+    SendMessage,
+)
+from aiogram.types import Chat, File, Message, Update, User
 import pytest
 
 from honeybuy_tg.config import Settings
@@ -51,8 +57,7 @@ class FakeTelegramSession(BaseSession):
         chunk_size: int = 65536,
         raise_for_status: bool = True,
     ) -> AsyncGenerator[bytes, None]:
-        if False:
-            yield b""
+        yield b"voice-data"
 
     async def make_request(self, bot, method, timeout=None):
         self.requests.append(method)
@@ -71,6 +76,12 @@ class FakeTelegramSession(BaseSession):
                 is_bot=True,
                 first_name="Honeybuy",
                 username="HoneyBuyBot",
+            )
+        if isinstance(method, GetFile):
+            return File(
+                file_id=method.file_id,
+                file_unique_id="voice-unique",
+                file_path="voice.ogg",
             )
         if isinstance(method, EditMessageText | AnswerCallbackQuery):
             return True
@@ -145,6 +156,105 @@ def test_mention_text_can_be_parsed_as_bought_message():
     )
 
 
+@pytest.mark.asyncio
+async def test_mention_reply_to_external_voice_reprocesses_voice(
+    monkeypatch,
+    tmp_path,
+):
+    async def fake_convert_voice_to_webm(*, source_path, webm_path):
+        webm_path.write_bytes(source_path.read_bytes())
+
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.VoiceTranscriber",
+        FakeVoiceTranscriber,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.convert_voice_to_webm",
+        fake_convert_voice_to_webm,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemNormalizer",
+        FakeItemNormalizer,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingTextParser",
+        FakeAddShoppingTextParser,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.RecipeCommandParser",
+        FakeUnusedAIClient,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemCategorizer",
+        FakeUnusedAIClient,
+    )
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+        OPENAI_API_KEY="test",
+        TEXT_PARSE_MODE="all",
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+    now = int(datetime.now(UTC).timestamp())
+
+    await dispatcher.feed_update(
+        bot,
+        Update.model_validate(
+            {
+                "update_id": 1,
+                "message": {
+                    "message_id": 10,
+                    "date": now,
+                    "chat": {"id": 1, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Owner"},
+                    "text": "@HoneyBuyBot",
+                    "reply_to_message": {
+                        "message_id": 8,
+                        "date": now,
+                        "chat": {"id": 1, "type": "private"},
+                        "from": {"id": 7, "is_bot": False, "first_name": "Sender"},
+                        "text": "reply stub",
+                    },
+                    "external_reply": {
+                        "origin": {
+                            "type": "user",
+                            "date": now,
+                            "sender_user": {
+                                "id": 7,
+                                "is_bot": False,
+                                "first_name": "Sender",
+                            },
+                        },
+                        "chat": {"id": 1, "type": "private"},
+                        "voice": {
+                            "file_id": "voice-file",
+                            "file_unique_id": "voice-unique",
+                            "duration": 1,
+                            "file_size": 10,
+                        },
+                    },
+                },
+            }
+        ),
+    )
+
+    sent_messages = [
+        request for request in session.requests if isinstance(request, SendMessage)
+    ]
+    items = await storage.list_items(chat_id=1)
+    assert [item.name for item in items] == ["молоко"]
+    assert sent_messages[-1].text.startswith("Transcript: купи молоко\n\nAdded")
+    assert all(
+        request.text != "Reply to a voice message and mention me."
+        for request in sent_messages
+    )
+
+
 class FakeStorage:
     def __init__(self, mode):
         self.mode = mode
@@ -184,9 +294,30 @@ class FakeUnknownShoppingTextParser:
         }
 
 
+class FakeAddShoppingTextParser:
+    def __init__(self, *, api_key, model):
+        pass
+
+    async def parse(self, text):
+        return {
+            "action": "add_items",
+            "items": ["молоко"],
+            "needs_confirmation": False,
+            "clarification_question": None,
+        }
+
+
 class FakeUnusedAIClient:
     def __init__(self, *, api_key, model):
         pass
+
+
+class FakeVoiceTranscriber:
+    def __init__(self, *, api_key, model):
+        pass
+
+    async def transcribe(self, path):
+        return "купи молоко"
 
 
 @pytest.mark.asyncio
