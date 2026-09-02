@@ -99,9 +99,19 @@ must preserve.
 
 ## Agentic Coding Configuration
 
-The repository currently has no tracked `AGENTS.md`, `AGENT.md`, `CLAUDE.md`,
-Cursor rules, Copilot instructions, `.agents/`, or `.codex/` configuration.
-`.gitignore` excludes `.codex`, so contributors may have untracked local Codex
-state that is not part of the project contract. Until explicit agent guidance
-is added, use this documentation, the functional scenarios, tests, and existing
-code style as the source of repository-specific conventions.
+The repository defines a Codex-oriented autonomous development setup:
+
+- root `AGENTS.md` defines project boundaries, safety rules, verification, and
+  the review/fix/retest loop;
+- `.codex/agents/` defines `coder`, `test_engineer`, `telegram_expert`, and
+  `reviewer` roles.
+
+For nontrivial changes, the primary keeps a path-ownership ledger. For behavior
+changes, the test engineer establishes the regression contract before the coder
+implements it. Telegram-facing work waits for the specialist's constraints, and
+the independent reviewer must return `VERDICT: APPROVE` before handoff.
+
+Outside the two role-local `sandbox_mode = "read-only"` defaults, the repository
+intentionally does not set `agents.enabled`, concurrency, model, credentials,
+plugins, MCP servers, parent-session permissions, sandboxing, or network access.
+Contributor-level configuration remains authoritative.
