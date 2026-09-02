@@ -30,6 +30,13 @@ Private Telegram shopping-list bot for one list per chat.
 - Optional Prometheus metrics exporter for Grafana/Prometheus.
 - Ubuntu deployment files for `systemd`, `uv`, SQLite data, and `ffmpeg`.
 
+## Developer Documentation
+
+The [`docs/`](docs/README.md) guide covers architecture, request lifecycles,
+recipe ingestion, SQLite persistence, configuration, deployment, and testing.
+[`SCENARIOS.md`](SCENARIOS.md) remains the functional behavior specification,
+while [`PLAN.md`](PLAN.md) tracks current status and backlog.
+
 ## Local Setup
 
 Install `uv`, then install dependencies:
@@ -48,7 +55,8 @@ Fill in:
 
 - `TELEGRAM_BOT_TOKEN`
 - `OWNER_USER_ID`
-- `OPENAI_API_KEY` for voice messages
+- `OPENAI_API_KEY` (optional) to enable voice, AI parsing and grouping,
+  cross-language item identity, and learning new recipes
 
 Voice messages also require `ffmpeg` on the host because Telegram voice notes are
 downloaded as OGG/OPUS and converted to WebM before transcription.
@@ -169,6 +177,7 @@ env template lives at `deploy/ubuntu/env.example`.
 ## Current Commands
 
 - `/whoami` - show your Telegram user ID and chat ID.
+- `/start` - show command help.
 - `/help` - show command help.
 - `/authorize` - authorize the current chat, owner only.
 - `/list` - show active shopping items.
@@ -263,6 +272,10 @@ Ingredients:
 Steps:
 Mix and cook.
 ```
+
+These are natural-text messages, so the chat's text parse mode applies. In the
+default `mention` mode, include `@your_bot_username`; the examples work as shown
+when the mode is `all`.
 
 Then reuse it later:
 
