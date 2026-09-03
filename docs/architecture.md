@@ -69,9 +69,9 @@ valid bot token and owner identity in the current implementation.
 | --- | --- | --- |
 | `app.py` | Process composition and the migration CLI | `main` |
 | `config.py` | Environment parsing, defaults, and owner validation | `Settings`, `load_settings` |
-| `telegram_bot.py` | Aiogram routes, access checks, dependency construction, callbacks, reply context, Telegram I/O, and voice conversion | `build_dispatcher`, `run_bot` |
-| `service.py` | Shopping and recipe use cases, identity matching, backfill, and deduplication | `ShoppingListService` |
-| `storage.py` | Concrete SQLite repository and transaction-level invariants | `Storage` |
+| `telegram_bot.py` | Aiogram routes, access checks, inline queries and callbacks, dependency construction, reply context, Telegram I/O, and voice conversion | `build_dispatcher`, `run_bot` |
+| `service.py` | Shopping and recipe use cases, inline-item normalization, identity matching, backfill, and deduplication | `ShoppingListService` |
+| `storage.py` | Concrete SQLite repository, expiring inline intents, and transaction-level invariants | `Storage` |
 | `migrations.py` | Schema definition and `PRAGMA user_version` migration | `run_migrations`, `migrate_database_path` |
 | `models.py` | Immutable domain values returned by storage and service layers | `ShoppingItem`, `Recipe`, `ItemIdentity` |
 | `parser.py` | Deterministic Russian and English shopping-command parsing | `parse_shopping_text` |
@@ -119,6 +119,33 @@ Aiogram supplies updates and Bot API calls. Command and callback handlers live
 inside `build_dispatcher`, while `set_bot_commands` publishes the command menu.
 The runtime uses long polling; group delivery of ordinary voice messages depends
 on BotFather privacy-mode configuration.
+
+Cross-chat capture uses Telegram inline mode, which an operator must enable
+manually with `@BotFather` `/setinline`. A query such as `@HoneyBuyBot milk`
+treats `milk` as one literal item and builds a personalized destination picker.
+The private destination depends on the requester's configured access. Every
+group destination must already be authorized, the bot must currently be an
+administrator there, and the requester must currently be a member.
+
+An inline update has no trusted source-chat tenant for this use case. The
+Telegram layer therefore creates one opaque, requester-bound intent per offered
+destination. The picker may show destination titles, but the card sent into
+another conversation contains only generic confirmation text and the item; it
+does not expose the destination or list contents. Selecting the result, and any
+optional `chosen_inline_result` feedback, has no state effect. Only the explicit
+inline-message callback can reach the service and storage apply path.
+Callback `chat_instance`, inline-message ID, and visible card text are delivery
+data, not destination authority.
+
+At confirmation time the Telegram handler checks current capability before
+normalization. The service performs the normal item-identity lookup without
+reparsing or splitting the literal query, then invokes the Telegram-provided
+guard to repeat the same private/group capability check immediately before
+storage apply. This second gate closes the authorization race across
+asynchronous normalization. Storage then rechecks the five-minute expiry and
+target invariants while atomically claiming the intent, redacting its payload,
+and inserting the shopping item. The generic success-card edit happens after
+that commit, so Telegram edit failure cannot reopen or duplicate the mutation.
 
 ### OpenAI
 
@@ -196,5 +223,7 @@ imports, multiple bot replicas, or high concurrency:
 - synchronous SQLite calls currently run on the event-loop thread;
 - there is no connection pool, WAL configuration, busy retry policy, or queue;
 - multi-item shopping actions commit one item at a time;
-- pending confirmations and tracked message context have no cleanup worker;
+- voice/recipe confirmations and tracked message context have no cleanup
+  worker; inline-capture intents instead expire logically and are removed only
+  when relevant persistence operations encounter them;
 - caches and database state are local to one SQLite file.

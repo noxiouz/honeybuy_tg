@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -173,6 +173,33 @@ SCHEMA_STATEMENTS = tuple(
 )
 
 
+INLINE_CAPTURE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS inline_capture_intents (
+    token_hash TEXT PRIMARY KEY,
+    requester_id INTEGER NOT NULL,
+    target_chat_id INTEGER NOT NULL,
+    target_kind TEXT NOT NULL CHECK (
+        target_kind IN ('private', 'group', 'supergroup')
+    ),
+    item_text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'applied')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_inline_capture_requester_pending
+    ON inline_capture_intents (requester_id, status, created_at);
+"""
+
+INLINE_CAPTURE_SCHEMA_STATEMENTS = tuple(
+    statement.strip()
+    for statement in INLINE_CAPTURE_SCHEMA_SQL.split(";")
+    if statement.strip()
+)
+
+
 def migrate_database_path(database_path: Path) -> MigrationResult:
     database_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(database_path) as db:
@@ -213,6 +240,11 @@ def run_migrations(
             _set_user_version(db, 1)
             applied_versions.append(1)
 
+        if old_version < 2:
+            _migrate_to_2(db)
+            _set_user_version(db, 2)
+            applied_versions.append(2)
+
         new_version = get_user_version(db)
         if started_transaction:
             db.commit()
@@ -243,6 +275,11 @@ def _migrate_to_1(db: sqlite3.Connection) -> None:
     _ensure_column(db, "recipe_ingredients", "canonical_name", "TEXT")
     _ensure_column(db, "recipe_ingredients", "canonical_key", "TEXT")
     _ensure_column(db, "shop_sessions", "category", "TEXT")
+
+
+def _migrate_to_2(db: sqlite3.Connection) -> None:
+    for statement in INLINE_CAPTURE_SCHEMA_STATEMENTS:
+        db.execute(statement)
 
 
 def _ensure_column(

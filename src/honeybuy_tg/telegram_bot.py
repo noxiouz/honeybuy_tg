@@ -5,13 +5,16 @@ from collections.abc import Awaitable, Callable
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import re
+import secrets
 import shutil
 from typing import Any
 from tempfile import TemporaryDirectory
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
@@ -21,6 +24,9 @@ from aiogram.types import (
     ExternalReplyInfo,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
     Message,
     ReactionTypeEmoji,
     TelegramObject,
@@ -90,6 +96,13 @@ logger = logging.getLogger(__name__)
 
 LAST_ADDED_REFERENCE = "__last_added__"
 HANDLED_MESSAGE_REACTION = "👀"
+INLINE_CAPTURE_PREFIX = "inline_capture:"
+INLINE_CAPTURE_QUERY_MAX_CHARACTERS = 256
+INLINE_CAPTURE_RESULT_LIMIT = 50
+INLINE_CAPTURE_GROUP_CANDIDATE_LIMIT = 50
+INLINE_CAPTURE_PENDING_LIMIT = 100
+INLINE_CAPTURE_TTL = timedelta(minutes=5)
+INLINE_CAPTURE_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,48}")
 
 CONTEXT_ITEM_REFERENCES = {
     "это",
@@ -535,6 +548,100 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         ):
             await message.answer("Chat is not authorized yet. Send /authorize first.")
         return False
+
+    async def has_inline_group_capability(
+        *,
+        bot: Bot,
+        bot_user_id: int,
+        chat_id: int,
+        requester_id: int,
+    ) -> bool:
+        authorized_chat = await storage.get_authorized_chat(chat_id)
+        if authorized_chat is None or authorized_chat["chat_type"] not in {
+            "group",
+            "supergroup",
+        }:
+            return False
+        try:
+            bot_member = await bot.get_chat_member(
+                chat_id=chat_id,
+                user_id=bot_user_id,
+            )
+            if bot_member.status != ChatMemberStatus.ADMINISTRATOR:
+                return False
+            requester_member = await bot.get_chat_member(
+                chat_id=chat_id,
+                user_id=requester_id,
+            )
+        except Exception:
+            return False
+
+        if requester_member.status in {
+            ChatMemberStatus.CREATOR,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.MEMBER,
+        }:
+            return True
+        return (
+            requester_member.status == ChatMemberStatus.RESTRICTED
+            and requester_member.is_member is True
+        )
+
+    async def has_inline_capture_capability(
+        *,
+        bot: Bot,
+        target_chat_id: int,
+        target_kind: str,
+        requester_id: int,
+        requester_username: str | None,
+    ) -> bool:
+        if target_kind == "private":
+            return target_chat_id == requester_id and is_allowed_user(
+                user_id=requester_id,
+                username=requester_username,
+                settings=settings,
+            )
+        if target_kind not in {"group", "supergroup"}:
+            return False
+        try:
+            bot_user_id = (await bot.get_me()).id
+        except Exception:
+            return False
+        return await has_inline_group_capability(
+            bot=bot,
+            bot_user_id=bot_user_id,
+            chat_id=target_chat_id,
+            requester_id=requester_id,
+        )
+
+    async def answer_empty_inline_query(inline_query: InlineQuery) -> None:
+        await inline_query.answer([], is_personal=True, cache_time=0)
+
+    def inline_capture_result(
+        *,
+        token: str,
+        item_text: str,
+        destination_title: str,
+    ) -> InlineQueryResultArticle:
+        return InlineQueryResultArticle(
+            id=token,
+            title=destination_title,
+            description="Confirm one item",
+            input_message_content=InputTextMessageContent(
+                message_text=f"Add to Honeybuy: {item_text}",
+                parse_mode=None,
+            ),
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Confirm add",
+                            callback_data=f"{INLINE_CAPTURE_PREFIX}{token}",
+                        )
+                    ]
+                ]
+            ),
+        )
 
     def item_keyboard(items: list[ShoppingItem]) -> InlineKeyboardMarkup | None:
         if not items:
@@ -1665,6 +1772,90 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         await callback.message.edit_text(format_recipe_saved(recipe))
         await callback.answer("Replaced")
 
+    @router.inline_query()
+    async def inline_capture_query(inline_query: InlineQuery, bot: Bot) -> None:
+        raw_query = inline_query.query
+        item_text = " ".join(raw_query.strip().split())
+        if (
+            not item_text
+            or len(raw_query) > INLINE_CAPTURE_QUERY_MAX_CHARACTERS
+            or len(item_text) > INLINE_CAPTURE_QUERY_MAX_CHARACTERS
+        ):
+            await answer_empty_inline_query(inline_query)
+            return
+
+        destinations: list[tuple[int, str, str]] = []
+        requester = inline_query.from_user
+        if is_allowed_user(
+            user_id=requester.id,
+            username=requester.username,
+            settings=settings,
+        ):
+            destinations.append((requester.id, "private", "Add to my Honeybuy list"))
+
+        group_chats = await storage.list_authorized_group_chats()
+        if group_chats:
+            try:
+                bot_user_id = (await bot.get_me()).id
+            except Exception:
+                bot_user_id = None
+            if bot_user_id is not None:
+                for group_chat in group_chats[:INLINE_CAPTURE_GROUP_CANDIDATE_LIMIT]:
+                    if len(destinations) >= INLINE_CAPTURE_RESULT_LIMIT:
+                        break
+                    chat_id = int(group_chat["chat_id"])
+                    if not await has_inline_group_capability(
+                        bot=bot,
+                        bot_user_id=bot_user_id,
+                        chat_id=chat_id,
+                        requester_id=requester.id,
+                    ):
+                        continue
+                    title = str(group_chat["title"] or "Authorized group").strip()
+                    destinations.append(
+                        (
+                            chat_id,
+                            str(group_chat["chat_type"]),
+                            f"Add to {title}",
+                        )
+                    )
+
+        now = datetime.now(UTC)
+        prepared_results = [
+            (secrets.token_urlsafe(24), target_chat_id, target_kind, destination_title)
+            for target_chat_id, target_kind, destination_title in destinations
+        ]
+        try:
+            await storage.create_inline_capture_intents(
+                requester_id=requester.id,
+                intents=[
+                    {
+                        "token": token,
+                        "target_chat_id": target_chat_id,
+                        "target_kind": target_kind,
+                        "item_text": item_text,
+                    }
+                    for token, target_chat_id, target_kind, _ in prepared_results
+                ],
+                created_at=now,
+                expires_at=now + INLINE_CAPTURE_TTL,
+                pending_limit=INLINE_CAPTURE_PENDING_LIMIT,
+            )
+        except Exception:
+            logger.exception("Failed to create inline capture intents")
+            await answer_empty_inline_query(inline_query)
+            return
+
+        results = [
+            inline_capture_result(
+                token=token,
+                item_text=item_text,
+                destination_title=destination_title,
+            )
+            for token, _, _, destination_title in prepared_results
+        ]
+        await inline_query.answer(results, is_personal=True, cache_time=0)
+
     @router.my_chat_member()
     async def on_my_chat_member(event: ChatMemberUpdated, bot: Bot) -> None:
         new_status = event.new_chat_member.status
@@ -2038,6 +2229,78 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                     ),
                     status="ok",
                 )
+
+    @router.callback_query(F.data.startswith(INLINE_CAPTURE_PREFIX))
+    async def inline_capture_callback(callback: CallbackQuery, bot: Bot) -> None:
+        if (
+            callback.message is not None
+            or not callback.inline_message_id
+            or callback.data is None
+        ):
+            await callback.answer("Invalid inline confirmation", show_alert=True)
+            return
+
+        token = callback.data.removeprefix(INLINE_CAPTURE_PREFIX)
+        if INLINE_CAPTURE_TOKEN_PATTERN.fullmatch(token) is None:
+            await callback.answer("Invalid inline confirmation", show_alert=True)
+            return
+
+        now = datetime.now(UTC)
+        try:
+            intent = await storage.get_inline_capture_intent(
+                token=token,
+                requester_id=callback.from_user.id,
+                now=now,
+            )
+        except Exception:
+            logger.exception("Failed to load inline capture intent")
+            try:
+                await callback.answer(
+                    "Inline confirmation is temporarily unavailable",
+                    show_alert=True,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to acknowledge unavailable inline confirmation"
+                )
+            return
+        if intent is None:
+            await callback.answer("Confirmation is no longer active", show_alert=True)
+            return
+
+        await callback.answer()
+        target_chat_id = int(intent["target_chat_id"])
+        target_kind = str(intent["target_kind"])
+        async def requester_still_has_access(
+            checked_chat_id: int,
+            checked_kind: str,
+        ) -> bool:
+            return await has_inline_capture_capability(
+                bot=bot,
+                target_chat_id=checked_chat_id,
+                target_kind=checked_kind,
+                requester_id=callback.from_user.id,
+                requester_username=callback.from_user.username,
+            )
+
+        if not await requester_still_has_access(target_chat_id, target_kind):
+            return
+
+        item = await service.apply_inline_capture(
+            token=token,
+            requester_id=callback.from_user.id,
+            pre_apply_guard=requester_still_has_access,
+        )
+        if item is None:
+            return
+
+        record_shopping_action(action="add", source="inline_capture", count=1)
+        await bot.edit_message_text(
+            text=f"Added to Honeybuy: {item.name}",
+            inline_message_id=callback.inline_message_id,
+            reply_markup=None,
+            parse_mode=None,
+        )
 
     @router.callback_query(F.data.startswith("bought:"))
     async def bought_callback(callback: CallbackQuery) -> None:

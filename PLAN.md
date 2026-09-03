@@ -30,6 +30,10 @@ stores state locally in SQLite.
   release gates. Live evals require a separate key and never run in CI.
 - GitHub Actions runs locked dependency sync, the full offline test suite, Ruff,
   and `git diff --check` on pushes and pull requests.
+- PT-025 cross-chat inline capture is implemented and covered by offline
+  service, storage, migration, and fake-Telegram integration tests. Enabling
+  `/setinline` in `@BotFather` and the live Telegram smoke test are still
+  outstanding.
 - Prometheus metrics can be enabled for Grafana dashboards.
 - Item-normalization and active-list deduplication work is committed. Watch the
   first identity-touching smoke run against old rows after deploy, explicitly
@@ -47,6 +51,9 @@ stores state locally in SQLite.
   `/add`, `/remove`, `/bought`, `/clear_bought`, `/clear`, `/recipes`,
   `/recipe_alias`, `/delete_recipe`, `/reanalyze`, and `/text_parse_mode`.
 - `/clear` requires inline-button confirmation.
+- Cross-chat inline capture offers a personalized private/authorized-group
+  destination picker and adds one literal item only after a requester-bound,
+  expiring `Confirm add` callback.
 - Natural text parsing modes per chat: `off`, `mention`, or `all`.
 - Voice transcription with duration, file-size, and transcript-length limits.
 - Voice commands use the same command pipeline as text where possible.
@@ -71,14 +78,16 @@ stores state locally in SQLite.
 ## Architecture
 
 - `config`: environment loading and runtime settings.
-- `storage`: SQLite schema, migrations, repositories, and cache tables.
+- `storage`: SQLite schema, migrations, repositories, cache tables, and atomic
+  expiring inline-capture intents.
 - `service`: shopping-list operations, recipe operations, matching, and
-  deduplication.
+  deduplication, including normalizing a literal inline-capture item before its
+  atomic storage apply.
 - `parser`: deterministic local command parsing.
 - `ai`: OpenAI clients for text parsing, transcription, recipe extraction,
   recipe commands, category selection, and item normalization.
-- `telegram_bot`: Telegram routing, auth guards, handlers, callbacks, and
-  message context handling.
+- `telegram_bot`: Telegram routing, auth guards, inline destination/capability
+  checks, handlers, callbacks, and message context handling.
 - `formatting`: user-facing Telegram message formatting.
 - `metrics`: Prometheus counters, histograms, and exporter startup.
 - `deploy`: Ubuntu installer and `systemd` unit.
@@ -92,6 +101,9 @@ stores state locally in SQLite.
 - `bot_messages`: tracked bot messages for reply-context commands.
 - `pending_confirmations`: inline confirmation state for ambiguous voice input
   and recipe overwrite confirmations.
+- `inline_capture_intents`: schema-v2 requester-bound, five-minute authority to
+  add one literal item to an explicit destination; raw callback tokens are not
+  stored.
 - `category_cache`: cached AI category labels.
 - `item_normalization_cache`: cached AI canonical grocery identities.
 - `recipes`: saved recipe headers scoped by chat.
@@ -165,6 +177,9 @@ Optional metrics:
 - [x] Config tests cover defaults for metrics and normalization.
 - [x] The text-routing eval corpus is schema-validated and exercised by offline
   deterministic and integration tests.
+- [x] Inline capture has offline service, schema/migration, storage atomicity,
+  expiry/quota, pre/post-normalization authorization, privacy, replay, and
+  fake-Telegram routing coverage.
 - [x] Prompt contracts are versioned and fingerprinted in live-eval reports.
 - [x] GitHub Actions runs the full offline test and lint gates without Telegram
   or OpenAI credentials.
@@ -175,6 +190,8 @@ Optional metrics:
   repetitions.
 - [ ] Manual Telegram private-chat smoke test after each deploy.
 - [ ] Manual Telegram group-chat smoke test after each deploy.
+- [ ] Enable inline mode with `@BotFather` `/setinline`, then run the private and
+  authorized-group inline-capture smoke scenarios.
 - [ ] Manual unauthorized-user check after auth changes.
 - [ ] Manual voice test after transcription/parser changes.
 - [ ] Manual recipe-link smoke test after recipe-flow changes touching parser,
@@ -194,6 +211,7 @@ Optional metrics:
 
 ### Product
 
+- [x] PT-025 cross-chat inline capture with explicit confirmation.
 - [x] Recipe deletion.
 - [x] Recipe overwrite confirmation.
 - [x] Recipe aliases, so one recipe can be recalled by several names.
@@ -231,9 +249,9 @@ Optional metrics:
    require every release gate in `docs/operations-and-testing.md` to pass.
 2. After the live baseline passes, copy-deploy the current tree, including the
    completed routing hardening, prompt contracts, eval system, recipe-flow,
-   normalization, cross-language matching, active-list dedupe, and migration
-   work. The current production host is copy-deployed, so a repository push
-   alone does not update it.
+   normalization, cross-language matching, active-list dedupe, PT-025 inline
+   capture, and schema-v2 migration work. The current production host is
+   copy-deployed, so a repository push alone does not update it.
 3. Stop or quiesce `honeybuy-tg`, back up the remote SQLite database, run
    `uv run python -m honeybuy_tg migrate` with the service environment, start or
    restart `honeybuy-tg`, and watch production logs.
@@ -241,12 +259,16 @@ Optional metrics:
    old rows, explicitly including `/list`, `/shop`, `/remove`, and `/bought`,
    because those paths can backfill canonical identities and remove duplicate
    active rows.
-5. Run manual Telegram smoke checks in private chat and group chat:
-   authorization, `/add`, `/list`, `/shop`, `/remove`, `/bought`, voice input,
-   recipe link learning, pasted recipe learning, recipe delete, overwrite
-   confirmation, and recipe aliases. Include the Russian routing regressions
-   that distinguish saved-recipe requests such as `купи ингредиенты для
-   солянки` from ordinary shopping phrases such as `купи продукты` and `купи на
-   завтра молоко`.
-6. Keep product work paused until deploy and smoke checks are complete. The next
+5. Enable inline mode manually with `@BotFather` `/setinline` and confirm the bot
+   remains an administrator in every authorized group intended as an inline
+   destination. `/setinlinefeedback` is not required.
+6. Run manual Telegram smoke checks in private chat and group chat:
+   authorization, inline capture into both eligible destination kinds with an
+   explicit confirmation and replay attempt, `/add`, `/list`, `/shop`,
+   `/remove`, `/bought`, voice input, recipe link learning, pasted recipe
+   learning, recipe delete, overwrite confirmation, and recipe aliases. Include
+   the Russian routing regressions that distinguish saved-recipe requests such
+   as `купи ингредиенты для солянки` from ordinary shopping phrases such as
+   `купи продукты` and `купи на завтра молоко`.
+7. Keep product work paused until deploy and smoke checks are complete. The next
    product candidate remains better due-date support in rendered lists.

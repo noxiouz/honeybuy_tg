@@ -1,7 +1,9 @@
 import asyncio
 import shutil
 import sqlite3
+import threading
 from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1050,7 +1052,7 @@ def test_migrates_old_shopping_items_table_without_canonical_columns(tmp_path):
     assert result.old_version == 0
     assert result.new_version == CURRENT_SCHEMA_VERSION
     assert result.integrity_check == "ok"
-    assert result.applied_versions == (1,)
+    assert result.applied_versions == tuple(range(1, CURRENT_SCHEMA_VERSION + 1))
 
     with sqlite3.connect(database_path) as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
@@ -1088,7 +1090,9 @@ def test_migrates_copied_remote_database_fixture(tmp_path):
     assert result.integrity_check == "ok"
     if old_version < CURRENT_SCHEMA_VERSION:
         assert result.changed
-        assert result.applied_versions == (CURRENT_SCHEMA_VERSION,)
+        assert result.applied_versions == tuple(
+            range(old_version + 1, CURRENT_SCHEMA_VERSION + 1)
+        )
     else:
         assert not result.changed
         assert result.applied_versions == ()
@@ -1113,6 +1117,734 @@ def test_migrates_copied_remote_database_fixture(tmp_path):
         assert "idx_shopping_items_chat_canonical_key" in _index_names(
             db, "shopping_items"
         )
+
+
+@pytest.mark.asyncio
+async def test_inline_capture_fresh_schema_is_version_two(tmp_path):
+    database_path = tmp_path / "fresh.sqlite3"
+    storage = Storage(database_path)
+
+    await storage.init()
+
+    with sqlite3.connect(database_path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert "inline_capture_intents" in _table_names(db)
+        assert {
+            "token_hash",
+            "requester_id",
+            "target_chat_id",
+            "target_kind",
+            "item_text",
+            "created_at",
+            "expires_at",
+            "status",
+        } <= _column_names(db, "inline_capture_intents")
+
+
+def test_migrates_v1_database_to_inline_capture_schema_without_data_loss(tmp_path):
+    database_path = tmp_path / "v1.sqlite3"
+    now = "2026-01-01T00:00:00+00:00"
+    with sqlite3.connect(database_path) as db:
+        db.executescript(
+            """
+            CREATE TABLE authorized_chats (
+                chat_id INTEGER PRIMARY KEY,
+                chat_type TEXT NOT NULL,
+                title TEXT,
+                authorized_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE shopping_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                canonical_name TEXT,
+                canonical_key TEXT,
+                quantity REAL,
+                unit TEXT,
+                note TEXT,
+                due_date TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                bought_at TEXT,
+                removed_at TEXT
+            );
+            CREATE INDEX idx_shopping_items_chat_status
+                ON shopping_items (chat_id, status);
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO authorized_chats (
+                chat_id, chat_type, title, authorized_by, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (-1001, "supergroup", "Household", 42, now),
+        )
+        db.execute(
+            """
+            INSERT INTO shopping_items (
+                chat_id, name, normalized_name, status, created_by, created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (-1001, "Milk", "milk", "active", 42, now, now),
+        )
+        db.execute("PRAGMA user_version = 1")
+        db.commit()
+
+    first = migrate_database_path(database_path)
+    second = migrate_database_path(database_path)
+
+    assert CURRENT_SCHEMA_VERSION == 2
+    assert first.old_version == 1
+    assert first.new_version == 2
+    assert first.applied_versions == (2,)
+    assert first.integrity_check == "ok"
+    assert not second.changed
+    assert second.old_version == second.new_version == 2
+    with sqlite3.connect(database_path) as db:
+        assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert db.execute(
+            "SELECT chat_id, chat_type, title, authorized_by FROM authorized_chats"
+        ).fetchall() == [(-1001, "supergroup", "Household", 42)]
+        assert db.execute(
+            "SELECT chat_id, name, normalized_name, status, created_by "
+            "FROM shopping_items"
+        ).fetchall() == [(-1001, "Milk", "milk", "active", 42)]
+        assert "inline_capture_intents" in _table_names(db)
+        columns = _column_names(db, "inline_capture_intents")
+        assert {
+            "token_hash",
+            "requester_id",
+            "target_chat_id",
+            "target_kind",
+            "item_text",
+            "created_at",
+            "expires_at",
+            "status",
+        } <= columns
+        assert {
+            "token",
+            "source_chat_id",
+            "chat_instance",
+            "inline_message_id",
+            "conversation",
+        }.isdisjoint(columns)
+
+
+@pytest.mark.asyncio
+async def test_inline_capture_intents_store_only_hash_and_enforce_pending_quota(
+    tmp_path,
+):
+    database_path = tmp_path / "test.sqlite3"
+    storage = Storage(database_path)
+    await storage.init()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    expired_token = "expired-raw-token-that-must-not-be-stored"
+    await storage.create_inline_capture_intent(
+        token=expired_token,
+        requester_id=42,
+        target_chat_id=42,
+        target_kind="private",
+        item_text="old milk",
+        created_at=now - timedelta(minutes=2),
+        expires_at=now - timedelta(minutes=1),
+        pending_limit=2,
+    )
+
+    live_tokens = [
+        "first-raw-token-that-must-not-be-stored",
+        "second-raw-token-that-must-not-be-stored",
+        "third-raw-token-that-must-not-be-stored",
+    ]
+    for index, token in enumerate(live_tokens):
+        await storage.create_inline_capture_intent(
+            token=token,
+            requester_id=42,
+            target_chat_id=42,
+            target_kind="private",
+            item_text=f"item {index}",
+            created_at=now + timedelta(seconds=index),
+            expires_at=now + timedelta(minutes=5),
+            pending_limit=2,
+        )
+    await storage.create_inline_capture_intent(
+        token="other-requester-token-that-must-not-be-stored",
+        requester_id=7,
+        target_chat_id=7,
+        target_kind="private",
+        item_text="bread",
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+        pending_limit=2,
+    )
+
+    with sqlite3.connect(database_path) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            "SELECT * FROM inline_capture_intents ORDER BY requester_id, created_at"
+        ).fetchall()
+
+    requester_rows = [row for row in rows if row["requester_id"] == 42]
+    assert len(requester_rows) == 2
+    assert all(row["status"] == "pending" for row in requester_rows)
+    assert all(row["item_text"] in {"item 1", "item 2"} for row in requester_rows)
+    assert len([row for row in rows if row["requester_id"] == 7]) == 1
+    stored_payload = "\n".join(str(value) for row in rows for value in row)
+    assert expired_token not in stored_payload
+    assert all(token not in stored_payload for token in live_tokens)
+    assert all(len(row["token_hash"]) >= 32 for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_inline_capture_apply_is_requester_bound_expiring_and_target_scoped(
+    tmp_path,
+):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    token = "requester-bound-inline-token"
+    await storage.create_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        target_chat_id=42,
+        target_kind="private",
+        item_text="milk and eggs",
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+        pending_limit=10,
+    )
+
+    assert (
+        await storage.apply_inline_capture_intent(
+            token=token,
+            requester_id=7,
+            now=now,
+            canonical_name="milk and eggs",
+            canonical_key="milk_and_eggs",
+        )
+        is None
+    )
+    assert await storage.get_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        now=now,
+    ) is not None
+
+    item = await storage.apply_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        now=now,
+        canonical_name="milk and eggs",
+        canonical_key="milk_and_eggs",
+    )
+
+    assert item is not None
+    assert (item.chat_id, item.name, item.created_by) == (42, "milk and eggs", 42)
+    assert await storage.list_items(chat_id=7) == []
+    with storage.connect() as db:
+        assert db.execute(
+            "SELECT status FROM inline_capture_intents"
+        ).fetchone()[0] == "applied"
+    assert (
+        await storage.apply_inline_capture_intent(
+            token=token,
+            requester_id=42,
+            now=now,
+            canonical_name="milk and eggs",
+            canonical_key="milk_and_eggs",
+        )
+        is None
+    )
+
+    expired_token = "expired-inline-token"
+    await storage.create_inline_capture_intent(
+        token=expired_token,
+        requester_id=42,
+        target_chat_id=42,
+        target_kind="private",
+        item_text="bread",
+        created_at=now - timedelta(minutes=2),
+        expires_at=now - timedelta(seconds=1),
+        pending_limit=10,
+    )
+    assert (
+        await storage.apply_inline_capture_intent(
+            token=expired_token,
+            requester_id=42,
+            now=now,
+            canonical_name="bread",
+            canonical_key="bread",
+        )
+        is None
+    )
+    assert [item.name for item in await storage.list_items(chat_id=42)] == [
+        "milk and eggs"
+    ]
+
+    wrong_private_token = "wrong-private-target-inline-token"
+    await storage.create_inline_capture_intent(
+        token=wrong_private_token,
+        requester_id=42,
+        target_chat_id=7,
+        target_kind="private",
+        item_text="must not cross private tenants",
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+        pending_limit=10,
+    )
+    assert (
+        await storage.apply_inline_capture_intent(
+            token=wrong_private_token,
+            requester_id=42,
+            now=now,
+            canonical_name="must not cross private tenants",
+            canonical_key="must_not_cross_private_tenants",
+        )
+        is None
+    )
+    assert await storage.list_items(chat_id=7) == []
+
+
+@pytest.mark.asyncio
+async def test_inline_capture_group_deauthorization_leaves_intent_retryable(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    token = "group-inline-token"
+    await storage.authorize_chat(
+        chat_id=-1001,
+        chat_type="supergroup",
+        title="Household",
+        authorized_by=42,
+    )
+    await storage.create_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        target_chat_id=-1001,
+        target_kind="supergroup",
+        item_text="tea",
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+        pending_limit=10,
+    )
+    with storage.connect() as db:
+        db.execute("DELETE FROM authorized_chats WHERE chat_id = ?", (-1001,))
+        db.commit()
+
+    assert (
+        await storage.apply_inline_capture_intent(
+            token=token,
+            requester_id=42,
+            now=now,
+            canonical_name="tea",
+            canonical_key="tea",
+        )
+        is None
+    )
+    assert await storage.get_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        now=now,
+    ) is not None
+
+    await storage.authorize_chat(
+        chat_id=-1001,
+        chat_type="private",
+        title="Invalid stored private row",
+        authorized_by=42,
+    )
+    assert (
+        await storage.apply_inline_capture_intent(
+            token=token,
+            requester_id=42,
+            now=now,
+            canonical_name="tea",
+            canonical_key="tea",
+        )
+        is None
+    )
+    await storage.authorize_chat(
+        chat_id=-1001,
+        chat_type="supergroup",
+        title="Household",
+        authorized_by=42,
+    )
+    item = await storage.apply_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        now=now,
+        canonical_name="tea",
+        canonical_key="tea",
+    )
+    assert item is not None
+    assert item.chat_id == -1001
+
+
+@pytest.mark.asyncio
+async def test_inline_capture_apply_rolls_back_claim_when_item_insert_fails(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    token = "rollback-inline-token"
+    await storage.create_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        target_chat_id=42,
+        target_kind="private",
+        item_text="milk",
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+        pending_limit=10,
+    )
+    with storage.connect() as db:
+        db.execute(
+            """
+            CREATE TRIGGER reject_inline_item
+            BEFORE INSERT ON shopping_items
+            BEGIN
+                SELECT RAISE(ABORT, 'injected insert failure');
+            END
+            """
+        )
+        db.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected insert failure"):
+        await storage.apply_inline_capture_intent(
+            token=token,
+            requester_id=42,
+            now=now,
+            canonical_name="milk",
+            canonical_key="milk",
+        )
+
+    assert await storage.list_items(chat_id=42) == []
+    assert await storage.get_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        now=now,
+    ) is not None
+    with storage.connect() as db:
+        status, item_text = db.execute(
+            "SELECT status, item_text FROM inline_capture_intents"
+        ).fetchone()
+        db.execute("DROP TRIGGER reject_inline_item")
+        db.commit()
+    assert status == "pending"
+    assert item_text == "milk"
+
+    item = await storage.apply_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        now=now,
+        canonical_name="milk",
+        canonical_key="milk",
+    )
+    assert item is not None
+    assert [saved.name for saved in await storage.list_items(chat_id=42)] == ["milk"]
+
+
+@pytest.mark.asyncio
+async def test_inline_capture_apply_is_single_use_under_duplicate_delivery(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    token = "concurrent-inline-token"
+    await storage.create_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        target_chat_id=42,
+        target_kind="private",
+        item_text="eggs",
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+        pending_limit=10,
+    )
+    start = threading.Barrier(2)
+
+    def apply_from_thread():
+        start.wait()
+        return asyncio.run(
+            storage.apply_inline_capture_intent(
+                token=token,
+                requester_id=42,
+                now=now,
+                canonical_name="eggs",
+                canonical_key="eggs",
+            )
+        )
+
+    first, second = await asyncio.gather(
+        asyncio.to_thread(apply_from_thread),
+        asyncio.to_thread(apply_from_thread),
+    )
+
+    assert sum(result is not None for result in (first, second)) == 1
+    assert [item.name for item in await storage.list_items(chat_id=42)] == ["eggs"]
+    assert (
+        await storage.apply_inline_capture_intent(
+            token=token,
+            requester_id=42,
+            now=now,
+            canonical_name="eggs",
+            canonical_key="eggs",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_inline_capture_success_redacts_payload_and_remains_single_use(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    token = "redacted-applied-inline-token"
+    await storage.create_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        target_chat_id=42,
+        target_kind="private",
+        item_text="sensitive applied payload",
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+        pending_limit=10,
+    )
+
+    item = await storage.apply_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        now=now,
+        canonical_name="sensitive applied payload",
+        canonical_key="sensitive_applied_payload",
+    )
+
+    assert item is not None
+    with storage.connect() as db:
+        status, item_text = db.execute(
+            "SELECT status, item_text FROM inline_capture_intents"
+        ).fetchone()
+    assert status == "applied"
+    assert item_text in {None, ""}
+    assert (
+        await storage.apply_inline_capture_intent(
+            token=token,
+            requester_id=42,
+            now=now,
+            canonical_name="sensitive applied payload",
+            canonical_key="sensitive_applied_payload",
+        )
+        is None
+    )
+    assert len(await storage.list_items(chat_id=42)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["get", "apply"])
+async def test_inline_capture_expired_payload_is_removed_or_redacted_when_touched(
+    tmp_path,
+    operation,
+):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    token = f"expired-{operation}-inline-token"
+    secret = f"sensitive expired {operation} payload"
+    live_token = f"live-neighbor-{operation}-inline-token"
+    await storage.create_inline_capture_intent(
+        token=live_token,
+        requester_id=42,
+        target_chat_id=42,
+        target_kind="private",
+        item_text="live neighboring payload",
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+        pending_limit=10,
+    )
+    await storage.create_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        target_chat_id=42,
+        target_kind="private",
+        item_text=secret,
+        created_at=now - timedelta(minutes=2),
+        expires_at=now - timedelta(minutes=1),
+        pending_limit=10,
+    )
+    with storage.connect() as db:
+        touched_token_hash = db.execute(
+            "SELECT token_hash FROM inline_capture_intents WHERE item_text = ?",
+            (secret,),
+        ).fetchone()[0]
+
+    if operation == "get":
+        result = await storage.get_inline_capture_intent(
+            token=token,
+            requester_id=42,
+            now=now,
+        )
+    else:
+        result = await storage.apply_inline_capture_intent(
+            token=token,
+            requester_id=42,
+            now=now,
+            canonical_name="expired item",
+            canonical_key="expired_item",
+        )
+    assert result is None
+    with storage.connect() as db:
+        touched_row = db.execute(
+            "SELECT * FROM inline_capture_intents WHERE token_hash = ?",
+            (touched_token_hash,),
+        ).fetchone()
+    assert touched_row is None or touched_row["item_text"] in {None, ""}
+    if touched_row is not None:
+        assert secret not in "\n".join(str(value) for value in touched_row)
+    live_intent = await storage.get_inline_capture_intent(
+        token=live_token,
+        requester_id=42,
+        now=now,
+    )
+    assert live_intent is not None
+    assert live_intent["item_text"] == "live neighboring payload"
+    assert await storage.list_items(chat_id=42) == []
+
+
+@pytest.mark.asyncio
+async def test_inline_capture_batch_rolls_back_on_mid_batch_insert_failure(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    await storage.authorize_chat(
+        chat_id=-1001,
+        chat_type="supergroup",
+        title="Household",
+        authorized_by=42,
+    )
+    existing_token = "existing-before-batch-inline-token"
+    await storage.create_inline_capture_intent(
+        token=existing_token,
+        requester_id=42,
+        target_chat_id=42,
+        target_kind="private",
+        item_text="existing pending item",
+        created_at=now - timedelta(seconds=1),
+        expires_at=now + timedelta(minutes=5),
+        pending_limit=10,
+    )
+    with storage.connect() as db:
+        db.execute(
+            """
+            CREATE TRIGGER reject_second_inline_intent
+            BEFORE INSERT ON inline_capture_intents
+            WHEN NEW.target_chat_id = -1001
+            BEGIN
+                SELECT RAISE(ABORT, 'injected batch failure');
+            END
+            """
+        )
+        db.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected batch failure"):
+        await storage.create_inline_capture_intents(
+            requester_id=42,
+            intents=[
+                {
+                    "token": "batch-private-inline-token",
+                    "target_chat_id": 42,
+                    "target_kind": "private",
+                    "item_text": "milk",
+                },
+                {
+                    "token": "batch-group-inline-token",
+                    "target_chat_id": -1001,
+                    "target_kind": "supergroup",
+                    "item_text": "milk",
+                },
+            ],
+            created_at=now,
+            expires_at=now + timedelta(minutes=5),
+            pending_limit=10,
+        )
+
+    with storage.connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM inline_capture_intents"
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT item_text FROM inline_capture_intents"
+        ).fetchone()[0] == "existing pending item"
+    assert await storage.get_inline_capture_intent(
+        token=existing_token,
+        requester_id=42,
+        now=now,
+    ) is not None
+
+
+@pytest.mark.asyncio
+async def test_inline_capture_batch_preserves_every_new_intent_near_quota(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    await storage.authorize_chat(
+        chat_id=-1001,
+        chat_type="supergroup",
+        title="Household",
+        authorized_by=42,
+    )
+    old_tokens = ["old-first-inline-token", "old-second-inline-token"]
+    for index, token in enumerate(old_tokens):
+        await storage.create_inline_capture_intent(
+            token=token,
+            requester_id=42,
+            target_chat_id=42,
+            target_kind="private",
+            item_text=f"old item {index}",
+            created_at=now + timedelta(seconds=index),
+            expires_at=now + timedelta(minutes=5),
+            pending_limit=3,
+        )
+
+    new_tokens = ["new-private-inline-token", "new-group-inline-token"]
+    await storage.create_inline_capture_intents(
+        requester_id=42,
+        intents=[
+            {
+                "token": new_tokens[0],
+                "target_chat_id": 42,
+                "target_kind": "private",
+                "item_text": "milk",
+            },
+            {
+                "token": new_tokens[1],
+                "target_chat_id": -1001,
+                "target_kind": "supergroup",
+                "item_text": "milk",
+            },
+        ],
+        created_at=now + timedelta(seconds=2),
+        expires_at=now + timedelta(minutes=5),
+        pending_limit=3,
+    )
+
+    for token in new_tokens:
+        assert await storage.get_inline_capture_intent(
+            token=token,
+            requester_id=42,
+            now=now + timedelta(seconds=2),
+        ) is not None
+    with storage.connect() as db:
+        assert db.execute(
+            """
+            SELECT COUNT(*) FROM inline_capture_intents
+            WHERE requester_id = ? AND status = 'pending'
+            """,
+            (42,),
+        ).fetchone()[0] == 3
 
 
 def _table_names(db: sqlite3.Connection) -> set[str]:

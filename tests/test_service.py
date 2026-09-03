@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from honeybuy_tg.models import ItemIdentity
@@ -10,7 +12,11 @@ from honeybuy_tg.storage import (
 
 
 class FakeItemNormalizer:
+    def __init__(self):
+        self.calls = []
+
     async def normalize(self, names):
+        self.calls.append(tuple(names))
         identities = {}
         for name in names:
             if name in {"tomato paste", "томатная паста", "tomato paste, 60 g"}:
@@ -41,6 +47,55 @@ async def test_service_rejects_empty_item(tmp_path):
 
     with pytest.raises(ValueError, match="Item name is required"):
         await service.add_item(chat_id=1, name="   ", user_id=10)
+
+
+@pytest.mark.asyncio
+async def test_service_inline_capture_apply_preserves_normal_add_semantics(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    normalizer = FakeItemNormalizer()
+    service = ShoppingListService(storage, item_normalizer=normalizer)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    token = "service-inline-token"
+    await storage.authorize_chat(
+        chat_id=-1001,
+        chat_type="supergroup",
+        title="Household",
+        authorized_by=42,
+    )
+    await storage.create_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        target_chat_id=-1001,
+        target_kind="supergroup",
+        item_text="  tomato   paste  ",
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+        pending_limit=10,
+    )
+
+    item = await service.apply_inline_capture(
+        token=token,
+        requester_id=42,
+        now=now,
+    )
+
+    assert item is not None
+    assert item.chat_id == -1001
+    assert item.name == "tomato paste"
+    assert item.normalized_name == "tomato paste"
+    assert item.canonical_name == "томатная паста"
+    assert item.canonical_key == "tomato_paste"
+    assert item.created_by == 42
+    assert normalizer.calls == [("tomato paste",)]
+    assert (
+        await service.apply_inline_capture(
+            token=token,
+            requester_id=42,
+            now=now,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

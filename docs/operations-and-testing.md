@@ -40,6 +40,25 @@ change, whereas the numeric ID is stable. If both owner settings are present,
 the code accepts a user matching either one; keep them synchronized or remove
 the username after bootstrap.
 
+### Telegram Inline Mode
+
+Cross-chat item capture requires one manual Telegram-side setting; there is no
+environment variable or deployment-file change for it:
+
+1. Open `@BotFather` and send `/setinline`.
+2. Select the Honeybuy bot.
+3. Set a short placeholder such as `Item to add`.
+
+The bot must also be an administrator in every authorized group that should be
+offered as an inline destination. The requester must still be a current member
+of that group. Ordinary group authorization with `/authorize` remains required.
+
+Do not rely on `/setinlinefeedback` for correctness. It is unnecessary for this
+feature: selecting or sending a result does not mutate a list, and Honeybuy does
+not use `chosen_inline_result` as a functional trigger. If Telegram feedback is
+enabled independently, Telegram may deliver those updates as telemetry, but
+Honeybuy currently ignores them and they have no application state effect.
+
 ### OpenAI And Limits
 
 | Variable | Default | Meaning |
@@ -114,10 +133,10 @@ evals or use Telegram/OpenAI credentials.
 | `test_parser.py` | Deterministic shopping phrases, splitting, filler, and unknown input |
 | `test_recipes.py` | Recipe URL/paste/alias/reuse parsing and visible HTML text |
 | `test_ai.py` | Strict response models, wrapper payloads, and invalid-response metrics |
-| `test_service.py` | Domain validation, recipe operations, matching, identity deduplication |
-| `test_storage.py` | Chat isolation, state transitions, transaction/conflict rules, caches, sessions, and migrations |
+| `test_service.py` | Domain validation, inline-item normalization/application, recipe operations, matching, identity deduplication |
+| `test_storage.py` | Chat isolation, state transitions, inline-intent atomicity/expiry/quota, transaction/conflict rules, caches, sessions, and migrations |
 | `test_formatting.py` | Category grouping, HTML escaping, recipes, and shop rendering |
-| `test_telegram_bot.py` | Routing helpers and fake-session integration for text, voice context, recipes, and shop mode |
+| `test_telegram_bot.py` | Routing helpers and fake-session integration for inline capture, text, voice context, recipes, and shop mode |
 | `test_metrics.py` | AI status/error/cancellation instrumentation |
 | `test_config.py` | Owner and positive-limit validation |
 | `test_deploy.py` | Installer assumptions and migrate CLI behavior |
@@ -125,6 +144,20 @@ evals or use Telegram/OpenAI credentials.
 [`SCENARIOS.md`](../SCENARIOS.md) is the user-visible acceptance checklist.
 When behavior changes, update its stable scenario IDs and add the narrowest
 module test plus an integration-style Telegram test when routing is involved.
+
+For a focused offline inline-capture check, run:
+
+```sh
+uv run pytest -q tests/test_service.py -k inline_capture
+uv run pytest -q tests/test_storage.py \
+  -k "inline_capture or migrates_v1_database_to_inline_capture_schema"
+uv run pytest -q tests/test_telegram_bot.py -k inline
+```
+
+These tests use temporary SQLite files and a fake Telegram session. They do not
+contact Telegram, OpenAI, or a deployed database. Follow them with the full
+`uv run pytest -q`, `uv run ruff check .`, and `git diff --check` gates before
+release.
 
 ## Text Routing Evals
 
@@ -302,6 +335,15 @@ diagnosing a request.
 At minimum, verify:
 
 - `/whoami`, private access, group `/authorize`, and an unauthorized case;
+- after enabling `@BotFather` `/setinline`, type `@bot_username milk` from an
+  unrelated chat, confirm that the private list and only currently eligible
+  authorized groups appear, then send one result;
+- before tapping `Confirm add`, verify the destination list is unchanged and
+  the public card reveals neither its destination nor existing list contents;
+- tap `Confirm add`, verify exactly one literal `milk` item appears in the
+  selected list, and verify a repeated tap cannot add it again;
+- repeat with `milk and eggs` to confirm it is stored as one literal item, then
+  spot-check expiry or loss of group capability before confirmation;
 - `/add`, `/list`, `/remove`, `/bought`, and `/clear_bought`;
 - `/shop` and repeated/stale `Got` callbacks;
 - `mention` and `all` natural-text modes plus a mention-only reply;
@@ -318,6 +360,8 @@ The detailed maintained checklist is at the end of
 ## Known Operational Gaps
 
 The current repository has no automated database backup or restore command,
-health-check endpoint, log-rotation policy, state-retention task, confirmation
-reaper, or multi-instance deployment mechanism. These gaps are suitable places
-to start when moving beyond a small private installation.
+health-check endpoint, log-rotation policy, general state-retention task,
+voice/recipe confirmation reaper, inline-intent background reaper, or
+multi-instance deployment mechanism. Inline intents do have logical expiry and
+opportunistic cleanup; they do not require a worker for correctness. These gaps
+are suitable places to start when moving beyond a small private installation.
