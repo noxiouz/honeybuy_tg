@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tarfile
@@ -27,6 +28,7 @@ RESERVED_RELEASE_PATHS = {".ready.json", ".venv"}
 
 class ResultStatus(StrEnum):
     BUSY = "busy"
+    DEPLOYED = "deployed"
     NOOP = "noop"
     PREPARED = "prepared"
     REJECTED = "rejected"
@@ -50,6 +52,7 @@ class ControllerConfig:
     releases_dir: Path = Path("/opt/honeybuy-tg/releases")
     current_link: Path = Path("/opt/honeybuy-tg/current")
     deployed_state_path: Path = Path("/var/lib/honeybuy-release-controller/deployed-sha")
+    database_backup_dir: Path = Path("/var/backups/honeybuy-tg")
     lock_path: Path = Path("/run/lock/honeybuy-release-controller.lock")
     allowed_signers_path: Path = Path("/etc/honeybuy-tg/allowed_signers")
     database_path: Path = Path("/var/lib/honeybuy-tg/honeybuy.sqlite3")
@@ -203,6 +206,12 @@ class ReleaseController:
                 )
 
             return _result(ResultStatus.PREPARED, "release prepared", remote_sha)
+
+    def deploy(self) -> ControllerResult:
+        result = self.reconcile()
+        if result.status != ResultStatus.PREPARED or result.sha is None:
+            return result
+        return self._activate_release(result.sha)
 
     def _read_deployed_sha(self) -> str | None:
         try:
@@ -461,6 +470,63 @@ class ReleaseController:
             return _result(ResultStatus.REJECTED, "prepared release failed validation", sha)
         return None
 
+    def _activate_release(self, sha: str) -> ControllerResult:
+        release = self.config.releases_dir / sha
+        if not self._ready_release_is_safe(release, sha):
+            return _result(ResultStatus.REJECTED, "prepared release failed validation", sha)
+        if self.config.current_link.exists() and not self.config.current_link.is_symlink():
+            return _result(ResultStatus.REJECTED, "current release path is not a symlink", sha)
+
+        previous_target = self._current_release_target()
+        backup_path = self._backup_database(sha)
+        service_was_stopped = False
+
+        stopped = self._systemctl("stop")
+        if stopped.returncode != 0:
+            return _result(ResultStatus.REJECTED, "failed to stop service", sha)
+        service_was_stopped = True
+
+        migrated = self.runner.run(
+            (
+                str(release / ".venv/bin/python"),
+                "-m",
+                "honeybuy_tg",
+                "migrate",
+            ),
+            cwd=release,
+            uid=self.config.runtime_uid,
+            gid=self.config.runtime_gid,
+            env={"DATABASE_PATH": str(self.config.database_path)},
+        )
+        if migrated.returncode != 0:
+            self._restore_after_failed_activation(previous_target, backup_path, service_was_stopped)
+            return _result(ResultStatus.REJECTED, "migration failed", sha)
+
+        try:
+            self._switch_current_link(release)
+        except OSError as exc:
+            self._restore_after_failed_activation(previous_target, backup_path, service_was_stopped)
+            return _result(ResultStatus.REJECTED, f"failed to switch current release: {exc}", sha)
+
+        started = self._systemctl("start")
+        if started.returncode != 0:
+            self._restore_after_failed_activation(previous_target, backup_path, True)
+            return _result(ResultStatus.REJECTED, "failed to start service", sha)
+
+        healthy = self.runner.run(
+            (str(release / ".venv/bin/python"), "-m", "honeybuy_tg", "healthcheck"),
+            cwd=self.config.empty_work_dir,
+            uid=self.config.runtime_uid,
+            gid=self.config.runtime_gid,
+            env={"DATABASE_PATH": str(self.config.database_path)},
+        )
+        if healthy.returncode != 0:
+            self._restore_after_failed_activation(previous_target, backup_path, True)
+            return _result(ResultStatus.REJECTED, "startup healthcheck failed", sha)
+
+        self._write_deployed_sha(sha)
+        return _result(ResultStatus.DEPLOYED, "release deployed", sha)
+
     def _ready_release_is_safe(self, release: Path, sha: str) -> bool:
         if not release.is_dir() or release.is_symlink():
             return False
@@ -485,6 +551,70 @@ class ReleaseController:
         except OSError:
             return False
         return manifest.get("uv_lock_sha256") == actual_digest
+
+    def _backup_database(self, sha: str) -> Path | None:
+        if not self.config.database_path.exists():
+            return None
+        self.config.database_backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = self.config.database_backup_dir / (
+            f"{self.config.database_path.name}.{sha}.bak"
+        )
+        shutil.copy2(self.config.database_path, backup_path)
+        backup_path.chmod(0o600)
+        return backup_path
+
+    def _current_release_target(self) -> Path | None:
+        if not self.config.current_link.is_symlink():
+            return None
+        try:
+            return self.config.current_link.resolve(strict=True)
+        except OSError:
+            return None
+
+    def _switch_current_link(self, release: Path) -> None:
+        self.config.current_link.parent.mkdir(parents=True, exist_ok=True)
+        temporary_link = self.config.current_link.parent / f".current.{release.name}.tmp"
+        try:
+            temporary_link.unlink()
+        except FileNotFoundError:
+            pass
+        temporary_link.symlink_to(release)
+        os.replace(temporary_link, self.config.current_link)
+
+    def _restore_after_failed_activation(
+        self,
+        previous_target: Path | None,
+        backup_path: Path | None,
+        service_was_stopped: bool,
+    ) -> None:
+        if service_was_stopped:
+            self._systemctl("stop")
+        if previous_target is not None:
+            self._switch_current_link(previous_target)
+        elif self.config.current_link.is_symlink():
+            self.config.current_link.unlink()
+        if backup_path is not None:
+            shutil.copy2(backup_path, self.config.database_path)
+        elif self.config.database_path.exists():
+            self.config.database_path.unlink()
+        if service_was_stopped:
+            self._systemctl("start")
+
+    def _systemctl(self, action: str) -> subprocess.CompletedProcess[Any]:
+        return self.runner.run(
+            (
+                str(self.config.systemctl_path),
+                action,
+                self.config.service_name,
+            )
+        )
+
+    def _write_deployed_sha(self, sha: str) -> None:
+        self.config.deployed_state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.config.deployed_state_path.with_suffix(".tmp")
+        temporary.write_text(f"{sha}\n", encoding="utf-8")
+        temporary.chmod(0o644)
+        os.replace(temporary, self.config.deployed_state_path)
 
 
 def _drop_privileges(uid: int | None, gid: int | None):

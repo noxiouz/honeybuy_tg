@@ -125,6 +125,8 @@ class RunnerScenario:
     sync_returncode: int = 0
     smoke_returncode: int = 0
     healthcheck_returncode: int = 0
+    migrate_returncode: int = 0
+    systemctl_returncode: int = 0
     _head_index: int = 0
 
     def respond(self, call: RunCall) -> subprocess.CompletedProcess:
@@ -173,6 +175,18 @@ class RunnerScenario:
                 returncode=self.healthcheck_returncode,
                 stderr="healthcheck failed" if self.healthcheck_returncode else "",
             )
+        if kind == "migrate":
+            return _completed(
+                call,
+                returncode=self.migrate_returncode,
+                stderr="migration failed" if self.migrate_returncode else "",
+            )
+        if kind == "systemctl":
+            return _completed(
+                call,
+                returncode=self.systemctl_returncode,
+                stderr="systemctl failed" if self.systemctl_returncode else "",
+            )
         raise AssertionError(f"unexpected command: {call.argv!r}")
 
 
@@ -209,6 +223,8 @@ def _command_kind(call: RunCall) -> str:
         return "uv-sync"
     if argv[-2:] == ("-c", "import honeybuy_tg"):
         return "import-smoke"
+    if argv[-2:] == ("honeybuy_tg", "migrate"):
+        return "migrate"
     if argv[-2:] == ("honeybuy_tg", "healthcheck"):
         return "healthcheck"
     if "systemctl" in Path(argv[0]).name:
@@ -288,6 +304,7 @@ def _config(controller_module: ModuleType, tmp_path: Path):
     source_repo = tmp_path / "var/lib/honeybuy-release-controller/repository"
     releases_dir = tmp_path / "opt/honeybuy-tg/releases"
     state_dir = tmp_path / "var/lib/honeybuy-release-controller"
+    backup_dir = tmp_path / "var/backups/honeybuy-tg"
     trust_file = tmp_path / "etc/honeybuy-tg/allowed_signers"
     database_path = tmp_path / "var/lib/honeybuy-tg/honeybuy.sqlite3"
     empty_work_dir = tmp_path / "var/empty/honeybuy-healthcheck"
@@ -297,6 +314,7 @@ def _config(controller_module: ModuleType, tmp_path: Path):
         state_dir,
         trust_file.parent,
         database_path.parent,
+        backup_dir,
         empty_work_dir,
         tmp_path / "var/cache/honeybuy-tg/uv",
     ):
@@ -313,6 +331,7 @@ def _config(controller_module: ModuleType, tmp_path: Path):
         releases_dir=releases_dir,
         current_link=tmp_path / "opt/honeybuy-tg/current",
         deployed_state_path=state_dir / "deployed-sha",
+        database_backup_dir=backup_dir,
         lock_path=tmp_path / "run/lock/honeybuy-release-controller.lock",
         allowed_signers_path=trust_file,
         database_path=database_path,
@@ -1037,3 +1056,100 @@ def test_github_api_failure_fails_closed_without_service_effects(
     assert _preparation_calls(runner) == []
     assert config.database_path.read_bytes() == database_before
     assert not config.current_link.exists()
+
+
+def test_deploy_activates_prepared_release_with_backup_migrate_health_and_state(
+    controller_module,
+    tmp_path,
+):
+    config = _config(controller_module, tmp_path)
+    _write_deployed_state(config)
+    config.database_path.write_bytes(b"database sentinel")
+    events: list[str] = []
+    runner = FakeRunner(_scenario(config), events)
+    http = FakeHttp(_workflow_payload(_workflow_run(TARGET_SHA)), events)
+
+    result = _controller(controller_module, config, runner, http).deploy()
+
+    _assert_status(result, "deployed")
+    release = config.releases_dir / TARGET_SHA
+    assert config.current_link.is_symlink()
+    assert config.current_link.resolve() == release
+    assert config.deployed_state_path.read_text() == f"{TARGET_SHA}\n"
+    backups = list(config.database_backup_dir.glob("honeybuy.sqlite3.*.bak"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == b"database sentinel"
+    migrate = next(call for call in runner.calls if _command_kind(call) == "migrate")
+    assert migrate.argv == (
+        str(release / ".venv/bin/python"),
+        "-m",
+        "honeybuy_tg",
+        "migrate",
+    )
+    assert migrate.cwd == release
+    assert migrate.uid == config.runtime_uid
+    assert migrate.gid == config.runtime_gid
+    assert migrate.env == {"DATABASE_PATH": str(config.database_path)}
+    healthcheck = [
+        call for call in runner.calls if _command_kind(call) == "healthcheck"
+    ][-1]
+    assert healthcheck.cwd == config.empty_work_dir
+    assert healthcheck.uid == config.runtime_uid
+    assert healthcheck.gid == config.runtime_gid
+    assert healthcheck.env == {"DATABASE_PATH": str(config.database_path)}
+    systemctl_calls = [
+        call.argv for call in runner.calls if _command_kind(call) == "systemctl"
+    ]
+    assert systemctl_calls == [
+        (str(config.systemctl_path), "stop", config.service_name),
+        (str(config.systemctl_path), "start", config.service_name),
+    ]
+
+
+def test_deploy_rolls_back_link_and_database_when_startup_health_fails(
+    controller_module,
+    tmp_path,
+):
+    config = _config(controller_module, tmp_path)
+    _write_deployed_state(config)
+    previous_release = _create_ready_release(config, LAST_SHA, make_current=True)
+    config.database_path.write_bytes(b"database before deploy")
+    events: list[str] = []
+    runner = FakeRunner(_scenario(config, healthcheck_returncode=1), events)
+    http = FakeHttp(_workflow_payload(_workflow_run(TARGET_SHA)), events)
+
+    result = _controller(controller_module, config, runner, http).deploy()
+
+    _assert_status(result, "rejected")
+    assert config.current_link.resolve() == previous_release
+    assert config.database_path.read_bytes() == b"database before deploy"
+    assert config.deployed_state_path.read_text() == f"{LAST_SHA}\n"
+    systemctl_calls = [
+        call.argv for call in runner.calls if _command_kind(call) == "systemctl"
+    ]
+    assert systemctl_calls == [
+        (str(config.systemctl_path), "stop", config.service_name),
+        (str(config.systemctl_path), "start", config.service_name),
+        (str(config.systemctl_path), "stop", config.service_name),
+        (str(config.systemctl_path), "start", config.service_name),
+    ]
+
+
+def test_deploy_returns_prepare_failures_without_service_or_database_effects(
+    controller_module,
+    tmp_path,
+):
+    config = _config(controller_module, tmp_path)
+    _write_deployed_state(config)
+    config.database_path.write_bytes(b"database sentinel")
+    before_database = config.database_path.read_bytes()
+    events: list[str] = []
+    runner = FakeRunner(_scenario(config, verify_returncode=1), events)
+    http = FakeHttp(_workflow_payload(_workflow_run(TARGET_SHA)), events)
+
+    result = _controller(controller_module, config, runner, http).deploy()
+
+    _assert_status(result, "rejected")
+    assert not any(_command_kind(call) == "systemctl" for call in runner.calls)
+    assert config.database_path.read_bytes() == before_database
+    assert config.deployed_state_path.read_text() == f"{LAST_SHA}\n"
