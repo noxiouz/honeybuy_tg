@@ -57,6 +57,18 @@ def parse_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value)
 
 
+def serialize_datetime(value: datetime) -> str:
+    if value.tzinfo is None:
+        raise ValueError("Datetime must be timezone-aware")
+    return value.astimezone(UTC).isoformat(timespec="seconds")
+
+
+def inline_capture_token_hash(token: str) -> str:
+    if not token:
+        raise ValueError("Inline capture token is required")
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 def recipe_state_digest(recipe: Recipe) -> str:
     state = {
         "id": recipe.id,
@@ -127,6 +139,280 @@ class Storage:
             )
             row = cursor.fetchone()
         return row is not None
+
+    async def get_authorized_chat(self, chat_id: int) -> sqlite3.Row | None:
+        with self.connect() as db:
+            cursor = db.execute(
+                "SELECT * FROM authorized_chats WHERE chat_id = ?",
+                (chat_id,),
+            )
+            return cursor.fetchone()
+
+    async def list_authorized_group_chats(self) -> list[sqlite3.Row]:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                SELECT * FROM authorized_chats
+                WHERE chat_type IN ('group', 'supergroup')
+                ORDER BY title COLLATE NOCASE, chat_id
+                """
+            )
+            return cursor.fetchall()
+
+    async def create_inline_capture_intent(
+        self,
+        *,
+        token: str,
+        requester_id: int,
+        target_chat_id: int,
+        target_kind: str,
+        item_text: str,
+        created_at: datetime,
+        expires_at: datetime,
+        pending_limit: int,
+    ) -> None:
+        await self.create_inline_capture_intents(
+            requester_id=requester_id,
+            intents=[
+                {
+                    "token": token,
+                    "target_chat_id": target_chat_id,
+                    "target_kind": target_kind,
+                    "item_text": item_text,
+                }
+            ],
+            created_at=created_at,
+            expires_at=expires_at,
+            pending_limit=pending_limit,
+        )
+
+    async def create_inline_capture_intents(
+        self,
+        *,
+        requester_id: int,
+        intents: list[dict[str, object]],
+        created_at: datetime,
+        expires_at: datetime,
+        pending_limit: int,
+    ) -> None:
+        if pending_limit < 1:
+            raise ValueError("Inline capture pending limit must be positive")
+        if len(intents) > pending_limit:
+            raise ValueError("Inline capture batch exceeds pending limit")
+        if not intents:
+            return
+
+        created_at_text = serialize_datetime(created_at)
+        expires_at_text = serialize_datetime(expires_at)
+        if expires_at_text <= created_at_text:
+            raise ValueError("Inline capture expiry must be after creation")
+
+        prepared_intents: list[tuple[object, ...]] = []
+        for intent in intents:
+            token = intent.get("token")
+            target_chat_id = intent.get("target_chat_id")
+            target_kind = intent.get("target_kind")
+            item_text = intent.get("item_text")
+            if not isinstance(token, str) or not token:
+                raise ValueError("Inline capture token is required")
+            if not isinstance(target_chat_id, int) or isinstance(target_chat_id, bool):
+                raise ValueError("Invalid inline capture target chat")
+            if target_kind not in {"private", "group", "supergroup"}:
+                raise ValueError("Invalid inline capture target kind")
+            if not isinstance(item_text, str):
+                raise ValueError("Inline capture item is required")
+            clean_item_text = " ".join(item_text.strip().split())
+            if not clean_item_text:
+                raise ValueError("Inline capture item is required")
+            prepared_intents.append(
+                (
+                    inline_capture_token_hash(token),
+                    requester_id,
+                    target_chat_id,
+                    target_kind,
+                    clean_item_text,
+                    created_at_text,
+                    expires_at_text,
+                )
+            )
+
+        existing_pending_limit = pending_limit - len(prepared_intents)
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute(
+                    "DELETE FROM inline_capture_intents WHERE expires_at <= ?",
+                    (created_at_text,),
+                )
+                db.execute(
+                    """
+                    DELETE FROM inline_capture_intents
+                    WHERE token_hash IN (
+                        SELECT token_hash FROM inline_capture_intents
+                        WHERE requester_id = ? AND status = 'pending'
+                        ORDER BY created_at DESC, rowid DESC
+                        LIMIT -1 OFFSET ?
+                    )
+                    """,
+                    (requester_id, existing_pending_limit),
+                )
+                db.executemany(
+                    """
+                    INSERT INTO inline_capture_intents (
+                        token_hash, requester_id, target_chat_id, target_kind,
+                        item_text, created_at, expires_at, status
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+                    """,
+                    prepared_intents,
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+
+    async def get_inline_capture_intent(
+        self,
+        *,
+        token: str,
+        requester_id: int,
+        now: datetime,
+    ) -> sqlite3.Row | None:
+        now_text = serialize_datetime(now)
+        token_hash = inline_capture_token_hash(token)
+        with self.connect() as db:
+            db.execute(
+                """
+                DELETE FROM inline_capture_intents
+                WHERE token_hash = ?
+                    AND requester_id = ?
+                    AND status = 'pending'
+                    AND expires_at <= ?
+                """,
+                (token_hash, requester_id, now_text),
+            )
+            cursor = db.execute(
+                """
+                SELECT * FROM inline_capture_intents
+                WHERE token_hash = ?
+                    AND requester_id = ?
+                    AND status = 'pending'
+                    AND expires_at > ?
+                """,
+                (token_hash, requester_id, now_text),
+            )
+            row = cursor.fetchone()
+            db.commit()
+            return row
+
+    async def apply_inline_capture_intent(
+        self,
+        *,
+        token: str,
+        requester_id: int,
+        now: datetime,
+        canonical_name: str | None,
+        canonical_key: str | None,
+    ) -> ShoppingItem | None:
+        now_text = serialize_datetime(now)
+        token_hash = inline_capture_token_hash(token)
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute(
+                    """
+                    DELETE FROM inline_capture_intents
+                    WHERE token_hash = ?
+                        AND requester_id = ?
+                        AND status = 'pending'
+                        AND expires_at <= ?
+                    """,
+                    (token_hash, requester_id, now_text),
+                )
+                intent = db.execute(
+                    """
+                    SELECT * FROM inline_capture_intents
+                    WHERE token_hash = ?
+                        AND requester_id = ?
+                        AND status = 'pending'
+                        AND expires_at > ?
+                    """,
+                    (token_hash, requester_id, now_text),
+                ).fetchone()
+                if intent is None:
+                    db.commit()
+                    return None
+
+                target_chat_id = int(intent["target_chat_id"])
+                target_kind = str(intent["target_kind"])
+                if target_kind == "private":
+                    if target_chat_id != requester_id:
+                        db.commit()
+                        return None
+                elif target_kind in {"group", "supergroup"}:
+                    authorized = db.execute(
+                        """
+                        SELECT chat_type FROM authorized_chats
+                        WHERE chat_id = ?
+                            AND chat_type IN ('group', 'supergroup')
+                        """,
+                        (target_chat_id,),
+                    ).fetchone()
+                    if authorized is None:
+                        db.commit()
+                        return None
+                else:
+                    db.commit()
+                    return None
+
+                item_text = str(intent["item_text"])
+                claimed = db.execute(
+                    """
+                    UPDATE inline_capture_intents
+                    SET status = 'applied', item_text = ''
+                    WHERE token_hash = ?
+                        AND requester_id = ?
+                        AND status = 'pending'
+                        AND expires_at > ?
+                    """,
+                    (token_hash, requester_id, now_text),
+                )
+                if claimed.rowcount != 1:
+                    db.commit()
+                    return None
+
+                cursor = db.execute(
+                    """
+                    INSERT INTO shopping_items (
+                        chat_id, name, normalized_name, canonical_name,
+                        canonical_key, quantity, unit, note, due_date, status,
+                        created_by, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?)
+                    """,
+                    (
+                        target_chat_id,
+                        item_text,
+                        normalize_item_name(item_text),
+                        canonical_name,
+                        canonical_key,
+                        ItemStatus.ACTIVE.value,
+                        requester_id,
+                        now_text,
+                        now_text,
+                    ),
+                )
+                item = db.execute(
+                    "SELECT * FROM shopping_items WHERE id = ?",
+                    (cursor.lastrowid,),
+                ).fetchone()
+                if item is None:
+                    raise RuntimeError("Inserted inline capture item could not be loaded")
+                db.commit()
+                return row_to_item(item)
+            except Exception:
+                db.rollback()
+                raise
 
     async def add_item(
         self,

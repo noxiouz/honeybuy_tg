@@ -1,10 +1,10 @@
 # Honeybuy Developer Documentation
 
 Honeybuy is a private, chat-scoped Telegram shopping-list bot. It accepts slash
-commands, selected natural-language messages, voice notes, inline-button
-callbacks, and recipe text or links. SQLite is the source of truth; OpenAI is an
-optional capability provider for everything except voice transcription and new
-recipe extraction, where it is required.
+commands, selected natural-language messages, voice notes, cross-chat inline
+queries, inline-button callbacks, and recipe text or links. SQLite is the source
+of truth; OpenAI is an optional capability provider for everything except voice
+transcription and new recipe extraction, where it is required.
 
 This directory describes how the implemented system fits together. It
 complements, rather than replaces, the root documentation:
@@ -22,7 +22,8 @@ input paths that do exist and their exact constraints.
 - [Architecture](architecture.md) explains process startup, module boundaries,
   dependencies, and external systems.
 - [Request Lifecycle](request-lifecycle.md) traces authorization, shopping
-  commands, natural text, voice, reply context, callbacks, and shopping mode.
+  commands, cross-chat inline capture, natural text, voice, reply context,
+  callbacks, and shopping mode.
 - [Ingestion And Recipes](ingestion-and-recipes.md) documents recipe URL and
   pasted-text ingestion, extraction, overwrite protection, and unsupported
   import formats.
@@ -44,6 +45,9 @@ Keep these properties intact when changing the project:
   shopping-list cleanup is a soft state transition, not row deletion.
 - An authorized group has one shared list for all its members. Owner-only
   operations remain owner-only inside that group.
+- Inline capture never infers its list tenant from the chat where Telegram
+  displays the card. A requester-bound, expiring intent names the destination,
+  and only its explicit inline callback can apply the literal one-item query.
 - Deterministic parsing and core slash commands continue to work without an
   OpenAI key. Voice transcription and learning a new recipe do not.
 - A recipe header and its replacement ingredient set are saved atomically.

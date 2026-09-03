@@ -28,6 +28,31 @@ Authorization is evaluated before list or recipe state is read or mutated. For
 tenant-scoped service and storage operations, the tenant key is the Telegram
 `chat_id`; category and identity caches are the intentional global exception.
 
+## Cross-Chat Inline Capture
+
+Inline capture lets an eligible user type one item after the bot username in
+any Telegram chat, choose a Honeybuy destination, send a generic card, and add
+the item only by tapping its explicit confirmation button.
+
+| Stage | Implemented behavior and boundary |
+| --- | --- |
+| Query validation | Collapse surrounding and repeated whitespace. A blank query or raw/clean query longer than 256 characters returns no results and creates no state. The complete query is one literal item; recipe and shopping parsers are not called and words such as `and` or `и` are not split. |
+| Private candidate | Offer `Add to my Honeybuy list` only when the requester currently matches the owner or `ALLOWED_USER_IDS`. The destination is the requester's numeric user ID, not the chat displaying the inline query. When allowed, this is the first result and consumes one of the 50 total result slots. |
+| Group candidates | Consider only the first 50 stored authorized groups in stable title/ID order; groups later in that order are not capability-checked or offered even when earlier candidates are ineligible. Stop checking the prefix earlier once the combined picker reaches 50 results. For each considered group, first require the bot's current Telegram status to be administrator, then require the requester to be creator, administrator, member, or a restricted user whose membership flag is true. Failed Telegram lookups exclude the group. |
+| Intent batch | Offer no more than 50 destinations in total. An allowed private destination is first, so it can be accompanied by at most 49 groups. Generate a separate opaque token per offered destination and create the complete five-minute intent batch atomically. Persistence caps pending intents at 100 per requester and trims older ones when necessary. A batch failure returns no results and leaves no partial new batch. |
+| Picker response | Return personal results with `cache_time=0`. Destination titles are picker metadata only. The sent card contains the literal item and a generic `Confirm add` button, but no destination name, chat ID, or existing list contents. |
+| Selection | Sending a result and receiving an optional `chosen_inline_result` update do not mutate a list. There is no chosen-result handler that applies an item. |
+| Explicit callback | Require a syntactically valid opaque token, the original requester, and a callback for an inline message rather than an ordinary chat message. Ignore `chat_instance` and visible card text for destination selection. Unknown, expired, wrong-requester, and replayed tokens cannot apply. |
+| Initial capability gate | Before normalization, check current private authorization or, for a group, stored authorization, bot administrator status, and requester membership. A failed check leaves an otherwise live intent retryable until it expires. |
+| Normalize and final gate | Normalize the single literal item through the ordinary item-identity service. Immediately afterward, repeat the same private/group capability check; loss of access during asynchronous normalization prevents application and leaves an otherwise live intent retryable. |
+| Atomic apply | After the final capability gate, take a fresh time and start one storage transaction that rereads the live intent, rechecks its expiry and target, marks it applied, redacts `item_text`, and inserts the shopping item. Expiry during normalization therefore prevents insertion; insert failure rolls back the claim and redaction. |
+| Post-commit response | Record an `add`/`inline_capture` shopping metric and edit the inline card to generic success text after the database commit. If that Telegram edit fails, the item stays committed and the applied token still prevents replay. |
+
+This flow does not use `pending_confirmations`, which remains the chat-scoped
+store for ambiguous voice and recipe-overwrite callbacks. Inline capture has no
+trusted source-chat identity: the expiring intent, requester ID, and current
+destination checks carry the authority.
+
 ## Direct Shopping Commands
 
 A normal command follows this path:

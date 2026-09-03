@@ -7,6 +7,8 @@ Private Telegram shopping-list bot for one list per chat.
 - Chat-scoped shopping lists backed by local SQLite.
 - Private bot access: owner authorization for chats, with all members of an
   authorized group allowed to use that chat's list.
+- Cross-chat inline capture: type `@bot item` in any Telegram chat, choose an
+  eligible private or authorized group list, and explicitly confirm the add.
 - Telegram command suggestions for supported slash commands.
 - Exact commands for adding, removing, buying, listing, shopping mode, clearing
   bought items, clearing the active list with confirmation, and showing IDs.
@@ -77,6 +79,13 @@ started successfully.
 For group voice messages, disable Telegram bot privacy mode in `@BotFather`
 with `/setprivacy`, otherwise Telegram will deliver commands but not ordinary
 voice messages from the group chat.
+
+To use cross-chat inline capture, enable inline mode for the bot manually in
+`@BotFather` with `/setinline`. The bot must be an administrator in every
+authorized group that should appear as a destination, and the requester must
+still be a member of that group. `/setinlinefeedback` is unnecessary: choosing
+an inline result never changes a list, and feedback updates are not used for
+the confirmation.
 
 Run tests:
 
@@ -192,6 +201,30 @@ env template lives at `deploy/ubuntu/env.example`.
 - `/delete_recipe solyanka` - delete a saved recipe from the current chat.
 - `/reanalyze` - reanalyze a replied-to voice message.
 - `/text_parse_mode` - configure natural text parsing for the current chat.
+
+## Cross-Chat Inline Capture
+
+After enabling inline mode in `@BotFather`, type one item after the bot username
+from any Telegram chat, for example:
+
+```text
+@your_bot_username milk
+```
+
+The personalized picker puts the requester's allowed private list first, then
+offers eligible groups from only the first 50 stored authorized groups in
+stable title/ID order. Groups later in that order are not checked or offered,
+even when earlier candidates are ineligible. The picker has 50 total slots, so
+the private result consumes one slot and can be accompanied by at most 49 group
+results. Choose a destination, send the card, and tap `Confirm add`. The sent
+card contains the item but does not reveal the destination name or any existing
+list contents.
+
+The query is one literal item after whitespace cleanup. It does not invoke the
+shopping or recipe parsers and does not split words such as `and` or `и` into
+multiple items. Neither opening the picker nor choosing a result mutates a list;
+only the requester-bound confirmation button can add the item. Confirmations
+expire after five minutes and cannot be replayed.
 
 Use `/shop` when you are in the store: it posts a compact checklist with one
 `Got: item` button per active item. After each tap, the same message is updated

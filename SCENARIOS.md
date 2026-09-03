@@ -19,6 +19,7 @@ The bot accepts:
 - Natural text messages, according to the chat text parsing mode.
 - Voice messages and replied voice reanalysis.
 - Recipe links and pasted recipe text.
+- Inline queries from other Telegram chats.
 - Inline keyboard callbacks for confirmations and shopping mode.
 
 ## Actors
@@ -39,6 +40,8 @@ The bot accepts:
   the chat list.
 - Unauthorized users must not mutate or read shopping-list state.
 - Owner-only commands remain owner-only even inside authorized group chats.
+- Inline capture is bound to the requester and an explicit destination; the
+  Telegram chat where the inline card is sent is never used as the list tenant.
 - Empty item names and malformed commands must be rejected with usage guidance.
 - AI-backed features may be unavailable when `OPENAI_API_KEY` is not configured;
   deterministic local behavior must continue to work.
@@ -164,6 +167,98 @@ confirmation message with the cleared count.
 Given a pending clear confirmation,
 when the owner cancels it,
 then the bot edits the message to say the clear was cancelled.
+
+## Cross-Chat Inline Capture
+
+### INLINE-001 Personalized Eligible Destinations
+
+Given inline mode is enabled for the bot,
+when a user types `@HoneyBuyBot milk` in any Telegram chat,
+then the bot returns a personal, uncached picker containing at most 50 eligible
+destinations.
+
+The user's private Honeybuy list is eligible only while that user is allowed in
+private chat. When eligible, it is the first result and consumes one of the 50
+result slots, so at most 49 group results accompany it.
+
+Only the first 50 stored authorized group candidates in stable title/ID order
+are considered for capability checks, and checks stop earlier when the combined
+picker reaches 50 results. Later stored groups are neither checked nor offered,
+even if they would be eligible and earlier candidates are ineligible. A
+considered group is eligible only while the bot is an administrator there and
+the requester is still a current member, including a restricted member whose
+Telegram membership flag remains true. The bot checks its administrator status
+before checking the requester's membership.
+
+### INLINE-002 Invalid Query Creates No State
+
+Given an inline query is blank, longer than 256 characters, or has no eligible
+destination,
+when the bot answers it,
+then it returns no results and creates neither a shopping item nor an inline
+capture intent.
+
+### INLINE-003 Query Is One Literal Item
+
+Given an eligible user enters an inline query such as `milk and eggs`,
+when the bot prepares destination results,
+then it collapses surrounding and repeated whitespace but treats the complete
+query as one literal item.
+
+The bot must not invoke shopping or recipe command parsing and must not split
+the query into multiple items.
+
+### INLINE-004 Selection Does Not Mutate
+
+Given the inline picker contains an eligible destination,
+when the user selects and sends its result,
+then no shopping-list mutation occurs until the explicit `Confirm add` callback.
+
+The sent card may show the literal item, but it must not reveal the destination
+title, destination chat ID, or existing list contents. A Telegram
+`chosen_inline_result` update must not mutate state.
+
+### INLINE-005 Confirmation Is Requester-Bound And Rechecks Access
+
+Given an inline capture confirmation is pending,
+when its original requester taps `Confirm add` on the inline message within five
+minutes,
+then the bot checks current private access or, for a group, stored authorization,
+bot administrator status, and requester membership before item normalization,
+and repeats the same capability check after normalization immediately before
+the atomic add.
+
+A callback from another user, a callback attached to an ordinary chat message,
+a malformed or unknown token, or a callback whose current capability checks
+fail must not add an item. Callback `chat_instance` and visible card content
+must not select or override the destination.
+
+If access changes while item normalization is running, the final capability
+check must prevent the add and leave the otherwise live intent retryable until
+it expires.
+
+### INLINE-006 Confirmation Expires And Is Single-Use
+
+Given an inline capture confirmation is pending,
+when its five-minute lifetime expires, including while optional item
+normalization is running,
+then the callback must not add an item.
+
+Given a confirmation has already added its item,
+when Telegram delivers the callback again,
+then the replay must not create another item.
+
+### INLINE-007 Apply Is Atomic Before Card Edit
+
+Given a valid inline confirmation,
+when storage applies it,
+then claiming the intent, redacting its item payload, and inserting the shopping
+item happen in one transaction.
+
+If the item insert fails, the transaction rolls back and the intent remains
+retryable while it is otherwise valid. If the item commit succeeds but editing
+the inline card fails, the item remains added and replay protection remains in
+force.
 
 ## Natural Text Parsing
 
@@ -702,6 +797,8 @@ After deployment, manually verify:
 
 - Private chat authorization and `/whoami`.
 - Group chat `/authorize`.
+- Inline capture from an unrelated chat into the private list and an authorized
+  group, including the explicit confirmation and a repeated tap.
 - `/add`, `/list`, `/remove`, `/bought`, `/clear_bought`.
 - `/shop` checklist and `Got` callbacks.
 - Natural text parsing in `mention` and `all` modes.

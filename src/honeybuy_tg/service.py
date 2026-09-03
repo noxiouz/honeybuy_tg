@@ -1,4 +1,6 @@
 import re
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Protocol
 
 from honeybuy_tg.models import ItemIdentity, Recipe, ShoppingItem
@@ -30,6 +32,41 @@ class ShoppingListService:
             chat_id=chat_id,
             name=clean_name,
             created_by=user_id,
+            canonical_name=identity.canonical_name,
+            canonical_key=identity.canonical_key,
+        )
+
+    async def apply_inline_capture(
+        self,
+        *,
+        token: str,
+        requester_id: int,
+        now: datetime | None = None,
+        pre_apply_guard: Callable[[int, str], Awaitable[bool]] | None = None,
+    ) -> ShoppingItem | None:
+        lookup_now = now if now is not None else datetime.now(UTC)
+        intent = await self.storage.get_inline_capture_intent(
+            token=token,
+            requester_id=requester_id,
+            now=lookup_now,
+        )
+        if intent is None:
+            return None
+
+        clean_name = " ".join(str(intent["item_text"]).strip().split())
+        if not clean_name:
+            return None
+        identity = await self.item_identity(clean_name)
+        if pre_apply_guard is not None and not await pre_apply_guard(
+            int(intent["target_chat_id"]),
+            str(intent["target_kind"]),
+        ):
+            return None
+        apply_now = now if now is not None else datetime.now(UTC)
+        return await self.storage.apply_inline_capture_intent(
+            token=token,
+            requester_id=requester_id,
+            now=apply_now,
             canonical_name=identity.canonical_name,
             canonical_key=identity.canonical_key,
         )

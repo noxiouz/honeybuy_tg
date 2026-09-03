@@ -30,6 +30,7 @@ also means:
 | `events` | generated `id`, contains `chat_id` and `user_id` | Selective input, parse, and error diagnostics; not a complete audit log |
 | `bot_messages` | `(chat_id, message_id)` | Telegram response kind and item IDs for reply-context actions |
 | `pending_confirmations` | generated `id`, looked up with `chat_id` | Single-use voice and recipe-overwrite confirmation state encoded in JSON |
+| `inline_capture_intents` | SHA-256 `token_hash`, every lookup also bound to `requester_id` | Expiring, single-use authority to add one literal item to an explicit private or authorized-group destination |
 | `chat_settings` | `chat_id` | Per-chat natural-text parse-mode override |
 | `category_cache` | normalized raw item name | Global, expiring AI category cache |
 | `item_normalization_cache` | normalized raw item name | Global, expiring canonical grocery identity cache |
@@ -67,6 +68,13 @@ erDiagram
         integer chat_id
         text status
         text items_json
+    }
+    INLINE_CAPTURE_INTENTS {
+        text token_hash PK
+        integer requester_id
+        integer target_chat_id
+        text target_kind
+        text status
     }
     CHAT_SETTINGS {
         integer chat_id PK
@@ -110,10 +118,19 @@ stored Telegram or shopping-item IDs without foreign-key constraints.
 
 ## Chat Isolation
 
-Shopping items, recipes, aliases, settings, confirmations, bot-message context,
-and shop sessions are always read with a `chat_id`. A Telegram message ID is
-only unique within its chat, which is why context and sessions use composite
-keys.
+Shopping items, recipes, aliases, settings, voice/recipe confirmations,
+bot-message context, and shop sessions are always read with a `chat_id`. A
+Telegram message ID is only unique within its chat, which is why context and
+sessions use composite keys.
+
+Inline capture is deliberately different because Telegram inline queries can
+originate outside a Honeybuy chat. Its intent stores an explicit target and is
+looked up with both an opaque token hash and the requester ID. A private target
+must equal that requester ID. A group target must still have a stored
+`authorized_chats` row of type `group` or `supergroup` inside the apply
+transaction; the Telegram layer separately rechecks current bot-admin and
+requester-membership capability both before asynchronous item normalization and
+again immediately afterward, just before calling storage.
 
 Two caches are intentionally cross-chat:
 
@@ -217,14 +234,60 @@ to a terminal status. This prevents two callbacks from applying the same
 request, but it is not one cross-operation transaction: a crash can strand a
 claimed status, or save the recipe before the final status update.
 
-Confirmations, bot-message context, shop sessions, and event rows have no TTL or
-cleanup mechanism.
+Voice/recipe confirmations, bot-message context, shop sessions, and event rows
+have no TTL or cleanup mechanism. Inline-capture intent expiry and cleanup are
+described separately below.
+
+## Inline Capture State
+
+Schema version 2 adds `inline_capture_intents` with exactly these columns:
+
+| Column | Type and constraint | Meaning |
+| --- | --- | --- |
+| `token_hash` | `TEXT PRIMARY KEY` | SHA-256 digest of the random callback token; the raw token is never stored |
+| `requester_id` | `INTEGER NOT NULL` | Telegram user who created and may apply the intent |
+| `target_chat_id` | `INTEGER NOT NULL` | Explicit Honeybuy list tenant represented by this personalized picker result |
+| `target_kind` | `TEXT NOT NULL`, checked to `private`, `group`, or `supergroup` | Determines the target invariant rechecked at apply time |
+| `item_text` | `TEXT NOT NULL` | One whitespace-cleaned literal item; cleared after successful application |
+| `created_at` | `TEXT NOT NULL` | UTC creation time at seconds precision |
+| `expires_at` | `TEXT NOT NULL` | Absolute UTC expiry used by application comparisons |
+| `status` | `TEXT NOT NULL DEFAULT 'pending'`, checked to `pending` or `applied` | Single-use state transition |
+
+The accompanying index is
+`idx_inline_capture_requester_pending(requester_id, status, created_at)`. There
+are no columns for the raw token, source chat, `chat_instance`, inline-message
+ID, conversation title, or destination title. Those Telegram delivery values
+must not become persistence authority.
+
+The Telegram integration gives every new batch a five-minute logical lifetime,
+returns at most 50 destination results, and asks storage to keep at most 100
+pending intents per requester. Batch creation uses one `BEGIN IMMEDIATE`
+transaction to remove expired rows, trim that requester's oldest pending rows,
+and insert every new destination intent. Either the full new batch commits or
+none of it does; other requesters' live rows are not part of that quota.
+
+Application is also one `BEGIN IMMEDIATE` transaction. Storage rereads a live,
+pending `(token_hash, requester_id)` row, revalidates the private or authorized
+group target, conditionally changes the status to `applied`, clears
+`item_text`, and inserts the active shopping item with the requester as
+`created_by`. An exception before commit rolls back the claim, redaction, and
+insert together. Duplicate or concurrent callback delivery can therefore
+insert at most one item. The Telegram card is edited only after this transaction
+commits, so an edit failure does not make the intent reusable.
+
+The Telegram query handler establishes an expiry deadline, and lookup and apply
+enforce it with timestamp comparisons rather than a database timer. Creating a
+batch opportunistically removes expired rows; looking up or applying a token
+removes only that matching expired pending row. Successful rows retain their
+`applied` marker with an empty item payload until a later batch deletes expired
+rows, if another batch is created. There is no background reaper or scheduled
+retention job.
 
 ## Events And Sensitive Data
 
 The `events` table is written on selected unauthorized, natural-text, voice, and
-recipe paths. Slash-command actions and every callback are not represented
-uniformly, so it must not be treated as a security audit log.
+recipe paths. Slash-command actions, inline queries, and callbacks are not
+represented uniformly, so it must not be treated as a security audit log.
 
 Depending on the path, it can contain:
 
@@ -250,7 +313,7 @@ to the global identity cache.
 
 ## Migrations
 
-The current schema version is `1`, stored in `PRAGMA user_version`.
+The current schema version is `2`, stored in `PRAGMA user_version`.
 `run_migrations`:
 
 1. acquires `BEGIN IMMEDIATE` when it does not already own a transaction;
@@ -261,8 +324,10 @@ The current schema version is `1`, stored in `PRAGMA user_version`.
 
 Version 1 creates missing tables and indexes and repairs a few known legacy
 table shapes by adding canonical identity and shop-category columns. It does not
-backfill identity values. If a database already advertises version 1, the
-current migration runner does not reconcile arbitrary missing schema objects.
+backfill identity values. Version 2 adds the inline-capture intent table and its
+requester/status/creation index without changing existing rows. If a database
+already advertises the current version, the migration runner does not reconcile
+arbitrary missing schema objects.
 
 Normal bot startup calls `Storage.init` and runs migrations before polling. The
 explicit migrate command additionally runs `PRAGMA integrity_check` after the

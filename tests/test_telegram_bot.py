@@ -1,18 +1,24 @@
+import asyncio
 from collections.abc import AsyncGenerator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
+import re
+import sqlite3
 
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import (
     AnswerCallbackQuery,
+    AnswerInlineQuery,
     EditMessageText,
+    GetChatMember,
     GetFile,
     GetMe,
     SendMessage,
     SetMessageReaction,
 )
-from aiogram.types import Chat, File, Message, Update, User
+from aiogram.types import Chat, File, Message, ResultChatMemberUnion, Update, User
+from pydantic import TypeAdapter
 import pytest
 
 from honeybuy_tg.config import Settings
@@ -47,6 +53,10 @@ class FakeTelegramSession(BaseSession):
         self.requests = []
         self.next_message_id = 100
         self.fail_reactions = False
+        self.fail_callback_answers = False
+        self.fail_inline_edits = False
+        self.chat_members = {}
+        self.before_inline_edit = None
 
     async def close(self) -> None:
         pass
@@ -85,13 +95,103 @@ class FakeTelegramSession(BaseSession):
                 file_unique_id="voice-unique",
                 file_path="voice.ogg",
             )
+        if isinstance(method, GetChatMember):
+            configured = self.chat_members.get((int(method.chat_id), method.user_id))
+            if configured is None:
+                raise AssertionError(
+                    "Missing fake chat member for "
+                    f"chat={method.chat_id}, user={method.user_id}"
+                )
+            if isinstance(configured, Exception):
+                raise configured
+            return make_chat_member(
+                status=configured,
+                user_id=method.user_id,
+            )
+        if isinstance(method, AnswerInlineQuery):
+            return True
         if isinstance(method, SetMessageReaction):
             if self.fail_reactions:
                 raise RuntimeError("reaction failed")
             return True
-        if isinstance(method, EditMessageText | AnswerCallbackQuery):
+        if isinstance(method, EditMessageText):
+            if method.inline_message_id is not None and self.before_inline_edit:
+                self.before_inline_edit(method)
+            if method.inline_message_id is not None and self.fail_inline_edits:
+                raise RuntimeError("inline edit failed")
+            return True
+        if isinstance(method, AnswerCallbackQuery):
+            if self.fail_callback_answers:
+                raise RuntimeError("callback answer failed")
             return True
         raise AssertionError(f"Unexpected Telegram method: {type(method).__name__}")
+
+
+CHAT_MEMBER_ADAPTER = TypeAdapter(ResultChatMemberUnion)
+
+
+def make_chat_member(*, status, user_id):
+    normalized_status = status
+    is_member = None
+    if status == "restricted_member":
+        normalized_status = "restricted"
+        is_member = True
+    elif status == "restricted_nonmember":
+        normalized_status = "restricted"
+        is_member = False
+
+    payload = {
+        "status": normalized_status,
+        "user": {
+            "id": user_id,
+            "is_bot": user_id == 999,
+            "first_name": "Bot" if user_id == 999 else "User",
+        },
+    }
+    if normalized_status == "creator":
+        payload["is_anonymous"] = False
+    elif normalized_status == "administrator":
+        payload.update(
+            {
+                "can_be_edited": False,
+                "is_anonymous": False,
+                "can_manage_chat": True,
+                "can_delete_messages": False,
+                "can_manage_video_chats": False,
+                "can_restrict_members": False,
+                "can_promote_members": False,
+                "can_change_info": False,
+                "can_invite_users": False,
+                "can_post_stories": False,
+                "can_edit_stories": False,
+                "can_delete_stories": False,
+            }
+        )
+    elif normalized_status == "restricted":
+        payload.update(
+            {
+                "is_member": is_member,
+                "can_send_messages": False,
+                "can_send_audios": False,
+                "can_send_documents": False,
+                "can_send_photos": False,
+                "can_send_videos": False,
+                "can_send_video_notes": False,
+                "can_send_voice_notes": False,
+                "can_send_polls": False,
+                "can_send_other_messages": False,
+                "can_add_web_page_previews": False,
+                "can_edit_tag": False,
+                "can_change_info": False,
+                "can_invite_users": False,
+                "can_pin_messages": False,
+                "can_manage_topics": False,
+                "until_date": 0,
+            }
+        )
+    elif normalized_status == "kicked":
+        payload["until_date"] = 0
+    return CHAT_MEMBER_ADAPTER.validate_python(payload)
 
 
 def test_voice_reanalysis_request_matches_bot_mention():
@@ -828,6 +928,1177 @@ def sent_message_texts(session):
         for request in session.requests
         if isinstance(request, SendMessage)
     ]
+
+
+async def build_inline_test_context(
+    tmp_path,
+    *,
+    owner_user_id=42,
+    owner_username=None,
+    allowed_user_ids="",
+    openai_api_key=None,
+):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=owner_user_id,
+        OWNER_USERNAME=owner_username,
+        ALLOWED_USER_IDS=allowed_user_ids,
+        OPENAI_API_KEY=openai_api_key,
+        TEXT_PARSE_MODE="all",
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+    return storage, dispatcher, session, bot
+
+
+def make_inline_query_update(
+    query,
+    *,
+    update_id=1,
+    query_id="inline-query-1",
+    user_id=42,
+    username=None,
+    offset="",
+    chat_type="sender",
+):
+    from_user = {
+        "id": user_id,
+        "is_bot": False,
+        "first_name": "Inline user",
+    }
+    if username is not None:
+        from_user["username"] = username
+    return Update.model_validate(
+        {
+            "update_id": update_id,
+            "inline_query": {
+                "id": query_id,
+                "from": from_user,
+                "query": query,
+                "offset": offset,
+                "chat_type": chat_type,
+            },
+        }
+    )
+
+
+def make_chosen_inline_result_update(
+    *,
+    result_id,
+    query,
+    update_id=2,
+    user_id=42,
+    username=None,
+):
+    from_user = {
+        "id": user_id,
+        "is_bot": False,
+        "first_name": "Inline user",
+    }
+    if username is not None:
+        from_user["username"] = username
+    return Update.model_validate(
+        {
+            "update_id": update_id,
+            "chosen_inline_result": {
+                "result_id": result_id,
+                "from": from_user,
+                "query": query,
+                "inline_message_id": "inline-message-1",
+            },
+        }
+    )
+
+
+def make_inline_callback_update(
+    callback_data,
+    *,
+    update_id=3,
+    callback_id="inline-callback-1",
+    user_id=42,
+    username=None,
+    inline_message_id="inline-message-1",
+    with_message=False,
+    chat_instance="unrelated-source-chat",
+):
+    from_user = {
+        "id": user_id,
+        "is_bot": False,
+        "first_name": "Inline user",
+    }
+    if username is not None:
+        from_user["username"] = username
+    callback = {
+        "id": callback_id,
+        "from": from_user,
+        "chat_instance": chat_instance,
+        "data": callback_data,
+    }
+    if inline_message_id is not None:
+        callback["inline_message_id"] = inline_message_id
+    if with_message:
+        callback["message"] = {
+            "message_id": 50,
+            "date": int(datetime.now(UTC).timestamp()),
+            "chat": {"id": 42, "type": "private"},
+            "text": "untrusted visible card text",
+        }
+    return Update.model_validate(
+        {"update_id": update_id, "callback_query": callback}
+    )
+
+
+async def authorize_inline_group(
+    storage,
+    session,
+    *,
+    chat_id,
+    title,
+    requester_id=42,
+    bot_status="administrator",
+    requester_status="member",
+):
+    await storage.authorize_chat(
+        chat_id=chat_id,
+        chat_type="supergroup",
+        title=title,
+        authorized_by=42,
+    )
+    session.chat_members[(chat_id, 999)] = bot_status
+    session.chat_members[(chat_id, requester_id)] = requester_status
+
+
+def inline_answers(session):
+    return [
+        request
+        for request in session.requests
+        if isinstance(request, AnswerInlineQuery)
+    ]
+
+
+def callback_answers(session):
+    return [
+        request
+        for request in session.requests
+        if isinstance(request, AnswerCallbackQuery)
+    ]
+
+
+def inline_result_picker_text(result):
+    return " ".join(
+        value
+        for value in (result.title, getattr(result, "description", None))
+        if value
+    )
+
+
+def inline_result_for_destination(answer, destination_title):
+    return next(
+        result
+        for result in answer.results
+        if destination_title.casefold()
+        in inline_result_picker_text(result).casefold()
+    )
+
+
+def inline_result_callback_data(result):
+    return result.reply_markup.inline_keyboard[0][0].callback_data
+
+
+@pytest.mark.asyncio
+async def test_inline_query_empty_unauthorized_and_oversized_return_no_results(
+    tmp_path,
+):
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path)
+
+    await dispatcher.feed_update(bot, make_inline_query_update("   "))
+    await dispatcher.feed_update(
+        bot,
+        make_inline_query_update(
+            "milk",
+            update_id=2,
+            query_id="unauthorized",
+            user_id=7,
+        ),
+    )
+    await dispatcher.feed_update(
+        bot,
+        make_inline_query_update(
+            "x" * 257,
+            update_id=3,
+            query_id="oversized",
+        ),
+    )
+
+    answers = inline_answers(session)
+    assert len(answers) == 3
+    assert all(answer.results == [] for answer in answers)
+    assert all(answer.is_personal is True for answer in answers)
+    assert all(answer.cache_time == 0 for answer in answers)
+    with storage.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM shopping_items").fetchone()[0] == 0
+        assert (
+            db.execute("SELECT COUNT(*) FROM inline_capture_intents").fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_inline_query_and_chosen_result_never_mutate_and_callback_adds_literal(
+    monkeypatch,
+    tmp_path,
+):
+    routing_trace = []
+    install_routing_fakes(
+        monkeypatch,
+        trace=routing_trace,
+        shopping_response={
+            "action": "add_items",
+            "items": ["must not be used", "must not be split"],
+            "needs_confirmation": False,
+            "clarification_question": None,
+        },
+    )
+    storage, dispatcher, session, bot = await build_inline_test_context(
+        tmp_path,
+        openai_api_key="test",
+    )
+    await authorize_inline_group(
+        storage,
+        session,
+        chat_id=-1001,
+        title="Secret Household",
+    )
+    await storage.add_item(
+        chat_id=-1001,
+        name="private cabbage",
+        created_by=42,
+    )
+    explicit_query = "  <milk & eggs>  "
+
+    await dispatcher.feed_update(
+        bot,
+        make_inline_query_update(explicit_query),
+    )
+
+    answer = inline_answers(session)[-1]
+    assert answer.is_personal is True
+    assert answer.cache_time == 0
+    assert len(answer.results) == 2
+    result = inline_result_for_destination(answer, "Secret Household")
+    public_card = result.input_message_content.message_text
+    public_button = result.reply_markup.inline_keyboard[0][0]
+    callback_data = public_button.callback_data
+    assert result.input_message_content.parse_mode is None
+    assert "<milk & eggs>" in public_card
+    assert "confirm" in public_button.text.casefold()
+    assert "Secret Household" not in public_card
+    assert "private cabbage" not in public_card
+    assert "Secret Household" not in public_button.text
+    assert "private cabbage" not in public_button.text
+    assert len(callback_data.encode()) <= 64
+    assert re.fullmatch(r"inline_capture:[A-Za-z0-9_-]{20,48}", callback_data)
+    assert "-1001" not in callback_data
+    assert "milk" not in callback_data.casefold()
+    assert [item.name for item in await storage.list_items(chat_id=-1001)] == [
+        "private cabbage"
+    ]
+    assert routing_trace == []
+    with storage.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+    await dispatcher.feed_update(
+        bot,
+        make_chosen_inline_result_update(
+            result_id=result.id,
+            query=explicit_query,
+        ),
+    )
+    assert [item.name for item in await storage.list_items(chat_id=-1001)] == [
+        "private cabbage"
+    ]
+    assert routing_trace == []
+    with storage.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+    def assert_committed_before_success_edit(method):
+        with storage.connect() as db:
+            names = [
+                row[0]
+                for row in db.execute(
+                    "SELECT name FROM shopping_items "
+                    "WHERE chat_id = ? ORDER BY id",
+                    (-1001,),
+                )
+            ]
+        assert names == ["private cabbage", "<milk & eggs>"]
+        assert "Secret Household" not in method.text
+        assert "private cabbage" not in method.text
+
+    session.before_inline_edit = assert_committed_before_success_edit
+    await dispatcher.feed_update(
+        bot,
+        make_inline_callback_update(
+            callback_data,
+            chat_instance="attacker-controlled-unrelated-chat",
+        ),
+    )
+
+    items = await storage.list_items(chat_id=-1001)
+    assert [item.name for item in items] == ["private cabbage", "<milk & eggs>"]
+    assert items[-1].created_by == 42
+    assert routing_trace == [("normalizer", ("<milk & eggs>",))]
+    assert await storage.list_items(chat_id=42) == []
+    edits = [
+        request for request in session.requests if isinstance(request, EditMessageText)
+    ]
+    assert edits[-1].inline_message_id == "inline-message-1"
+    assert "Secret Household" not in edits[-1].text
+    assert len(callback_answers(session)) == 1
+
+
+@pytest.mark.asyncio
+async def test_inline_query_filters_destinations_by_current_telegram_capability(
+    tmp_path,
+):
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path)
+    group_specs = [
+        (-1001, "Creator household", "administrator", "creator", True),
+        (-1002, "Admin household", "administrator", "administrator", True),
+        (-1003, "Member household", "administrator", "member", True),
+        (-1004, "Restricted household", "administrator", "restricted_member", True),
+        (-2001, "Bot demoted", "member", "member", False),
+        (-2002, "Former member", "administrator", "left", False),
+        (-2003, "Kicked member", "administrator", "kicked", False),
+        (
+            -2004,
+            "Restricted nonmember",
+            "administrator",
+            "restricted_nonmember",
+            False,
+        ),
+        (-2005, "Lookup error", "administrator", RuntimeError("offline"), False),
+    ]
+    for chat_id, title, bot_status, requester_status, _ in group_specs:
+        await authorize_inline_group(
+            storage,
+            session,
+            chat_id=chat_id,
+            title=title,
+            bot_status=bot_status,
+            requester_status=requester_status,
+        )
+    await storage.authorize_chat(
+        chat_id=-3001,
+        chat_type="private",
+        title="Stored private row must not leak",
+        authorized_by=42,
+    )
+
+    await dispatcher.feed_update(bot, make_inline_query_update("milk"))
+
+    answer = inline_answers(session)[-1]
+    picker_texts = [inline_result_picker_text(result) for result in answer.results]
+    assert len(answer.results) == 5
+    for _, title, _, _, expected in group_specs:
+        assert any(title in text for text in picker_texts) is expected
+    assert all("Stored private row must not leak" not in text for text in picker_texts)
+    membership_requests = [
+        request
+        for request in session.requests
+        if isinstance(request, GetChatMember)
+    ]
+    assert all(int(request.chat_id) != -3001 for request in membership_requests)
+    assert await storage.list_items(chat_id=42) == []
+
+
+@pytest.mark.asyncio
+async def test_inline_query_caps_and_orders_many_destinations_deterministically(
+    tmp_path,
+):
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path)
+    for index in range(55):
+        await authorize_inline_group(
+            storage,
+            session,
+            chat_id=-10_000 - index,
+            title=f"Household {index:02d}",
+            requester_id=7,
+        )
+
+    await dispatcher.feed_update(
+        bot,
+        make_inline_query_update(
+            "milk",
+            user_id=7,
+            query_id="many-1",
+        ),
+    )
+    await dispatcher.feed_update(
+        bot,
+        make_inline_query_update(
+            "milk",
+            update_id=2,
+            user_id=7,
+            query_id="many-2",
+        ),
+    )
+
+    first, second = inline_answers(session)
+    assert len(first.results) == len(second.results) == 50
+    assert first.is_personal is second.is_personal is True
+    assert first.cache_time == second.cache_time == 0
+    assert [inline_result_picker_text(result) for result in first.results] == [
+        inline_result_picker_text(result) for result in second.results
+    ]
+    with storage.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM shopping_items").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_inline_query_stops_capability_checks_at_result_limit(tmp_path):
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path)
+    group_chat_ids = []
+    for index in range(55):
+        chat_id = -20_000 - index
+        group_chat_ids.append(chat_id)
+        await authorize_inline_group(
+            storage,
+            session,
+            chat_id=chat_id,
+            title=f"Early stop household {index:02d}",
+        )
+
+    await dispatcher.feed_update(bot, make_inline_query_update("milk"))
+
+    answer = inline_answers(session)[-1]
+    assert len(answer.results) == 50
+    assert any(
+        "my Honeybuy" in inline_result_picker_text(result)
+        for result in answer.results
+    )
+    membership_requests = [
+        request
+        for request in session.requests
+        if isinstance(request, GetChatMember)
+    ]
+    expected_group_ids = set(group_chat_ids[:49])
+    checked_group_ids = {int(request.chat_id) for request in membership_requests}
+    assert len(membership_requests) == 2 * len(expected_group_ids)
+    assert checked_group_ids == expected_group_ids
+    assert checked_group_ids.isdisjoint(group_chat_ids[49:])
+
+
+@pytest.mark.asyncio
+async def test_inline_query_caps_ineligible_group_candidate_checks(tmp_path):
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path)
+    group_chat_ids = []
+    for index in range(55):
+        chat_id = -30_000 - index
+        group_chat_ids.append(chat_id)
+        await authorize_inline_group(
+            storage,
+            session,
+            chat_id=chat_id,
+            title=f"Ineligible household {index:02d}",
+            requester_status="left",
+        )
+
+    await dispatcher.feed_update(bot, make_inline_query_update("milk"))
+
+    answer = inline_answers(session)[-1]
+    assert len(answer.results) == 1
+    assert "my Honeybuy" in inline_result_picker_text(answer.results[0])
+    membership_requests = [
+        request
+        for request in session.requests
+        if isinstance(request, GetChatMember)
+    ]
+    expected_group_ids = set(group_chat_ids[:50])
+    checked_group_ids = {int(request.chat_id) for request in membership_requests}
+    assert len(membership_requests) == 2 * len(expected_group_ids)
+    assert checked_group_ids == expected_group_ids
+    assert checked_group_ids.isdisjoint(group_chat_ids[50:])
+
+
+@pytest.mark.asyncio
+async def test_inline_confirmation_rejects_wrong_requester_and_message_callback(
+    tmp_path,
+):
+    storage, dispatcher, session, bot = await build_inline_test_context(
+        tmp_path,
+        allowed_user_ids="7",
+    )
+    await dispatcher.feed_update(bot, make_inline_query_update("milk"))
+    result = inline_answers(session)[-1].results[0]
+    callback_data = inline_result_callback_data(result)
+
+    await dispatcher.feed_update(
+        bot,
+        make_inline_callback_update(
+            callback_data,
+            user_id=7,
+            callback_id="wrong-requester",
+        ),
+    )
+    await dispatcher.feed_update(
+        bot,
+        make_inline_callback_update(
+            callback_data,
+            update_id=4,
+            callback_id="ordinary-message-callback",
+            inline_message_id=None,
+            with_message=True,
+            chat_instance="-999999",
+        ),
+    )
+    assert await storage.list_items(chat_id=42) == []
+
+    await dispatcher.feed_update(
+        bot,
+        make_inline_callback_update(
+            callback_data,
+            update_id=5,
+            callback_id="correct-requester",
+            chat_instance="-999999",
+        ),
+    )
+
+    assert [item.name for item in await storage.list_items(chat_id=42)] == ["milk"]
+    assert await storage.list_items(chat_id=-999999) == []
+    answers = callback_answers(session)
+    assert len(answers) == 3
+    assert answers[0].show_alert is True
+    assert answers[1].show_alert is True
+
+
+@pytest.mark.asyncio
+async def test_inline_confirmation_rejects_malformed_unknown_expired_and_replay(
+    tmp_path,
+):
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path)
+    now = datetime.now(UTC)
+    expired_token = "expired-token-with-valid-shape"
+    await storage.create_inline_capture_intent(
+        token=expired_token,
+        requester_id=42,
+        target_chat_id=42,
+        target_kind="private",
+        item_text="bread",
+        created_at=now - timedelta(minutes=2),
+        expires_at=now - timedelta(seconds=1),
+        pending_limit=10,
+    )
+    invalid_payloads = [
+        "inline_capture:",
+        "inline_capture:token with spaces",
+        "inline_capture:unknown-token-with-valid-shape",
+        f"inline_capture:{expired_token}",
+    ]
+    for index, payload in enumerate(invalid_payloads, start=1):
+        await dispatcher.feed_update(
+            bot,
+            make_inline_callback_update(
+                payload,
+                update_id=index,
+                callback_id=f"invalid-{index}",
+            ),
+        )
+
+    await dispatcher.feed_update(
+        bot,
+        make_inline_query_update(
+            "tea",
+            update_id=10,
+            query_id="valid-for-replay",
+        ),
+    )
+    valid_result = inline_answers(session)[-1].results[0]
+    valid_callback = inline_result_callback_data(valid_result)
+    await dispatcher.feed_update(
+        bot,
+        make_inline_callback_update(
+            valid_callback,
+            update_id=11,
+            callback_id="valid-first-delivery",
+        ),
+    )
+    await dispatcher.feed_update(
+        bot,
+        make_inline_callback_update(
+            valid_callback,
+            update_id=12,
+            callback_id="valid-replay",
+        ),
+    )
+
+    assert [item.name for item in await storage.list_items(chat_id=42)] == ["tea"]
+    answers = callback_answers(session)
+    assert len(answers) == len(invalid_payloads) + 2
+    assert all(answer.show_alert is True for answer in answers[: len(invalid_payloads)])
+
+
+@pytest.mark.asyncio
+async def test_inline_confirmation_handles_transient_intent_lookup_failure(
+    caplog,
+    monkeypatch,
+    tmp_path,
+):
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path)
+    token = "lookup-error-valid-token-12345"
+    item_text = "sensitive lookup milk"
+    target_chat_id = -100424242
+    target_title = "Private lookup destination"
+    now = datetime.now(UTC)
+    await storage.authorize_chat(
+        chat_id=target_chat_id,
+        chat_type="supergroup",
+        title=target_title,
+        authorized_by=42,
+    )
+    await storage.create_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        target_chat_id=target_chat_id,
+        target_kind="supergroup",
+        item_text=item_text,
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+        pending_limit=10,
+    )
+    original_get_intent = storage.get_inline_capture_intent
+
+    async def raise_transient_lookup_error(*, token, requester_id, now):
+        assert token == "lookup-error-valid-token-12345"
+        assert requester_id == 42
+        assert now.tzinfo is not None
+        raise sqlite3.OperationalError("transient sqlite read failure")
+
+    monkeypatch.setattr(
+        storage,
+        "get_inline_capture_intent",
+        raise_transient_lookup_error,
+    )
+    caplog.set_level("DEBUG", logger="honeybuy_tg.telegram_bot")
+
+    await dispatcher.feed_update(
+        bot,
+        make_inline_callback_update(
+            f"inline_capture:{token}",
+            callback_id="transient-intent-lookup-failure",
+        ),
+    )
+
+    answers = callback_answers(session)
+    assert len(answers) == 1
+    assert answers[0].show_alert is True
+    assert answers[0].text
+    assert not any(
+        isinstance(request, EditMessageText) for request in session.requests
+    )
+    assert await storage.list_items(chat_id=target_chat_id) == []
+
+    private_values = (token, str(target_chat_id), target_title, item_text)
+    telegram_text = answers[0].text or ""
+    assert all(value not in telegram_text for value in private_values)
+    telegram_logs = [
+        record
+        for record in caplog.records
+        if record.name == "honeybuy_tg.telegram_bot"
+    ]
+    assert telegram_logs
+    assert all(value not in caplog.text for value in private_values)
+
+    monkeypatch.setattr(storage, "get_inline_capture_intent", original_get_intent)
+    intent = await storage.get_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        now=datetime.now(UTC),
+    )
+    assert intent is not None
+    assert intent["status"] == "pending"
+    assert intent["target_chat_id"] == target_chat_id
+    assert intent["item_text"] == item_text
+
+
+@pytest.mark.asyncio
+async def test_inline_lookup_and_error_ack_failures_are_contained(
+    caplog,
+    monkeypatch,
+    tmp_path,
+):
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path)
+    token = "lookup-and-ack-error-token-12345"
+    item_text = "sensitive retry milk"
+    target_chat_id = -100525252
+    target_title = "Private retry destination"
+    now = datetime.now(UTC)
+    await storage.authorize_chat(
+        chat_id=target_chat_id,
+        chat_type="supergroup",
+        title=target_title,
+        authorized_by=42,
+    )
+    await storage.create_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        target_chat_id=target_chat_id,
+        target_kind="supergroup",
+        item_text=item_text,
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+        pending_limit=10,
+    )
+    original_get_intent = storage.get_inline_capture_intent
+
+    async def raise_transient_lookup_error(*, token, requester_id, now):
+        assert token == "lookup-and-ack-error-token-12345"
+        assert requester_id == 42
+        assert now.tzinfo is not None
+        raise sqlite3.OperationalError("transient sqlite read failure")
+
+    monkeypatch.setattr(
+        storage,
+        "get_inline_capture_intent",
+        raise_transient_lookup_error,
+    )
+    session.fail_callback_answers = True
+    caplog.set_level("DEBUG", logger="honeybuy_tg.telegram_bot")
+
+    await dispatcher.feed_update(
+        bot,
+        make_inline_callback_update(
+            f"inline_capture:{token}",
+            callback_id="lookup-and-error-ack-failure",
+        ),
+    )
+
+    answers = callback_answers(session)
+    assert len(answers) == 1
+    assert answers[0].show_alert is True
+    assert answers[0].text
+    assert not any(
+        isinstance(request, EditMessageText) for request in session.requests
+    )
+    assert await storage.list_items(chat_id=target_chat_id) == []
+
+    private_values = (token, str(target_chat_id), target_title, item_text)
+    assert all(value not in (answers[0].text or "") for value in private_values)
+    telegram_logs = [
+        record
+        for record in caplog.records
+        if record.name == "honeybuy_tg.telegram_bot"
+    ]
+    assert telegram_logs
+    assert all(value not in caplog.text for value in private_values)
+
+    monkeypatch.setattr(storage, "get_inline_capture_intent", original_get_intent)
+    intent = await storage.get_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        now=datetime.now(UTC),
+    )
+    assert intent is not None
+    assert intent["status"] == "pending"
+    assert intent["target_chat_id"] == target_chat_id
+    assert intent["item_text"] == item_text
+
+
+@pytest.mark.asyncio
+async def test_inline_confirmation_rechecks_private_username_capability(tmp_path):
+    storage, dispatcher, session, bot = await build_inline_test_context(
+        tmp_path,
+        owner_user_id=None,
+        owner_username="ownername",
+    )
+    await dispatcher.feed_update(
+        bot,
+        make_inline_query_update("milk", username="ownername"),
+    )
+    result = inline_answers(session)[-1].results[0]
+    callback_data = inline_result_callback_data(result)
+
+    await dispatcher.feed_update(
+        bot,
+        make_inline_callback_update(
+            callback_data,
+            username="renamed",
+            callback_id="private-access-revoked",
+        ),
+    )
+    assert await storage.list_items(chat_id=42) == []
+
+    await dispatcher.feed_update(
+        bot,
+        make_inline_callback_update(
+            callback_data,
+            update_id=4,
+            username="ownername",
+            callback_id="private-access-restored",
+        ),
+    )
+    assert [item.name for item in await storage.list_items(chat_id=42)] == ["milk"]
+    assert len(callback_answers(session)) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "deauthorized",
+        "bot_demoted",
+        "requester_left",
+        "requester_kicked",
+        "requester_restricted_nonmember",
+        "telegram_error",
+    ],
+)
+async def test_inline_confirmation_rechecks_group_capability_and_is_retryable(
+    tmp_path,
+    failure_mode,
+):
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path)
+    await authorize_inline_group(
+        storage,
+        session,
+        chat_id=-1001,
+        title="Household",
+    )
+    await dispatcher.feed_update(bot, make_inline_query_update("milk"))
+    result = inline_result_for_destination(inline_answers(session)[-1], "Household")
+    callback_data = inline_result_callback_data(result)
+    token = callback_data.split(":", 1)[1]
+
+    if failure_mode == "deauthorized":
+        with storage.connect() as db:
+            db.execute("DELETE FROM authorized_chats WHERE chat_id = ?", (-1001,))
+            db.commit()
+    elif failure_mode == "bot_demoted":
+        session.chat_members[(-1001, 999)] = "member"
+    elif failure_mode == "requester_left":
+        session.chat_members[(-1001, 42)] = "left"
+    elif failure_mode == "requester_kicked":
+        session.chat_members[(-1001, 42)] = "kicked"
+    elif failure_mode == "requester_restricted_nonmember":
+        session.chat_members[(-1001, 42)] = "restricted_nonmember"
+    elif failure_mode == "telegram_error":
+        session.chat_members[(-1001, 42)] = RuntimeError("Telegram unavailable")
+
+    await dispatcher.feed_update(
+        bot,
+        make_inline_callback_update(
+            callback_data,
+            callback_id=f"{failure_mode}-first",
+        ),
+    )
+    assert await storage.list_items(chat_id=-1001) == []
+    assert await storage.get_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        now=datetime.now(UTC),
+    ) is not None
+    assert callback_answers(session)[-1].text in {None, ""} or (
+        callback_answers(session)[-1].show_alert is True
+    )
+
+    if failure_mode == "deauthorized":
+        await storage.authorize_chat(
+            chat_id=-1001,
+            chat_type="supergroup",
+            title="Household",
+            authorized_by=42,
+        )
+    session.chat_members[(-1001, 999)] = "administrator"
+    session.chat_members[(-1001, 42)] = "member"
+    await dispatcher.feed_update(
+        bot,
+        make_inline_callback_update(
+            callback_data,
+            update_id=4,
+            callback_id=f"{failure_mode}-retry",
+        ),
+    )
+
+    assert [item.name for item in await storage.list_items(chat_id=-1001)] == [
+        "milk"
+    ]
+    assert len(callback_answers(session)) == 2
+
+
+@pytest.mark.asyncio
+async def test_inline_confirmation_rechecks_expiry_after_async_normalization(
+    monkeypatch,
+    tmp_path,
+):
+    clock = {"now": datetime(2026, 1, 1, tzinfo=UTC)}
+    normalization_started = asyncio.Event()
+    finish_normalization = asyncio.Event()
+
+    class MutableDateTime:
+        @classmethod
+        def now(cls, timezone=None):
+            assert timezone in {None, UTC}
+            return clock["now"]
+
+    class ExpiryCrossingItemNormalizer:
+        async def normalize(self, names):
+            assert names == ["sensitive slow milk"]
+            normalization_started.set()
+            await finish_normalization.wait()
+            return {}
+
+    normalizer = ExpiryCrossingItemNormalizer()
+    monkeypatch.setattr("honeybuy_tg.telegram_bot.datetime", MutableDateTime)
+    monkeypatch.setattr("honeybuy_tg.service.datetime", MutableDateTime)
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemNormalizer",
+        lambda **kwargs: normalizer,
+    )
+    for adapter_name in (
+        "ShoppingTextParser",
+        "RecipeCommandParser",
+        "VoiceTranscriber",
+        "ShoppingItemCategorizer",
+        "RecipeExtractor",
+    ):
+        monkeypatch.setattr(
+            f"honeybuy_tg.telegram_bot.{adapter_name}",
+            FakeUnusedAIClient,
+        )
+    storage, dispatcher, session, bot = await build_inline_test_context(
+        tmp_path,
+        openai_api_key="test",
+    )
+    token = "expiry-crossing-inline-token"
+    await storage.create_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        target_chat_id=42,
+        target_kind="private",
+        item_text="sensitive slow milk",
+        created_at=clock["now"],
+        expires_at=clock["now"] + timedelta(seconds=1),
+        pending_limit=10,
+    )
+
+    delivery = asyncio.create_task(
+        dispatcher.feed_update(
+            bot,
+            make_inline_callback_update(
+                f"inline_capture:{token}",
+                callback_id="expiry-crossing-normalization",
+            ),
+        )
+    )
+    await asyncio.wait_for(normalization_started.wait(), timeout=1)
+    clock["now"] += timedelta(seconds=2)
+    finish_normalization.set()
+    await delivery
+
+    assert await storage.list_items(chat_id=42) == []
+    with storage.connect() as db:
+        expired_row = db.execute(
+            "SELECT item_text FROM inline_capture_intents"
+        ).fetchone()
+    assert expired_row is None or expired_row[0] in {None, ""}
+    assert len(callback_answers(session)) == 1
+    assert not any(
+        isinstance(request, EditMessageText) for request in session.requests
+    )
+
+
+@pytest.mark.asyncio
+async def test_inline_confirmation_rechecks_group_capability_after_normalization(
+    monkeypatch,
+    tmp_path,
+):
+    normalization_started = asyncio.Event()
+    finish_normalization = asyncio.Event()
+
+    class CapabilityCrossingItemNormalizer:
+        async def normalize(self, names):
+            assert names == ["slow milk"]
+            normalization_started.set()
+            await finish_normalization.wait()
+            return {}
+
+    normalizer = CapabilityCrossingItemNormalizer()
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemNormalizer",
+        lambda **kwargs: normalizer,
+    )
+    for adapter_name in (
+        "ShoppingTextParser",
+        "RecipeCommandParser",
+        "VoiceTranscriber",
+        "ShoppingItemCategorizer",
+        "RecipeExtractor",
+    ):
+        monkeypatch.setattr(
+            f"honeybuy_tg.telegram_bot.{adapter_name}",
+            FakeUnusedAIClient,
+        )
+    storage, dispatcher, session, bot = await build_inline_test_context(
+        tmp_path,
+        openai_api_key="test",
+    )
+    await authorize_inline_group(
+        storage,
+        session,
+        chat_id=-1001,
+        title="Household",
+    )
+    await dispatcher.feed_update(bot, make_inline_query_update("slow milk"))
+    result = inline_result_for_destination(inline_answers(session)[-1], "Household")
+    callback_data = inline_result_callback_data(result)
+    token = callback_data.split(":", 1)[1]
+
+    delivery = asyncio.create_task(
+        dispatcher.feed_update(
+            bot,
+            make_inline_callback_update(
+                callback_data,
+                callback_id="capability-crossing-normalization",
+            ),
+        )
+    )
+    await asyncio.wait_for(normalization_started.wait(), timeout=1)
+    session.chat_members[(-1001, 42)] = "left"
+    finish_normalization.set()
+    await delivery
+
+    assert await storage.list_items(chat_id=-1001) == []
+    assert await storage.get_inline_capture_intent(
+        token=token,
+        requester_id=42,
+        now=datetime.now(UTC),
+    ) is not None
+    assert not any(
+        isinstance(request, EditMessageText) for request in session.requests
+    )
+
+    session.chat_members[(-1001, 42)] = "member"
+    await dispatcher.feed_update(
+        bot,
+        make_inline_callback_update(
+            callback_data,
+            update_id=4,
+            callback_id="capability-restored-after-normalization",
+        ),
+    )
+
+    assert [item.name for item in await storage.list_items(chat_id=-1001)] == [
+        "slow milk"
+    ]
+    assert len(callback_answers(session)) == 2
+
+
+@pytest.mark.asyncio
+async def test_inline_query_intent_batch_failure_leaves_no_partial_intents(tmp_path):
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path)
+    await authorize_inline_group(
+        storage,
+        session,
+        chat_id=-1001,
+        title="Household",
+    )
+    existing_now = datetime.now(UTC)
+    existing_token = "existing-query-neighbor-inline-token"
+    await storage.create_inline_capture_intent(
+        token=existing_token,
+        requester_id=42,
+        target_chat_id=42,
+        target_kind="private",
+        item_text="existing query neighbor",
+        created_at=existing_now,
+        expires_at=existing_now + timedelta(minutes=5),
+        pending_limit=100,
+    )
+    with storage.connect() as db:
+        db.execute(
+            """
+            CREATE TRIGGER reject_group_inline_intent
+            BEFORE INSERT ON inline_capture_intents
+            WHEN NEW.target_chat_id = -1001
+            BEGIN
+                SELECT RAISE(ABORT, 'injected query batch failure');
+            END
+            """
+        )
+        db.commit()
+
+    await dispatcher.feed_update(bot, make_inline_query_update("milk"))
+
+    answer = inline_answers(session)[-1]
+    assert answer.results == []
+    assert answer.is_personal is True
+    assert answer.cache_time == 0
+    with storage.connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM inline_capture_intents"
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT item_text FROM inline_capture_intents"
+        ).fetchone()[0] == "existing query neighbor"
+    assert await storage.get_inline_capture_intent(
+        token=existing_token,
+        requester_id=42,
+        now=datetime.now(UTC),
+    ) is not None
+
+
+@pytest.mark.asyncio
+async def test_inline_edit_failure_after_commit_never_reapplies(tmp_path):
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path)
+    await dispatcher.feed_update(bot, make_inline_query_update("milk"))
+    result = inline_answers(session)[-1].results[0]
+    callback_data = inline_result_callback_data(result)
+    saw_committed_item = False
+
+    def assert_commit_precedes_edit(_method):
+        nonlocal saw_committed_item
+        with storage.connect() as db:
+            saw_committed_item = (
+                db.execute(
+                    "SELECT COUNT(*) FROM shopping_items WHERE chat_id = ?",
+                    (42,),
+                ).fetchone()[0]
+                == 1
+            )
+        assert saw_committed_item
+
+    session.before_inline_edit = assert_commit_precedes_edit
+    session.fail_inline_edits = True
+    try:
+        await dispatcher.feed_update(
+            bot,
+            make_inline_callback_update(
+                callback_data,
+                callback_id="edit-fails-after-commit",
+            ),
+        )
+    except RuntimeError as error:
+        assert str(error) == "inline edit failed"
+
+    assert saw_committed_item
+    assert [item.name for item in await storage.list_items(chat_id=42)] == ["milk"]
+    assert len(callback_answers(session)) == 1
+
+    session.fail_inline_edits = False
+    await dispatcher.feed_update(
+        bot,
+        make_inline_callback_update(
+            callback_data,
+            update_id=4,
+            callback_id="edit-failure-replay",
+        ),
+    )
+    assert [item.name for item in await storage.list_items(chat_id=42)] == ["milk"]
+    assert len(callback_answers(session)) == 2
 
 
 @pytest.mark.asyncio
