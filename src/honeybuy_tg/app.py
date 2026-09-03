@@ -5,8 +5,8 @@ from collections.abc import Sequence
 
 from pydantic import ValidationError
 
-from honeybuy_tg.config import load_settings
-from honeybuy_tg.migrations import migrate_database_path
+from honeybuy_tg.config import load_healthcheck_settings, load_settings
+from honeybuy_tg.migrations import healthcheck_database_path, migrate_database_path
 from honeybuy_tg.metrics import start_metrics_exporter
 from honeybuy_tg.storage import Storage
 from honeybuy_tg.telegram_bot import run_bot
@@ -14,6 +14,25 @@ from honeybuy_tg.telegram_bot import run_bot
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
+
+    if args == ["healthcheck"]:
+        try:
+            healthcheck_settings = load_healthcheck_settings()
+        except ValidationError as error:
+            raise SystemExit(
+                "Invalid healthcheck configuration: DATABASE_PATH is required"
+            ) from error
+        try:
+            health = healthcheck_database_path(healthcheck_settings.database_path)
+        except RuntimeError as error:
+            raise SystemExit(f"Healthcheck failed: {error}") from error
+        print(
+            f"healthcheck ok: schema={health.schema_version} "
+            f"integrity={health.integrity_check} "
+            f"foreign_keys={health.foreign_keys_check}"
+        )
+        return
+
     try:
         settings = load_settings()
     except ValidationError as error:
@@ -37,7 +56,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     if args:
-        raise SystemExit("Usage: python -m honeybuy_tg [migrate]")
+        raise SystemExit("Usage: python -m honeybuy_tg [migrate|healthcheck]")
 
     logging.basicConfig(
         level=settings.log_level.upper(),
