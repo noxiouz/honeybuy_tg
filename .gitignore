@@ -15,6 +15,7 @@ wheels/
 .env
 .uv-cache/
 data/
+evals/results/
 
 # Track shared Codex agent roles, but ignore other project-scoped Codex state.
 .codex/*

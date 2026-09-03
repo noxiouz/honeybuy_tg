@@ -103,6 +103,10 @@ do not need the configured runtime database. Telegram tests use a fake aiogram
 session; AI tests fake client responses. No live Telegram or OpenAI call should
 be needed for the automated suite.
 
+CI runs the same offline checks on push and pull request: locked dependency
+sync, full pytest, Ruff, and `git diff --check`. CI must not run live model
+evals or use Telegram/OpenAI credentials.
+
 ## Test Map
 
 | Test module | Main contract |
@@ -122,10 +126,77 @@ be needed for the automated suite.
 When behavior changes, update its stable scenario IDs and add the narrowest
 module test plus an integration-style Telegram test when routing is involved.
 
-Known coverage gaps are concentrated around live recipe URL fetching: scheme
-and content-type rejection, redirects, timeouts, bounded reads, private-network
+## Text Routing Evals
+
+Text routing has three layers:
+
+- unit and integration tests under `tests/`, always offline;
+- a strict JSONL corpus at `evals/cases/text_routing.v1.jsonl`, validated by
+  `tests/test_eval_corpus.py`;
+- an opt-in live model comparison runner, `python -m evals.live_compare`, for
+  release decisions around model or prompt changes.
+
+The corpus records the expected route, action, accepted item variants, accepted
+recipe-name alternatives, critical status, and tags for Russian, English,
+mixed-language, mention, voice-transcript, shopping, recipe, unhandled, and
+ambiguous inputs. Item grading treats accepted variants as unordered normalized
+multisets. Recipe-name alternatives must be explicit labels in the corpus, not
+hidden stemming. Ambiguous cases must be labeled as `unknown` without guessed
+items or recipe names.
+
+Before editing prompts or changing `OPENAI_PARSE_MODEL`, add or review corpus
+cases for the behavior being changed, then run the offline suite. For a live
+comparison, use a separate evaluation key:
+
+```sh
+HONEYBUY_EVAL_OPENAI_API_KEY=... \
+  python -m evals.live_compare \
+  --allow-live-openai \
+  --model gpt-5.4-mini \
+  --output evals/results/text-routing.json
+```
+
+The live runner ignores ordinary `OPENAI_API_KEY`, strips ambient OpenAI
+endpoint/org/project/webhook environment while constructing the client, never
+loads `.env`, and refuses to call OpenAI unless `--allow-live-openai`, at least
+one nonblank `--model`, and `HONEYBUY_EVAL_OPENAI_API_KEY` are all present. It
+uses production prompt fingerprints and response schemas but does not call
+Telegram, SQLite, recipe URLs, voice transcription, or production data. Reports
+include `HEAD`, a dirty-worktree flag, status lines, and a diff hash to prevent
+misattributing results to a clean commit.
+
+Prompt override files are candidate-only. The first `--model` entry always uses
+production prompts as the baseline; the second and later entries use any
+override files. To compare a prompt change on the same model, pass that model
+twice. A run with overrides and fewer than two model entries is rejected before
+client construction.
+
+Release gates for each live model are:
+
+- 100% schema-valid completed model responses;
+- 100% critical cases;
+- zero shopping-to-recipe false positives;
+- 100% overall graded cases;
+- at least 98% route/action accuracy;
+- at least 98% accepted item accuracy where labeled;
+- at least 98% recipe-name accuracy where labeled;
+- at least 99% consistency across repetitions;
+- no more than 2% failed model requests; and
+- release qualification with at least 72 cases and at least 3 repetitions.
+
+When comparing models, the first `--model` is the baseline. Candidate reports
+flag p95 latency above 1.5x baseline and output tokens above 1.25x baseline.
+These gates are deterministic release checks over the maintained corpus, not a
+claim of statistical certainty. Smaller custom runs are smoke checks: they can
+be useful locally, but the report must show that they are not release-qualified,
+and the CLI exits nonzero.
+
+Known coverage gaps remain around live recipe URL fetching: scheme and
+content-type rejection, redirects, timeouts, bounded reads, private-network
 destinations, and the generic user-facing failure path do not have dedicated
-end-to-end tests.
+end-to-end tests. Voice eval cases use transcript text and cover
+pre-confirmation intent classification only; dispatcher tests own Telegram
+confirmation behavior and they do not measure audio transcription quality.
 
 ## Database Initialization And Migration
 

@@ -1,3 +1,7 @@
+import pytest
+
+from evals.corpus import load_corpus
+from evals.live_compare import DEFAULT_BOT_USERNAME, command_text_for_case
 from honeybuy_tg.recipes import (
     html_to_text,
     parse_add_recipe_request,
@@ -7,6 +11,37 @@ from honeybuy_tg.recipes import (
     looks_like_recipe_reuse_request,
     recipe_command_from_ai,
     should_try_ai_recipe_command,
+)
+
+
+CORPUS_CASES = load_corpus().cases
+RECIPE_FALSE_POSITIVE_CASES = [
+    case for case in CORPUS_CASES if "recipe-false-positive" in case.tags
+]
+AI_RECIPE_ROUTE_CASES = [case for case in CORPUS_CASES if "ai-route" in case.tags]
+DETERMINISTIC_RECIPE_REUSE_CASES = [
+    case
+    for case in CORPUS_CASES
+    if case.expected.route == "recipe"
+    and "reuse" in case.tags
+    and "deterministic" in case.tags
+]
+
+RECIPE_CASCADE_PHRASES = (
+    "купи ингредиенты для солянки",
+    "купи продукты для солянки",
+    "пожалуйста, купи на солянку",
+    "пожалуйста, добавь всё для солянки",
+    "can you buy ingredients for chili",
+)
+
+NON_RECIPE_SHOPPING_PHRASES = (
+    "купи на завтра молоко",
+    "купи молоко на завтра",
+    "добавь сыр для завтрака",
+    "buy candles for tomorrow",
+    "купи молоко",
+    "buy milk",
 )
 
 
@@ -127,6 +162,59 @@ def test_ai_recipe_command_detection_is_selective():
     assert not should_try_ai_recipe_command("купи молоко")
     assert looks_like_recipe_reuse_request("купи на солянку")
     assert not looks_like_recipe_reuse_request("купи молоко")
+
+
+@pytest.mark.parametrize("text", RECIPE_CASCADE_PHRASES)
+def test_explicit_and_polite_recipe_phrases_reach_recipe_cascade(text):
+    deterministic = parse_add_recipe_request(text)
+
+    assert deterministic is not None or should_try_ai_recipe_command(text)
+    assert should_try_ai_recipe_command(text)
+    assert looks_like_recipe_reuse_request(text)
+
+
+@pytest.mark.parametrize("text", NON_RECIPE_SHOPPING_PHRASES)
+def test_temporal_purpose_and_single_product_phrases_avoid_recipe_routing(text):
+    assert parse_add_recipe_request(text) is None
+    assert not should_try_ai_recipe_command(text)
+    assert not looks_like_recipe_reuse_request(text)
+
+
+@pytest.mark.parametrize(
+    "case",
+    RECIPE_FALSE_POSITIVE_CASES,
+    ids=lambda case: case.id,
+)
+def test_corpus_recipe_false_positives_are_not_recipe_candidates(case):
+    text = command_text_for_case(case, bot_username=DEFAULT_BOT_USERNAME)
+
+    assert not should_try_ai_recipe_command(text)
+    assert not looks_like_recipe_reuse_request(text)
+
+
+@pytest.mark.parametrize(
+    "case",
+    AI_RECIPE_ROUTE_CASES,
+    ids=lambda case: case.id,
+)
+def test_all_corpus_ai_recipe_routes_reach_recipe_prefilter(case):
+    text = command_text_for_case(case, bot_username=DEFAULT_BOT_USERNAME)
+
+    assert should_try_ai_recipe_command(text)
+    assert looks_like_recipe_reuse_request(text)
+
+
+@pytest.mark.parametrize(
+    "case",
+    DETERMINISTIC_RECIPE_REUSE_CASES,
+    ids=lambda case: case.id,
+)
+def test_documented_deterministic_recipe_reuse_phrases_remain_candidates(case):
+    text = command_text_for_case(case, bot_username=DEFAULT_BOT_USERNAME)
+
+    assert parse_add_recipe_request(text) is not None
+    assert should_try_ai_recipe_command(text)
+    assert looks_like_recipe_reuse_request(text)
 
 
 def test_recipe_command_from_ai():
