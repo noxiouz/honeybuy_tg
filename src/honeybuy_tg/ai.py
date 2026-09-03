@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import re
 from typing import Literal, TypeVar
 
 from openai import AsyncOpenAI
@@ -14,6 +15,14 @@ from pydantic import (
 
 from honeybuy_tg.metrics import AIRequestReport, record_ai_request_async
 from honeybuy_tg.models import ItemIdentity
+from honeybuy_tg.prompts import (
+    CATEGORY_PROMPT,
+    ITEM_NORMALIZATION_PROMPT,
+    RECIPE_COMMAND_PROMPT,
+    RECIPE_EXTRACT_PROMPT,
+    SHOPPING_TEXT_PROMPT,
+    VOICE_TRANSCRIPTION_PROMPT,
+)
 
 
 ResponseModelT = TypeVar("ResponseModelT", bound="AIResponseModel")
@@ -27,7 +36,7 @@ def clean_required_text(value: str) -> str:
 
 
 class AIResponseModel(BaseModel):
-    model_config = ConfigDict(extra="ignore", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class CategorizedItemResponse(AIResponseModel):
@@ -53,6 +62,13 @@ class NormalizedItemResponse(AIResponseModel):
     @classmethod
     def clean_text(cls, value: str) -> str:
         return clean_required_text(value)
+
+    @field_validator("canonical_key")
+    @classmethod
+    def validate_canonical_key(cls, value: str) -> str:
+        if re.fullmatch(r"[a-z0-9_]+", value) is None:
+            raise ValueError("canonical_key must match [a-z0-9_]+")
+        return value
 
 
 class ItemNormalizationResponse(AIResponseModel):
@@ -80,6 +96,8 @@ class ShoppingTextParseResponse(AIResponseModel):
     def require_items_for_mutating_actions(self) -> "ShoppingTextParseResponse":
         if self.action in {"add_items", "remove_items", "mark_bought"} and not self.items:
             raise ValueError("Mutating shopping action must include at least one item")
+        if self.action in {"unknown", "show_list"} and self.items:
+            raise ValueError("Unknown and show_list actions must not include items")
         return self
 
     @field_validator("clarification_question")
@@ -152,7 +170,7 @@ class VoiceTranscriber:
                     file=audio_file,
                     model=self.model,
                     language="ru",
-                    prompt="Shopping list commands in Russian and English.",
+                    prompt=VOICE_TRANSCRIPTION_PROMPT.instructions,
                 )
 
         text = getattr(result, "text", None)
@@ -173,15 +191,10 @@ class ShoppingItemCategorizer:
         async with record_ai_request_async(operation="category_parse") as report:
             result = await self.client.responses.create(
                 model=self.model,
-                instructions=(
-                    "Categorize shopping-list items into concise grocery store "
-                    "sections. Choose categories yourself from the item names. "
-                    "Use Russian category names. Return only valid JSON with this "
-                    'shape: {"items":[{"id":1,"category":"Молочка"}]}.'
-                ),
+                instructions=CATEGORY_PROMPT.instructions,
                 input=json.dumps({"items": items}, ensure_ascii=False),
-                temperature=0,
-                max_output_tokens=600,
+                temperature=CATEGORY_PROMPT.temperature,
+                max_output_tokens=CATEGORY_PROMPT.max_output_tokens,
             )
             parsed = parse_ai_json_response(
                 result,
@@ -210,21 +223,10 @@ class ShoppingItemNormalizer:
         async with record_ai_request_async(operation="item_normalize") as report:
             result = await self.client.responses.create(
                 model=self.model,
-                instructions=(
-                    "Normalize grocery shopping-list items for deduplication across "
-                    "languages. Ignore quantities, units, packaging size, politeness, "
-                    "and filler. Return only valid JSON with this shape: "
-                    '{"items":[{"name":"tomato paste, 60 g",'
-                    '"canonical_name":"томатная паста",'
-                    '"canonical_key":"tomato_paste"}]}. '
-                    "canonical_name should be a short Russian grocery name when "
-                    "possible. canonical_key must be a stable lowercase English slug "
-                    "using a-z, 0-9, and underscores only. Different languages for the "
-                    "same product must have the same canonical_key."
-                ),
+                instructions=ITEM_NORMALIZATION_PROMPT.instructions,
                 input=json.dumps({"items": unique_names}, ensure_ascii=False),
-                temperature=0,
-                max_output_tokens=900,
+                temperature=ITEM_NORMALIZATION_PROMPT.temperature,
+                max_output_tokens=ITEM_NORMALIZATION_PROMPT.max_output_tokens,
             )
             parsed = parse_ai_json_response(
                 result,
@@ -251,23 +253,10 @@ class ShoppingTextParser:
         async with record_ai_request_async(operation="text_parse") as report:
             result = await self.client.responses.create(
                 model=self.model,
-                instructions=(
-                    "Parse a grocery shopping-list command. Ignore politeness, filler, "
-                    "uncertainty, and meta phrases such as 'пожалуйста' or 'что еще'. "
-                    "For undo/cancel-last-add commands such as 'отмени', 'не надо', "
-                    "or 'удали то что добавил', return action 'remove_items' with "
-                    'items ["__last_added__"]. For reply-context commands such as '
-                    "'удали это' or 'это куплено', keep the referenced item as 'это' "
-                    "or 'this' instead of inventing a product name. "
-                    "Return only valid JSON with shape: "
-                    '{"action":"add_items|remove_items|mark_bought|show_list|unknown",'
-                    '"items":["milk"],"needs_confirmation":false,'
-                    '"clarification_question":null}. Preserve item names in the user\'s '
-                    "language and include only real shopping items."
-                ),
+                instructions=SHOPPING_TEXT_PROMPT.instructions,
                 input=text,
-                temperature=0,
-                max_output_tokens=700,
+                temperature=SHOPPING_TEXT_PROMPT.temperature,
+                max_output_tokens=SHOPPING_TEXT_PROMPT.max_output_tokens,
             )
             parsed = parse_ai_json_response(
                 result,
@@ -292,15 +281,7 @@ class RecipeExtractor:
         async with record_ai_request_async(operation="recipe_extract") as report:
             result = await self.client.responses.create(
                 model=self.model,
-                instructions=(
-                    "Extract a recipe from visible recipe-page text or pasted recipe "
-                    "text. Return only valid JSON with shape: "
-                    '{"name":"солянка","ingredients":[{"name":"carrot",'
-                    '"quantity":"120 g"}]}. Use the requested name if it is a '
-                    "reasonable alias. Ingredients must be grocery items only; omit "
-                    "nutrition, ratings, equipment, navigation, and recommendations. "
-                    "Preserve useful quantities as short text."
-                ),
+                instructions=RECIPE_EXTRACT_PROMPT.instructions,
                 input=json.dumps(
                     {
                         "requested_name": requested_name,
@@ -309,8 +290,8 @@ class RecipeExtractor:
                     },
                     ensure_ascii=False,
                 ),
-                temperature=0,
-                max_output_tokens=2500,
+                temperature=RECIPE_EXTRACT_PROMPT.temperature,
+                max_output_tokens=RECIPE_EXTRACT_PROMPT.max_output_tokens,
             )
             parsed = parse_ai_json_response(
                 result,
@@ -329,27 +310,10 @@ class RecipeCommandParser:
         async with record_ai_request_async(operation="recipe_command_parse") as report:
             result = await self.client.responses.create(
                 model=self.model,
-                instructions=(
-                    "Parse commands that teach or reuse saved recipes. Return only "
-                    "valid JSON with shape: "
-                    '{"action":"learn_recipe|add_recipe|unknown",'
-                    '"recipe_name":"солянка","url":"https://example.com",'
-                    '"recipe_text":null}. '
-                    "Use null for missing recipe_name, url, or recipe_text. "
-                    "Use action 'learn_recipe' when the user asks to remember, learn, "
-                    "save, or teach a recipe and provides either a recipe URL or "
-                    "pasted recipe text. Do not copy pasted recipe bodies into "
-                    "recipe_text; set recipe_text to null unless the recipe content "
-                    "is very short. Use action 'add_recipe' when the user asks to "
-                    "add/buy ingredients/products "
-                    "for a saved recipe, even if phrased loosely, for example "
-                    "'добавь для солянки', 'купи на солянку', 'ингредиенты для "
-                    "солянки', or 'все для солянки'. Return unknown for ordinary "
-                    "single-product shopping commands."
-                ),
+                instructions=RECIPE_COMMAND_PROMPT.instructions,
                 input=text,
-                temperature=0,
-                max_output_tokens=500,
+                temperature=RECIPE_COMMAND_PROMPT.temperature,
+                max_output_tokens=RECIPE_COMMAND_PROMPT.max_output_tokens,
             )
             parsed = parse_ai_json_response(
                 result,
