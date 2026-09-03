@@ -1,6 +1,6 @@
 # Honeybuy Telegram Bot Plan
 
-Last updated: 2026-05-03
+Last updated: 2026-09-03
 
 ## Goal
 
@@ -23,6 +23,13 @@ stores state locally in SQLite.
 - OpenAI is used for voice transcription, natural command parsing, grocery
   categories, recipe extraction, recipe command fallback, and item identity
   normalization.
+- Natural-text and recipe routing use versioned prompt contracts with strict
+  response schemas and stable prompt fingerprints.
+- Text routing has a maintained 78-case bilingual eval corpus, deterministic
+  offline graders, and an opt-in live model comparison runner with explicit
+  release gates. Live evals require a separate key and never run in CI.
+- GitHub Actions runs locked dependency sync, the full offline test suite, Ruff,
+  and `git diff --check` on pushes and pull requests.
 - Prometheus metrics can be enabled for Grafana dashboards.
 - Item-normalization and active-list deduplication work is committed. Watch the
   first identity-touching smoke run against old rows after deploy, explicitly
@@ -156,8 +163,16 @@ Optional metrics:
   and the copied remote database fixture when present.
 - [x] Service tests cover add, remove, bought, recipes, dedupe, and matching.
 - [x] Config tests cover defaults for metrics and normalization.
+- [x] The text-routing eval corpus is schema-validated and exercised by offline
+  deterministic and integration tests.
+- [x] Prompt contracts are versioned and fingerprinted in live-eval reports.
+- [x] GitHub Actions runs the full offline test and lint gates without Telegram
+  or OpenAI credentials.
 - [x] `ruff check .` passes.
 - [x] `pytest -q` passes.
+- [ ] A release-qualified live baseline eval has passed for the configured
+  production parse model with the maintained corpus and at least three
+  repetitions.
 - [ ] Manual Telegram private-chat smoke test after each deploy.
 - [ ] Manual Telegram group-chat smoke test after each deploy.
 - [ ] Manual unauthorized-user check after auth changes.
@@ -210,19 +225,28 @@ Optional metrics:
 
 ## Current Next Steps
 
-1. Copy-deploy the current local tree, including the completed code hardening,
-   recipe-flow, normalization, cross-language matching, active-list dedupe, and
-   migration work.
-2. Stop or quiesce `honeybuy-tg`, back up the remote SQLite database, run
+1. Run the first release-qualified live text-routing baseline with a separate
+   `HONEYBUY_EVAL_OPENAI_API_KEY`, the full maintained corpus, and at least three
+   repetitions. Use the configured production parse model as the baseline and
+   require every release gate in `docs/operations-and-testing.md` to pass.
+2. After the live baseline passes, copy-deploy the current tree, including the
+   completed routing hardening, prompt contracts, eval system, recipe-flow,
+   normalization, cross-language matching, active-list dedupe, and migration
+   work. The current production host is copy-deployed, so a repository push
+   alone does not update it.
+3. Stop or quiesce `honeybuy-tg`, back up the remote SQLite database, run
    `uv run python -m honeybuy_tg migrate` with the service environment, start or
    restart `honeybuy-tg`, and watch production logs.
-3. Watch production logs during the first identity-touching smoke run against
+4. Watch production logs during the first identity-touching smoke run against
    old rows, explicitly including `/list`, `/shop`, `/remove`, and `/bought`,
    because those paths can backfill canonical identities and remove duplicate
    active rows.
-4. Run manual Telegram smoke checks in private chat and group chat:
+5. Run manual Telegram smoke checks in private chat and group chat:
    authorization, `/add`, `/list`, `/shop`, `/remove`, `/bought`, voice input,
    recipe link learning, pasted recipe learning, recipe delete, overwrite
-   confirmation, and recipe aliases.
-5. Keep product work paused until deploy and smoke checks are complete. The next
+   confirmation, and recipe aliases. Include the Russian routing regressions
+   that distinguish saved-recipe requests such as `купи ингредиенты для
+   солянки` from ordinary shopping phrases such as `купи продукты` and `купи на
+   завтра молоко`.
+6. Keep product work paused until deploy and smoke checks are complete. The next
    product candidate remains better due-date support in rendered lists.
