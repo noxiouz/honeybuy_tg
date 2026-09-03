@@ -19,6 +19,13 @@ class MigrationResult:
         return bool(self.applied_versions)
 
 
+@dataclass(frozen=True)
+class DatabaseHealth:
+    schema_version: int
+    integrity_check: str
+    foreign_keys_check: str
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS authorized_chats (
     chat_id INTEGER PRIMARY KEY,
@@ -218,6 +225,59 @@ def migrate_database_path(database_path: Path) -> MigrationResult:
         )
 
 
+def healthcheck_database_path(database_path: Path) -> DatabaseHealth:
+    if not database_path.exists():
+        raise RuntimeError(f"Database does not exist: {database_path}")
+    if not database_path.is_file():
+        raise RuntimeError(f"Database path is not a file: {database_path}")
+
+    database_uri = database_path.resolve().as_uri() + "?mode=ro"
+    try:
+        with (
+            sqlite3.connect(database_uri, uri=True) as source_db,
+            sqlite3.connect(":memory:") as db,
+        ):
+            source_db.backup(db)
+            db.row_factory = sqlite3.Row
+            schema_version = get_user_version(db)
+            if schema_version < CURRENT_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "Database schema version "
+                    f"{schema_version} is older than supported version "
+                    f"{CURRENT_SCHEMA_VERSION}; run migrate"
+                )
+            if schema_version > CURRENT_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "Database schema version "
+                    f"{schema_version} is newer than supported version "
+                    f"{CURRENT_SCHEMA_VERSION}"
+                )
+
+            _validate_required_schema(db)
+
+            integrity_rows = db.execute("PRAGMA integrity_check").fetchall()
+            integrity_messages = tuple(str(_row_value(row, 0, 0)) for row in integrity_rows)
+            if integrity_messages != ("ok",):
+                details = _summarize_check_rows(integrity_messages)
+                raise RuntimeError(f"SQLite integrity check failed: {details}")
+
+            foreign_key_rows = db.execute("PRAGMA foreign_key_check").fetchall()
+            if foreign_key_rows:
+                violations = tuple(_format_foreign_key_violation(row) for row in foreign_key_rows)
+                details = _summarize_check_rows(violations)
+                raise RuntimeError(f"SQLite foreign key check failed: {details}")
+    except sqlite3.Error as error:
+        raise RuntimeError(
+            f"Unable to inspect SQLite database {database_path}: {error}"
+        ) from error
+
+    return DatabaseHealth(
+        schema_version=schema_version,
+        integrity_check="ok",
+        foreign_keys_check="ok",
+    )
+
+
 def run_migrations(
     db: sqlite3.Connection,
     *,
@@ -263,6 +323,54 @@ def run_migrations(
 
 def get_user_version(db: sqlite3.Connection) -> int:
     return int(_scalar(db.execute("PRAGMA user_version").fetchone()))
+
+
+def _validate_required_schema(db: sqlite3.Connection) -> None:
+    with sqlite3.connect(":memory:") as reference_db:
+        reference_db.row_factory = sqlite3.Row
+        run_migrations(reference_db)
+        required_schema = _application_schema(reference_db)
+
+    actual_schema = _application_schema(db)
+    missing_objects = [
+        f"table {table_name}"
+        for table_name in sorted(required_schema.keys() - actual_schema.keys())
+    ]
+    for table_name in sorted(required_schema.keys() & actual_schema.keys()):
+        missing_objects.extend(
+            f"column {table_name}.{column_name}"
+            for column_name in sorted(
+                required_schema[table_name] - actual_schema[table_name]
+            )
+        )
+
+    if missing_objects:
+        details = "; ".join(missing_objects)
+        raise RuntimeError(f"Database schema is missing required objects: {details}")
+
+
+def _application_schema(db: sqlite3.Connection) -> dict[str, frozenset[str]]:
+    table_names = (
+        str(_row_value(row, "name", 0))
+        for row in db.execute(
+            """
+            SELECT name
+            FROM sqlite_schema
+            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+            ORDER BY name
+            """
+        ).fetchall()
+    )
+    return {
+        table_name: frozenset(
+            str(_row_value(row, "name", 0))
+            for row in db.execute(
+                "SELECT name FROM pragma_table_xinfo(?)",
+                (table_name,),
+            ).fetchall()
+        )
+        for table_name in table_names
+    }
 
 
 def _migrate_to_1(db: sqlite3.Connection) -> None:
@@ -328,6 +436,24 @@ def _scalar(row: sqlite3.Row | tuple[object, ...] | None) -> object:
     if row is None:
         raise RuntimeError("SQLite pragma returned no rows")
     return _row_value(row, 0, 0)
+
+
+def _format_foreign_key_violation(
+    row: sqlite3.Row | tuple[object, ...],
+) -> str:
+    table = _row_value(row, "table", 0)
+    row_id = _row_value(row, "rowid", 1)
+    parent = _row_value(row, "parent", 2)
+    foreign_key_id = _row_value(row, "fkid", 3)
+    return f"{table}(rowid={row_id}, parent={parent}, fkid={foreign_key_id})"
+
+
+def _summarize_check_rows(rows: tuple[str, ...], *, limit: int = 5) -> str:
+    summary = "; ".join(" ".join(row.split()) for row in rows[:limit])
+    remaining = len(rows) - limit
+    if remaining > 0:
+        summary += f"; and {remaining} more"
+    return summary or "no result"
 
 
 def _row_value(

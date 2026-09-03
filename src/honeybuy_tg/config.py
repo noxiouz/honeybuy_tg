@@ -1,18 +1,20 @@
 from pathlib import Path
-
 from typing import Literal
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+_ENV_FILE_CONFIG = SettingsConfigDict(
+    env_file=".env",
+    env_file_encoding="utf-8",
+    env_ignore_empty=True,
+    extra="ignore",
+)
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        env_ignore_empty=True,
-        extra="ignore",
-    )
+    model_config = _ENV_FILE_CONFIG
 
     telegram_bot_token: str = Field(validation_alias="TELEGRAM_BOT_TOKEN")
     owner_user_id: int | None = Field(default=None, validation_alias="OWNER_USER_ID")
@@ -97,3 +99,13 @@ class Settings(BaseSettings):
 
 def load_settings() -> Settings:
     return Settings()
+
+
+class HealthcheckSettings(BaseSettings):
+    model_config = _ENV_FILE_CONFIG
+
+    database_path: Path = Field(validation_alias="DATABASE_PATH")
+
+
+def load_healthcheck_settings() -> HealthcheckSettings:
+    return HealthcheckSettings()
