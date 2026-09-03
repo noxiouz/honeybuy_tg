@@ -1,0 +1,84 @@
+# Council classification: reliability and observability ideas
+
+Scope: `RO-001`–`RO-030` plus `RA-011`, `RA-019`, and
+`RA-023`–`RA-026` (36 ideas). This is a complexity classification, not a value
+ranking or implementation order.
+
+Complexity is estimated for a production-ready implementation of the full idea:
+
+- **XS:** presentation/configuration only, with no persistence;
+- **S:** contained change inside an existing boundary;
+- **M:** multi-module change or additive schema;
+- **L:** durable state machine, scheduler, integration/security boundary, or
+  material migration;
+- **XL:** topology, tenant/identity, or platform shift, or several high-risk
+  external/data boundaries.
+
+The list is sorted by complexity from XS to XL, then by idea ID. No assigned
+idea is XS once its full production, privacy, recovery, and operator obligations
+are included.
+
+## S
+
+| ID | Exact title | Primary category | Secondary tags | Why this size; prerequisites and dependencies | Confidence |
+| --- | --- | --- | --- | --- | --- |
+| RO-003 | Stable reason-code catalog | Reliability & observability | diagnostic contract, testing | A versioned enum registry and validation can stay within the existing diagnostic boundary. It should precede RO-001/002/005/008/010 and be shared with tests; migrating every existing signal can be incremental. | High |
+| RO-016 | Read-only database invariant doctor | Deployment & operations | data integrity, migration safety | A read-only CLI over existing SQLite schema needs bounded checks, deadlines, redacted output, and tests, but no durable state or live integration. Reuse its probes in RO-019/021/029 while keeping cheap, deep, and deployment modes explicit. | High |
+
+## M
+
+| ID | Exact title | Primary category | Secondary tags | Why this size; prerequisites and dependencies | Confidence |
+| --- | --- | --- | --- | --- | --- |
+| RA-019 | Immutable application operation context | Data & application architecture | authorization context, correlation | Resolving one immutable value at transport boundaries and passing it through selected service paths is a multi-module refactor without new durable authority. It depends on preserving explicit `chat_id` predicates and must not let ContextVars or background jobs supply implicit tenancy. | High |
+| RO-001 | End-to-end request decision trace | Reliability & observability | routing, privacy | Middleware/context setup, routing instrumentation, a bounded finalizer, and tests cross several modules; an additive short-lived store may follow. RO-003 should come first, while RO-004/006 define capture and persistence policy; ContextVars remain request-local and reset on every exit. | High |
+| RO-002 | Owner-visible “why?” explainer | Reliability & observability | Telegram UX, privacy, access | The view spans trace lookup, sanitization, owner-only Telegram delivery, expiry, and rate limits, but can build on existing authorization and an established trace store. It depends on RO-001/003/004/006 and stays a separate product projection rather than exposing model reasoning. | High |
+| RO-004 | Sampled tracing with temporary diagnostic windows | Reliability & observability | privacy, retention, operator controls | Sampling, per-chat caps, a durable expiring debug setting, and cleanup require additive state plus middleware integration. It depends on RO-001/003/006, an explicit clock/TTL contract, and RO-007 or RO-030 for lifecycle enforcement. | High |
+| RO-005 | Structured journald logging with correlation | Reliability & observability | logging, privacy, operations | A shared logging adapter plus conversion of call sites is multi-module but introduces no business state. It should be a redacted projection of RO-001/003 rather than a second trace, and needs bounded fields plus a separate journald disk-retention policy. | High |
+| RO-008 | Low-cardinality routing and fallback metrics | Reliability & observability | metrics, Russian routing, eval evidence | Instrumenting terminal routing/fallback outcomes crosses middleware, routing, and the metrics module, with strict enum validation and tests. It depends on RO-003 and preferably RO-001; dashboard ratios must distinguish ineligible text, unknown parsing, and AI/schema failures. | High |
+| RO-009 | Request latency phase breakdown | Reliability & observability | performance, capacity | Fixed timers must be added around Telegram, AI, fetch, ffmpeg, and SQLite boundaries and closed on errors/cancellation. This is broad instrumentation without new durable state; it depends on bounded stage names and should provide evidence before RO-017 or scaling work. | High |
+| RO-010 | AI outcome, prompt, and cost observability | Reliability & observability | AI, prompt contracts, cost | A common AI request report, normalized model aliases, usage handling, and trace/metric projections span AI, eval metadata, and observability modules. It depends on RO-003 and prompt fingerprints; cost budgets remain separate policy, while RO-011 owns resilience. | High |
+| RO-018 | Database health and capacity telemetry | Reliability & observability | SQLite, capacity, privacy | A bounded low-priority sampler, cached expensive checks, freshness semantics, and gauges require storage, lifecycle, and metric integration but no data mutation. Share probes with RO-016 and let RO-025/RA-024 consume freshness rather than assuming scrape success. | High |
+| RO-022 | Release identity and deployment markers | Deployment & operations | release manifest, observability | Generating an immutable manifest, validating it at startup, and exposing safe release/deployment markers spans packaging, deployment, runtime, and metrics. It should merge with the atomic-release identity work and feed RO-019/023/024/025; raw hashes belong in logs/info, not unbounded labels. | High |
+
+## L
+
+| ID | Exact title | Primary category | Secondary tags | Why this size; prerequisites and dependencies | Confidence |
+| --- | --- | --- | --- | --- | --- |
+| RA-011 | Capability-specific safe-mode experience | Reliability & observability | product UX, AI, integrations | A truthful capability registry must coordinate fallbacks across handlers, AI, media, delivery, schedulers, health, and onboarding, including combinations of outages. It depends on explicit envelopes such as RO-011/012/025 and requires broad failure-path tests so degradation cannot bypass authorization or claim false success. | High |
+| RA-023 | Background-work operator budget and failure isolation | Deployment & operations | schedulers, capacity, governance | Production scope goes beyond a document: each worker needs bounded resources, retries, poison handling, shutdown/restart semantics, health, and an accountable operator path, with some jobs isolated in systemd timers. It should constrain RO-020/021/024/030 and depends on measurements from RO-009/017/018. | Medium |
+| RA-024 | Monitoring-path health and alert delivery proof | Reliability & observability | external monitoring, SLO, credentials | Dead-man monitoring and synthetic alert delivery create a separate provider/credential/network boundary with independent placement, retention, rate limits, and operator ownership. It depends on RO-022/025 and must distinguish zero traffic from absent telemetry without paging household chats. | High |
+| RA-025 | Structured shutdown and cancellation contract | Data & application architecture | lifecycle, recovery, fault injection | One lifecycle coordinator must span SQLite, subprocesses, HTTP, OpenAI, Telegram, scheduled work, and durable leases, defining commit points and bounded drain/restart behavior. Actual library cancellation limits and phase-by-phase fault tests make this a cross-boundary lifecycle change. | High |
+| RA-026 | Typed interaction-session framework | Data & application architecture | Telegram safety, privacy, callbacks | A durable typed session lifecycle, child schemas, reauthorization, versioned callbacks, expiry, recovery, and migration of existing confirmations form a security-sensitive state machine. It should precede expansion of RO-015-style flows and depends on bounded retention plus maintenance. | High |
+| RO-006 | Privacy-preserving diagnostic event schema | Privacy & security | data migration, retention, observability | Separating metadata from content requires additive schema, sanitizer enforcement, migration/expiry decisions for sensitive existing rows, and backup-aware retention; the optional protected content path adds another data boundary. It depends on RO-003 and must stay distinct from domain history, operation journals, audit, and delivery state. | High |
+| RO-007 | Retention, deletion, and backup privacy lifecycle | Privacy & security | data lifecycle, backups, maintenance | Policies and retry-safe deletion span multiple data classes, incremental cleanup scheduling, owner deletion, and backup expiry where erasure is necessarily delayed. It depends on an explicit clock/classification matrix, RO-020 backup metadata, and a bounded executor such as RO-030. | High |
+| RO-011 | Explicit AI resilience envelope | Reliability & observability | AI, external dependency, safe mode | Operation-specific deadlines, retry eligibility, concurrency gates, circuit behavior, and truthful fallbacks wrap an external provider across several capabilities. It should be one AI client/policy with RO-010 instrumentation, capability evals, and RA-011 safe-mode behavior. | High |
+| RO-012 | Telegram delivery reliability envelope | Reliability & observability | Telegram, partial outcomes, idempotency | Classifying and selectively retrying sends, edits, reactions, callbacks, and downloads is an external-integration correctness boundary: unsafe retry can duplicate output after a committed mutation. It becomes shared delivery infrastructure and depends on stable reasons, explicit partial outcomes, and coalescing/idempotency policy. | High |
+| RO-013 | Telegram update idempotency ledger | Data & application architecture | Telegram, recovery, persistence | A transactional claim/finalize ledger with TTL and crash recovery is a durable state machine around every update. It requires a migration, bot-scoped identity, uncertain-in-progress rules, and maintenance; keep update deduplication distinct from RO-014 operation recovery and domain undo history. | High |
+| RO-014 | Durable operation journal for multi-item mutations | Data & application architecture | atomicity, recovery, SQLite | Journal and business-row linkage, progress/terminal states, reconciliation, retention, and idempotent resume or compensation create durable workflow state. Each operation must first choose atomic transaction versus resumable execution; never blindly replay an uncertain batch. | High |
+| RO-015 | Confirmation expiry and stranded-claim recovery | Data & application architecture | callbacks, lifecycle, recipes | Per-kind TTLs, claim transitions, digest-based overwrite reconciliation, scheduled cleanup, and explicit uncertain outcomes extend an existing security-sensitive state machine. RA-026 is the likely shared foundation; RO-030 can execute cleanup, but feature-specific recovery remains separate. | High |
+| RO-017 | SQLite concurrency and event-loop isolation | Data & application architecture | performance, shutdown, backups | A bounded executor/queue, connection policy, busy deadlines, and possibly WAL materially change storage concurrency and shutdown behavior. RO-009/018 should prove need and measure results; WAL also changes RO-020 backup/restore contracts and requires careful preservation of transaction semantics. | High |
+| RO-019 | Migration preflight and postflight contract | Deployment & operations | schema safety, backup, recovery | Orchestrating service-stop proof, disk/permissions/version checks, verified backup, forward migration, integrity validation, and a durable release receipt is a high-consequence deployment workflow. It depends on RO-016/020/022 and must leave service stopped on failed verification rather than reverse-migrating. | High |
+| RO-020 | Automated consistent backup with manifest | Deployment & operations | recovery, privacy, retention | Snapshot consistency, logical verification, checksums/manifests, permissions, retention, and optional encrypted off-host replication cross sensitive data and operational boundaries. Merge duplicate backup-production ideas, depend on RO-016/022, and keep restore proof in RO-021 distinct. | High |
+| RO-021 | Restore drill and rollback rehearsal | Deployment & operations | disaster recovery, testing, privacy | A scheduled or manual isolated restore must select a compatible artifact, protect copied production data, validate schema/application reads, publish freshness, and securely clean up. It depends on RO-016/020/022 and is a separate guarantee from producing backups. | High |
+| RO-025 | Service-level objectives and actionable alerts | Reliability & observability | monitoring, operator load, safe mode | Production-ready SLOs need capability-aware indicators, low-volume statistics, recording/alert rules, deployment annotations, runbooks, and sustained actionable thresholds. It depends on RO-008/009/018/022 and on RA-024 to prove the external scrape/alert path. | High |
+| RO-026 | Secure recipe-fetch boundary with explainable failures | Privacy & security | recipes, network egress, SSRF | Actual-peer DNS/IP enforcement on every redirect, deadline/size/content budgets, safe telemetry, and hermetic tests form a security-critical network boundary. Merge runtime policy with the equivalent AI/operations ideas, retain the separate test harness, and explicitly decide trusted private-host behavior. | High |
+| RO-027 | Separate security audit trail for authorization changes | Privacy & security | access, audit, retention | An append-only, restricted, retention-controlled trail for grants and destructive actions is a new sensitive security-data boundary whose write failure cannot grant access. It depends on an authoritative membership/grant model; it is evidence, not the source of authorization, and must remain separate from diagnostic/domain history. | High |
+| RO-028 | Sanitized failure inbox for unresolved requests | Reliability & observability | eval curation, privacy, product feedback | A quota-bound durable inbox, expiry/deduplication, owner review, explicit resubmission/redaction, and corpus proposal workflow form a privacy-sensitive queue. It depends on RO-001/003/006 and should merge with the human-reviewed production-failure-to-eval workflow without auto-copying messages. | High |
+| RO-029 | Startup and crash-loop diagnostic capsule | Deployment & operations | lifecycle, readiness, systemd | A staged startup state machine plus an atomically persisted last-failure capsule must survive and classify repeated systemd restarts without leaking config. It should reuse RO-016 probes and RO-022 identity, and its readiness semantics must account for sandboxing, artifact access, and mandatory dependencies. | High |
+| RO-030 | Unified ephemeral-state maintenance service | Data & application architecture | scheduler, retention, operator load | A bounded, restart-safe scheduler deleting across several tables needs per-class policy, ordering, backoff, fairness, dry-run, and health while protecting business data. Merge policy with RO-007 but keep the executor distinct; depend on a clock contract, RA-023 budgets, RA-025 shutdown, and relevant recovery rules. | High |
+
+## XL
+
+| ID | Exact title | Primary category | Secondary tags | Why this size; prerequisites and dependencies | Confidence |
+| --- | --- | --- | --- | --- | --- |
+| RO-023 | Isolated staging and canary release path | Deployment & operations | topology, Telegram identity, release promotion | A genuinely isolated environment adds a second bot identity, credentials, chat, database, metrics endpoint, systemd unit, network policy, artifact promotion, and operating burden. It depends on RO-019/020/022 and must remain staging—not two production pollers sharing a token or SQLite file. | High |
+| RO-024 | Post-deploy synthetic smoke sentinel | Deployment & operations | testing, Telegram, AI, credentials | End-to-end production-like probing crosses deployment, a distinct test principal/tenant, live Telegram and optional OpenAI, authorization, cleanup, secrets, rate limits, and failure attribution. Without an isolated identity it stays manual; with one, it also depends on RO-022/023/025 and RA-023/024. | High |
+
+## Calibration notes
+
+- Privacy, retention, recovery, and operator burden are included in each size;
+  they are not deferred polish.
+- Related brainstorm cards may later merge, but this table classifies every
+  assigned source ID independently so none disappears before value ranking.
+- Dependencies express safe sequencing or shared foundations, not priority or
+  product value.
