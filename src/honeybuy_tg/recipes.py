@@ -9,6 +9,14 @@ from urllib.request import Request, urlopen
 
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+FRONT_LOADED_TEMPORAL_TARGETS = {
+    "завтра",
+    "сегодня",
+    "вечер",
+    "утро",
+    "обед",
+    "ужин",
+}
 
 
 @dataclass(frozen=True)
@@ -161,7 +169,7 @@ def clean_optional_recipe_text(value: Any) -> str | None:
 
 
 def parse_add_recipe_request(text: str) -> AddRecipeRequest | None:
-    normalized = normalize_recipe_command_text(text)
+    normalized = strip_leading_recipe_politeness(normalize_recipe_command_text(text))
     prefixes = (
         "добавь все для",
         "добавить все для",
@@ -169,8 +177,14 @@ def parse_add_recipe_request(text: str) -> AddRecipeRequest | None:
         "купить все для",
         "добавь ингредиенты для",
         "добавить ингредиенты для",
+        "купи ингредиенты для",
+        "купить ингредиенты для",
         "добавь продукты для",
         "добавить продукты для",
+        "купи продукты для",
+        "купить продукты для",
+        "buy ingredients for",
+        "add ingredients for",
         "добавь рецепт",
         "приготовь",
     )
@@ -233,41 +247,88 @@ def parse_recipe_alias_to_argument(text: str) -> RecipeAliasRequest | None:
 
 
 def should_try_ai_recipe_command(text: str) -> bool:
-    normalized = normalize_recipe_command_text(text)
-    return any(
+    normalized = strip_leading_recipe_politeness(normalize_recipe_command_text(text))
+    if not normalized:
+        return False
+    if parse_add_recipe_request(normalized) is not None:
+        return True
+    if normalized.startswith(
+        (
+            "выучи",
+            "запомни",
+            "learn ",
+            "remember ",
+            "save recipe ",
+            "teach recipe ",
+        )
+    ):
+        return True
+    if looks_like_pasted_recipe_text(text) and any(
         marker in normalized
         for marker in (
-            "рецепт",
-            "ингредиент",
-            "ingredient",
-            "продукт",
-            "recipe",
-            "готов",
-            "learn",
             "remember",
             "save",
             "teach",
+            "learn",
             "выучи",
             "запомни",
-            "для ",
-            " на ",
         )
-    )
+    ):
+        return True
+    if "рецепт" in normalized or "recipe" in normalized:
+        return True
+    return looks_like_recipe_reuse_request(normalized)
 
 
 def looks_like_recipe_reuse_request(text: str) -> bool:
-    normalized = normalize_recipe_command_text(text)
-    return any(
-        marker in normalized
-        for marker in (
-            " все для ",
-            " для ",
-            " на ",
-            "ингредиент",
-            "продукт",
-            "приготов",
+    normalized = strip_leading_recipe_politeness(normalize_recipe_command_text(text))
+    if not normalized:
+        return False
+    if parse_add_recipe_request(normalized) is not None:
+        return True
+    if is_front_loaded_temporal_shopping_request(normalized):
+        return False
+    if normalized.startswith(
+        (
+            "купи на ",
+            "купить на ",
+            "buy for ",
+            "add for ",
+            "добавь для ",
+            "добавить для ",
+            "все для ",
+            "всё для ",
+            "ингредиенты для ",
+            "ingredients for ",
+            "buy ingredients for ",
+            "add ingredients for ",
+        )
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\b(add|buy)\s+everything\s+for\s+\S+",
+            normalized,
+            flags=re.IGNORECASE,
         )
     )
+
+
+def strip_leading_recipe_politeness(text: str) -> str:
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r"^(пожалуйста|плиз|please)[,\s]+", "", text).strip()
+        text = re.sub(r"^(can|could|would)\s+you\s+", "", text).strip()
+    return text
+
+
+def is_front_loaded_temporal_shopping_request(text: str) -> bool:
+    for prefix in ("купи на ", "купить на "):
+        if text.startswith(prefix):
+            target = text[len(prefix) :].split(" ", 1)[0]
+            return target in FRONT_LOADED_TEMPORAL_TARGETS
+    return False
 
 
 def normalize_recipe_command_text(text: str) -> str:

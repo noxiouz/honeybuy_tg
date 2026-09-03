@@ -73,7 +73,6 @@ from honeybuy_tg.recipes import (
     parse_recipe_alias_request,
     parse_learn_recipe_request,
     looks_like_pasted_recipe_text,
-    looks_like_recipe_reuse_request,
     recipe_command_from_ai,
     should_try_ai_recipe_command,
 )
@@ -180,14 +179,23 @@ async def parse_text_command_with_ai_fallback(
     text_parser: ShoppingTextParser | None,
     default_action: ParsedAction | None = None,
 ) -> ParsedCommand:
+    ai_unknown: ParsedCommand | None = None
     if text_parser is not None:
         try:
             parsed = parsed_command_from_ai(await text_parser.parse(text))
-            if parsed.action != ParsedAction.UNKNOWN or default_action is None:
+            if parsed.action != ParsedAction.UNKNOWN:
                 return parsed
+            ai_unknown = parsed
         except Exception:
             logger.exception("Failed to parse shopping text with AI")
-    return parse_shopping_text(text, default_action=default_action)
+    local_parsed = parse_shopping_text(text, default_action=default_action)
+    if local_parsed.action != ParsedAction.UNKNOWN:
+        return local_parsed
+    if ai_unknown is not None and (
+        ai_unknown.needs_confirmation or ai_unknown.clarification_question
+    ):
+        return ai_unknown
+    return local_parsed
 
 
 def parse_bare_voice_items(text: str) -> ParsedCommand | None:
@@ -706,7 +714,6 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         learn_request = parse_learn_recipe_request(text)
         add_request = parse_add_recipe_request(text)
         alias_request = parse_recipe_alias_request(text)
-        tried_ai_recipe_command = False
         if (
             learn_request is None
             and add_request is None
@@ -714,7 +721,6 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             and recipe_command_parser is not None
             and should_try_ai_recipe_command(text)
         ):
-            tried_ai_recipe_command = True
             try:
                 recipe_command = recipe_command_from_ai(
                     await recipe_command_parser.parse(text)
@@ -765,18 +771,6 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 return True
             await message.answer(
                 f"Saved alias for {recipe.name}: {alias_request.alias}"
-            )
-            return True
-
-        if (
-            learn_request is None
-            and add_request is None
-            and tried_ai_recipe_command
-            and looks_like_recipe_reuse_request(text)
-        ):
-            await message.answer(
-                "I could not match that to a saved recipe.\n\n"
-                "Try: добавь все для солянки"
             )
             return True
 
@@ -2323,7 +2317,15 @@ def strip_bot_mention(text: str | None, *, bot_username: str | None) -> str:
         return ""
     if bot_username is None:
         return text
-    return re.sub(f"@{re.escape(bot_username)}", "", text, flags=re.IGNORECASE).strip()
+    stripped, count = re.subn(
+        rf"@{re.escape(bot_username)}\b[,;:.!?]*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if count == 0:
+        return text.strip()
+    return stripped.strip(" \t\r\n,;:.!?")
 
 
 async def set_bot_commands(bot: Bot) -> None:

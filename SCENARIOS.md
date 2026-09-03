@@ -1,6 +1,6 @@
 # Honeybuy Functional Scenarios
 
-Last updated: 2026-05-03
+Last updated: 2026-09-03
 
 This document is the functional specification for known user-visible behavior of
 the Honeybuy Telegram bot. It describes what the bot must do, not how the code is
@@ -206,6 +206,11 @@ then the bot strips the bot mention and parses the remaining text.
 Given a non-command text message does not mention the bot,
 then the bot ignores it for natural text parsing.
 
+When the bot mention has adjacent punctuation, such as `@HoneyBuyBot, купи
+молоко`, the mention and its adjacent separator are removed before parsing.
+Meaningful item punctuation elsewhere in the command remains part of the
+command text.
+
 ### TEXT-006 Mode `all`
 
 Given text parse mode is `all`,
@@ -237,11 +242,55 @@ Example:
 - Reply message: `@HoneyBuyBot`
 - Expected result: the bot adds `молоко`.
 
+The same rule applies when the mention-only reply includes adjacent punctuation,
+such as `@HoneyBuyBot,`.
+
 ### TEXT-009 Bot Mention Reply To Text Must Not Trigger Voice Prompt
 
 Given a user replies to an ordinary text message and mentions the bot,
 when the replied message is not a voice message,
 then the bot must not answer `Reply to a voice message and mention me.`
+
+### TEXT-010 Shopping AI Unknown Falls Back To Local Parsing
+
+Given natural text parsing is enabled and the OpenAI shopping parser is
+configured,
+when OpenAI returns `unknown`, an invalid response, or an error,
+then the bot tries the deterministic shopping parser before treating the text as
+unknown.
+
+If deterministic parsing also cannot classify the text, the bot may use a
+useful OpenAI clarification question from the `unknown` response.
+
+Speculative text such as `может быть купить молоко` is not an imperative
+shopping command and should remain unknown unless the user makes the action
+explicit.
+
+### TEXT-011 Recipe And Shopping Routing Stay Separate
+
+Given natural text parsing is enabled,
+when a text is an ordinary shopping command with modifiers such as `на завтра`,
+`для завтрака`, `продукты`, or `готовую солянку`,
+then recipe routing must not consume it merely because those words appear.
+
+Given a text is an explicit saved-recipe reuse request such as `добавь всё для
+солянки`, `купи на солянку`, `ингредиенты для солянки`, `купи ингредиенты для
+солянки`, `купи продукты для солянки`, `can you buy ingredients for chili`, or
+a polite equivalent such as `пожалуйста, купи на солянку`,
+then recipe routing may handle it before shopping parsing.
+
+Given a text is a front-loaded temporal shopping command such as `купи на
+завтра молоко`,
+then recipe routing must not treat the temporal target as a recipe name.
+
+### TEXT-012 Recipe AI Unknown Falls Through
+
+Given recipe AI is configured,
+when recipe AI returns `unknown`, an invalid response, or an error,
+then the bot returns control to shopping routing.
+
+The bot answers `I do not know recipe: ...` only after it has a positive recipe
+reuse request with an extracted recipe name.
 
 ## Voice Input
 

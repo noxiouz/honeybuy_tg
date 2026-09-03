@@ -145,6 +145,20 @@ def test_strip_bot_mention():
         )
         == "яйца купил"
     )
+    assert (
+        strip_bot_mention(
+            "@HoneyBuyBot, купи молоко",
+            bot_username="honeybuybot",
+        )
+        == "купи молоко"
+    )
+    assert (
+        strip_bot_mention(
+            "@HoneyBuyBot,",
+            bot_username="honeybuybot",
+        )
+        == ""
+    )
 
 
 def test_mention_text_can_be_parsed_as_bought_message():
@@ -650,6 +664,557 @@ class FakeVoiceTranscriber:
         return "купи молоко"
 
 
+class RecordingRoutingParser:
+    def __init__(self, *, label, trace, response=None, error=None):
+        self.label = label
+        self.trace = trace
+        self.response = response
+        self.error = error
+
+    async def parse(self, text):
+        self.trace.append((self.label, text))
+        if self.error is not None:
+            raise self.error
+        if self.response is None:
+            raise AssertionError(f"No response configured for {self.label}")
+        return self.response
+
+
+class RecordingRoutingItemNormalizer:
+    def __init__(self, *, trace):
+        self.trace = trace
+
+    async def normalize(self, names):
+        self.trace.append(("normalizer", tuple(names)))
+        return {}
+
+
+class FailFastExternalAdapter:
+    async def transcribe(self, *args, **kwargs):
+        raise AssertionError("voice transcriber must not be called")
+
+    async def categorize(self, *args, **kwargs):
+        raise AssertionError("categorizer must not be called")
+
+    async def extract(self, *args, **kwargs):
+        raise AssertionError("recipe extractor must not be called")
+
+
+def install_routing_fakes(
+    monkeypatch,
+    *,
+    trace,
+    shopping_response,
+    recipe_response=None,
+    recipe_error=None,
+):
+    shopping_parser = RecordingRoutingParser(
+        label="shopping",
+        trace=trace,
+        response=shopping_response,
+    )
+    recipe_parser = RecordingRoutingParser(
+        label="recipe",
+        trace=trace,
+        response=recipe_response
+        or {
+            "action": "unknown",
+            "recipe_name": None,
+            "url": None,
+            "recipe_text": None,
+        },
+        error=recipe_error,
+    )
+    item_normalizer = RecordingRoutingItemNormalizer(trace=trace)
+    forbidden_adapter = FailFastExternalAdapter()
+
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingTextParser",
+        lambda **kwargs: shopping_parser,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.RecipeCommandParser",
+        lambda **kwargs: recipe_parser,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemNormalizer",
+        lambda **kwargs: item_normalizer,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.VoiceTranscriber",
+        lambda **kwargs: forbidden_adapter,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.ShoppingItemCategorizer",
+        lambda **kwargs: forbidden_adapter,
+    )
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.RecipeExtractor",
+        lambda **kwargs: forbidden_adapter,
+    )
+    return recipe_parser, shopping_parser
+
+
+async def build_routing_test_context(
+    monkeypatch,
+    tmp_path,
+    *,
+    mode="all",
+    shopping_response=None,
+    recipe_response=None,
+    recipe_error=None,
+):
+    trace = []
+    recipe_parser, shopping_parser = install_routing_fakes(
+        monkeypatch,
+        trace=trace,
+        shopping_response=shopping_response
+        or {
+            "action": "unknown",
+            "items": [],
+            "needs_confirmation": False,
+            "clarification_question": None,
+        },
+        recipe_response=recipe_response,
+        recipe_error=recipe_error,
+    )
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+        OPENAI_API_KEY="test",
+        TEXT_PARSE_MODE=mode,
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+    return storage, dispatcher, session, bot, trace, recipe_parser, shopping_parser
+
+
+def make_text_update(
+    text,
+    *,
+    update_id=1,
+    message_id=10,
+    chat_id=1,
+    chat_type="private",
+    user_id=42,
+    reply_text=None,
+):
+    now = int(datetime.now(UTC).timestamp())
+    message = {
+        "message_id": message_id,
+        "date": now,
+        "chat": {"id": chat_id, "type": chat_type},
+        "from": {"id": user_id, "is_bot": False, "first_name": "User"},
+        "text": text,
+    }
+    if reply_text is not None:
+        message["reply_to_message"] = {
+            "message_id": message_id - 1,
+            "date": now,
+            "chat": {"id": chat_id, "type": chat_type},
+            "from": {"id": 7, "is_bot": False, "first_name": "Sender"},
+            "text": reply_text,
+        }
+    return Update.model_validate({"update_id": update_id, "message": message})
+
+
+def sent_message_texts(session):
+    return [
+        request.text
+        for request in session.requests
+        if isinstance(request, SendMessage)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "expected_item"),
+    [
+        ("купи продукты", "продукты"),
+        ("купи молоко на завтра", "молоко"),
+        ("добавь сыр для завтрака", "сыр"),
+    ],
+)
+async def test_recipe_ai_unknown_does_not_consume_shopping_commands(
+    monkeypatch,
+    tmp_path,
+    text,
+    expected_item,
+):
+    (
+        storage,
+        dispatcher,
+        session,
+        bot,
+        trace,
+        _recipe_parser,
+        _shopping_parser,
+    ) = await build_routing_test_context(
+        monkeypatch,
+        tmp_path,
+        shopping_response={
+            "action": "add_items",
+            "items": [expected_item],
+            "needs_confirmation": False,
+            "clarification_question": None,
+        },
+    )
+
+    await dispatcher.feed_update(bot, make_text_update(text))
+
+    parser_trace = [entry for entry in trace if entry[0] in {"recipe", "shopping"}]
+    assert parser_trace[-1] == ("shopping", text)
+    assert sum(entry[0] == "shopping" for entry in parser_trace) == 1
+    if any(entry[0] == "recipe" for entry in parser_trace):
+        assert parser_trace.index(("recipe", text)) < parser_trace.index(
+            ("shopping", text)
+        )
+    assert [item.name for item in await storage.list_items(chat_id=1)] == [
+        expected_item
+    ]
+    assert not any("could not match" in text.casefold() for text in sent_message_texts(session))
+    assert not any("солянк" in text.casefold() for text in sent_message_texts(session))
+
+
+@pytest.mark.asyncio
+async def test_recipe_parser_exception_falls_through_to_shopping_parser(
+    monkeypatch,
+    tmp_path,
+):
+    text = "ингредиенты для солянки"
+    (
+        storage,
+        dispatcher,
+        session,
+        bot,
+        trace,
+        _recipe_parser,
+        _shopping_parser,
+    ) = await build_routing_test_context(
+        monkeypatch,
+        tmp_path,
+        shopping_response={
+            "action": "add_items",
+            "items": ["ингредиенты для солянки"],
+            "needs_confirmation": False,
+            "clarification_question": None,
+        },
+        recipe_error=RuntimeError("offline recipe parser failure"),
+    )
+
+    await dispatcher.feed_update(bot, make_text_update(text))
+
+    parser_trace = [entry for entry in trace if entry[0] in {"recipe", "shopping"}]
+    assert parser_trace == [("recipe", text), ("shopping", text)]
+    assert [item.name for item in await storage.list_items(chat_id=1)] == [text]
+    assert not any("could not match" in answer.casefold() for answer in sent_message_texts(session))
+
+
+@pytest.mark.asyncio
+async def test_deterministic_recipe_reuse_bypasses_ai_shopping_parser(
+    monkeypatch,
+    tmp_path,
+):
+    (
+        storage,
+        dispatcher,
+        session,
+        bot,
+        trace,
+        _recipe_parser,
+        _shopping_parser,
+    ) = await build_routing_test_context(monkeypatch, tmp_path)
+    await storage.save_recipe(
+        chat_id=1,
+        name="Солянка",
+        source_url=None,
+        created_by=42,
+        ingredients=[("солёные огурцы", "2 шт")],
+    )
+
+    await dispatcher.feed_update(bot, make_text_update("добавь всё для солянки"))
+
+    assert not [entry for entry in trace if entry[0] in {"recipe", "shopping"}]
+    assert [item.name for item in await storage.list_items(chat_id=1)] == [
+        "солёные огурцы, 2 шт"
+    ]
+    assert any(
+        answer.startswith("Added ingredients for Солянка")
+        for answer in sent_message_texts(session)
+    )
+
+
+@pytest.mark.asyncio
+async def test_polite_ai_recipe_request_adds_chat_scoped_saved_ingredients(
+    monkeypatch,
+    tmp_path,
+):
+    text = "пожалуйста, купи на солянку"
+    (
+        storage,
+        dispatcher,
+        session,
+        bot,
+        trace,
+        _recipe_parser,
+        _shopping_parser,
+    ) = await build_routing_test_context(
+        monkeypatch,
+        tmp_path,
+        recipe_response={
+            "action": "add_recipe",
+            "recipe_name": "солянка",
+            "url": None,
+            "recipe_text": None,
+        },
+    )
+    await storage.save_recipe(
+        chat_id=1,
+        name="Солянка",
+        source_url=None,
+        created_by=42,
+        ingredients=[("солёные огурцы", "2 шт")],
+    )
+    await storage.save_recipe(
+        chat_id=2,
+        name="Солянка",
+        source_url=None,
+        created_by=7,
+        ingredients=[("лимон", "1 шт")],
+    )
+
+    await dispatcher.feed_update(bot, make_text_update(text, chat_id=1))
+
+    parser_trace = [entry for entry in trace if entry[0] in {"recipe", "shopping"}]
+    assert parser_trace == [("recipe", text)]
+    assert [item.name for item in await storage.list_items(chat_id=1)] == [
+        "солёные огурцы, 2 шт"
+    ]
+    assert await storage.list_items(chat_id=2) == []
+    sent = [
+        request
+        for request in session.requests
+        if isinstance(request, SendMessage)
+    ]
+    assert sent
+    assert all(request.chat_id == 1 for request in sent)
+    assert sent[-1].text.startswith("Added ingredients for Солянка")
+
+
+@pytest.mark.asyncio
+async def test_polite_recipe_ai_unknown_falls_through_without_recipe_error(
+    monkeypatch,
+    tmp_path,
+):
+    text = "пожалуйста, купи на солянку"
+    (
+        storage,
+        dispatcher,
+        session,
+        bot,
+        trace,
+        _recipe_parser,
+        _shopping_parser,
+    ) = await build_routing_test_context(
+        monkeypatch,
+        tmp_path,
+        recipe_response={
+            "action": "unknown",
+            "recipe_name": None,
+            "url": None,
+            "recipe_text": None,
+        },
+        shopping_response={
+            "action": "add_items",
+            "items": ["солянка"],
+            "needs_confirmation": False,
+            "clarification_question": None,
+        },
+    )
+
+    await dispatcher.feed_update(bot, make_text_update(text))
+
+    parser_trace = [entry for entry in trace if entry[0] in {"recipe", "shopping"}]
+    assert parser_trace == [("recipe", text), ("shopping", text)]
+    assert [item.name for item in await storage.list_items(chat_id=1)] == ["солянка"]
+    replies = sent_message_texts(session)
+    assert not any("I do not know recipe" in reply for reply in replies)
+    assert not any("could not match" in reply.casefold() for reply in replies)
+
+
+@pytest.mark.asyncio
+async def test_mention_with_adjacent_comma_passes_clean_text_to_parser(
+    monkeypatch,
+    tmp_path,
+):
+    (
+        storage,
+        dispatcher,
+        _session,
+        bot,
+        trace,
+        _recipe_parser,
+        _shopping_parser,
+    ) = await build_routing_test_context(
+        monkeypatch,
+        tmp_path,
+        mode="mention",
+        shopping_response={
+            "action": "add_items",
+            "items": ["молоко"],
+            "needs_confirmation": False,
+            "clarification_question": None,
+        },
+    )
+
+    await dispatcher.feed_update(
+        bot,
+        make_text_update("@HoneyBuyBot, купи молоко"),
+    )
+
+    assert ("shopping", "купи молоко") in trace
+    assert [item.name for item in await storage.list_items(chat_id=1)] == ["молоко"]
+
+
+@pytest.mark.asyncio
+async def test_mention_only_with_comma_parses_replied_text(
+    monkeypatch,
+    tmp_path,
+):
+    (
+        storage,
+        dispatcher,
+        session,
+        bot,
+        trace,
+        _recipe_parser,
+        _shopping_parser,
+    ) = await build_routing_test_context(
+        monkeypatch,
+        tmp_path,
+        mode="mention",
+        shopping_response={
+            "action": "add_items",
+            "items": ["молоко"],
+            "needs_confirmation": False,
+            "clarification_question": None,
+        },
+    )
+
+    await dispatcher.feed_update(
+        bot,
+        make_text_update(
+            "@HoneyBuyBot,",
+            message_id=11,
+            reply_text="купи молоко",
+        ),
+    )
+
+    assert ("shopping", "купи молоко") in trace
+    assert [item.name for item in await storage.list_items(chat_id=1)] == ["молоко"]
+    reactions = [
+        request
+        for request in session.requests
+        if isinstance(request, SetMessageReaction)
+    ]
+    assert [reaction.message_id for reaction in reactions] == [11, 10]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "text", "user_id", "expected_event_count"),
+    [
+        ("off", "купи молоко", 42, 0),
+        ("mention", "купи молоко", 42, 0),
+        ("all", "купи молоко", 7, 1),
+    ],
+)
+async def test_ignored_text_does_not_call_ai_or_mutate_domain_state(
+    monkeypatch,
+    tmp_path,
+    mode,
+    text,
+    user_id,
+    expected_event_count,
+):
+    (
+        storage,
+        dispatcher,
+        session,
+        bot,
+        trace,
+        _recipe_parser,
+        _shopping_parser,
+    ) = await build_routing_test_context(monkeypatch, tmp_path, mode=mode)
+
+    await dispatcher.feed_update(bot, make_text_update(text, user_id=user_id))
+
+    assert trace == []
+    assert await storage.list_items(chat_id=1) == []
+    assert await storage.list_recipes(chat_id=1) == []
+    assert not any(
+        isinstance(request, SendMessage | SetMessageReaction)
+        for request in session.requests
+    )
+    with storage.connect() as db:
+        events = db.execute("SELECT status, error FROM events").fetchall()
+    assert len(events) == expected_event_count
+    if events:
+        assert (events[0]["status"], events[0]["error"]) == (
+            "ignored",
+            "unauthorized_user",
+        )
+
+
+@pytest.mark.asyncio
+async def test_recipe_reuse_does_not_read_recipe_from_another_chat(tmp_path):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    await storage.save_recipe(
+        chat_id=1,
+        name="Солянка",
+        source_url=None,
+        created_by=42,
+        ingredients=[("огурцы", None)],
+    )
+    await storage.authorize_chat(
+        chat_id=-200,
+        chat_type="group",
+        title="Other household",
+        authorized_by=42,
+    )
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="123456:ABCDEF",
+        OWNER_USER_ID=42,
+        OPENAI_API_KEY=None,
+        TEXT_PARSE_MODE="all",
+    )
+    dispatcher = build_dispatcher(settings, storage)
+    session = FakeTelegramSession()
+    bot = Bot(settings.telegram_bot_token, session=session)
+
+    await dispatcher.feed_update(
+        bot,
+        make_text_update(
+            "добавь всё для солянки",
+            chat_id=-200,
+            chat_type="group",
+            user_id=7,
+        ),
+    )
+
+    assert await storage.list_items(chat_id=-200) == []
+    assert await storage.list_items(chat_id=1) == []
+    assert await storage.get_recipe(chat_id=-200, name="солянка") is None
+    assert await storage.get_recipe(chat_id=1, name="солянка") is not None
+    assert any("I do not know recipe" in answer for answer in sent_message_texts(session))
+
+
 @pytest.mark.asyncio
 async def test_default_action_is_used_when_ai_parse_is_unknown():
     parsed = await parse_text_command_with_ai_fallback(
@@ -660,6 +1225,17 @@ async def test_default_action_is_used_when_ai_parse_is_unknown():
 
     assert parsed.action == ParsedAction.ADD_ITEMS
     assert parsed.items == ("яйца", "масло")
+
+
+@pytest.mark.asyncio
+async def test_shopping_ai_unknown_falls_back_without_default_action():
+    parsed = await parse_text_command_with_ai_fallback(
+        "купи молоко",
+        text_parser=FakeUnknownTextParser(),
+    )
+
+    assert parsed.action == ParsedAction.ADD_ITEMS
+    assert parsed.items == ("молоко",)
 
 
 def test_bare_voice_items_require_confirmation():
