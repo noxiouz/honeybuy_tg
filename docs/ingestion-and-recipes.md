@@ -133,7 +133,8 @@ The response must validate as this logical shape:
 
 Validation is strict about JSON field types. The name must be nonempty and at
 least one ingredient is required. Whitespace is collapsed; blank ingredient
-names are removed at the service boundary. Unknown response fields are ignored.
+names are removed at the service boundary. Unknown response fields are rejected
+by the strict schema and lead to the existing recipe-learning failure response.
 
 The extracted name is authoritative when nonblank; the user's requested name
 is the fallback. Thus a model can change the stored display and lookup name.

@@ -12,6 +12,7 @@ from honeybuy_tg.telegram_bot import strip_bot_mention
 
 
 SHIPPED_CASES = load_corpus().cases
+AI_RECIPE_CASES = [case for case in SHIPPED_CASES if "ai-route" in case.tags]
 DETERMINISTIC_RECIPE_CASES = [
     case for case in SHIPPED_CASES if "deterministic" in case.tags
 ]
@@ -109,6 +110,39 @@ def model_response(payload, *, input_tokens=0, output_tokens=0):
 
 def corpus_case(case_id: str) -> RoutingCase:
     return next(case for case in SHIPPED_CASES if case.id == case_id)
+
+
+@pytest.mark.parametrize(
+    "case",
+    AI_RECIPE_CASES,
+    ids=lambda case: case.id,
+)
+def test_ai_route_corpus_cases_cannot_short_circuit_to_deterministic(case):
+    text = live_compare.command_text_for_case(
+        case,
+        bot_username=live_compare.DEFAULT_BOT_USERNAME,
+    )
+
+    assert live_compare.deterministic_recipe_result(text) is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    DETERMINISTIC_RECIPE_CASES,
+    ids=lambda case: case.id,
+)
+def test_deterministic_corpus_tags_match_execution_and_expected_result(case):
+    text = live_compare.command_text_for_case(
+        case,
+        bot_username=live_compare.DEFAULT_BOT_USERNAME,
+    )
+
+    actual = live_compare.deterministic_recipe_result(text)
+
+    assert actual is not None
+    assert actual.route == case.expected.route
+    assert actual.action == case.expected.action
+    assert grade_case(case, actual).passed
 
 
 @pytest.mark.parametrize(
