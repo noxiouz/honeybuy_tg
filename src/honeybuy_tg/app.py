@@ -17,13 +17,13 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args == ["healthcheck"]:
         try:
-            healthcheck_settings = load_healthcheck_settings()
+            database_settings = load_healthcheck_settings()
         except ValidationError as error:
             raise SystemExit(
                 "Invalid healthcheck configuration: DATABASE_PATH is required"
             ) from error
         try:
-            health = healthcheck_database_path(healthcheck_settings.database_path)
+            health = healthcheck_database_path(database_settings.database_path)
         except RuntimeError as error:
             raise SystemExit(f"Healthcheck failed: {error}") from error
         print(
@@ -33,23 +33,24 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         return
 
-    try:
-        settings = load_settings()
-    except ValidationError as error:
-        raise SystemExit(f"Invalid configuration: {error}") from error
-
     if args == ["migrate"]:
-        result = migrate_database_path(settings.database_path)
+        try:
+            database_settings = load_healthcheck_settings()
+        except ValidationError as error:
+            raise SystemExit(
+                "Invalid migrate configuration: DATABASE_PATH is required"
+            ) from error
+        result = migrate_database_path(database_settings.database_path)
         if result.changed:
             applied = ", ".join(str(version) for version in result.applied_versions)
             print(
-                f"Migrated {settings.database_path}: "
+                f"Migrated {database_settings.database_path}: "
                 f"user_version {result.old_version} -> {result.new_version} "
                 f"(applied {applied}, integrity {result.integrity_check})"
             )
         else:
             print(
-                f"Database already current at {settings.database_path}: "
+                f"Database already current at {database_settings.database_path}: "
                 f"user_version {result.new_version} "
                 f"(integrity {result.integrity_check})"
             )
@@ -57,6 +58,11 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args:
         raise SystemExit("Usage: python -m honeybuy_tg [migrate|healthcheck]")
+
+    try:
+        settings = load_settings()
+    except ValidationError as error:
+        raise SystemExit(f"Invalid configuration: {error}") from error
 
     logging.basicConfig(
         level=settings.log_level.upper(),
