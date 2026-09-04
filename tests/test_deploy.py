@@ -399,6 +399,103 @@ def _bootstrap_marker_parser(source: str) -> str:
     return words[script_index]
 
 
+def _run_bootstrap_preflight(
+    installer: str,
+    tmp_path: Path,
+    *,
+    marker_exists: bool,
+    mismatch: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    candidate_sha = "a" * 40
+    repo_root = tmp_path / "installer-source"
+    app_dir = tmp_path / "app"
+    state_dir = tmp_path / "state"
+    marker = state_dir / "bootstrap-journal.json"
+    deployed_state = state_dir / "deployed-sha"
+    required_artifacts = (
+        "deploy/ubuntu/release_controller.py",
+        "deploy/ubuntu/allowed_signers",
+        "deploy/systemd/honeybuy-tg.service",
+        "deploy/systemd/honeybuy-release-controller.service",
+        "deploy/systemd/honeybuy-release-controller.timer",
+    )
+
+    if marker_exists:
+        marker.parent.mkdir(parents=True)
+        marker.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "candidate_sha": candidate_sha,
+                    "phase": "awaiting_service",
+                    "phases": BOOTSTRAP_PHASES,
+                }
+            ),
+            encoding="utf-8",
+        )
+        deployed_state.write_text(f"{candidate_sha}\n", encoding="ascii")
+        for relative_path in required_artifacts:
+            source = repo_root / relative_path
+            prepared = app_dir / "releases" / candidate_sha / relative_path
+            source.parent.mkdir(parents=True, exist_ok=True)
+            prepared.parent.mkdir(parents=True, exist_ok=True)
+            payload = f"exact artifact: {relative_path}\n"
+            source.write_text(payload, encoding="utf-8")
+            prepared.write_text(payload, encoding="utf-8")
+        if mismatch is not None:
+            (repo_root / mismatch).write_text(
+                "installer came from another revision\n",
+                encoding="utf-8",
+            )
+
+    function_definitions = "\n".join(
+        f"{name}() {{\n{body}}}"
+        for name, body in _shell_functions(installer).items()
+    )
+    preflight_name = next(
+        name
+        for name, body in _shell_functions(installer).items()
+        if "$BOOTSTRAP_JOURNAL_FILE" in body
+        and "python3" in body
+        and "awaiting_service" in body
+    )
+    harness = f"""
+set -euo pipefail
+BOOTSTRAP_JOURNAL_FILE={shlex.quote(str(marker))}
+DEPLOYED_STATE_FILE={shlex.quote(str(deployed_state))}
+REPO_ROOT={shlex.quote(str(repo_root))}
+APP_DIR={shlex.quote(str(app_dir))}
+{function_definitions}
+assert_not_symlink() {{
+  [[ ! -L "$1" ]] || fail "unexpected test symlink"
+}}
+assert_safe_existing() {{
+  if [[ -e "$1" ]]; then
+    [[ -f "$1" && ! -L "$1" ]] || fail "unsafe test fixture"
+  fi
+}}
+stat() {{
+  if [[ "$1" == -c && "$2" == %h ]]; then
+    local target=$3
+    if [[ "$target" == -- ]]; then
+      target=$4
+    fi
+    {shlex.quote(sys.executable)} -c \
+      'import os,sys; print(os.lstat(sys.argv[1]).st_nlink)' "$target"
+    return
+  fi
+  fail "unexpected stat invocation in bootstrap preflight test: $*"
+}}
+{preflight_name}
+"""
+    return subprocess.run(
+        ["bash", "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _configure_healthcheck(
     monkeypatch,
     tmp_path: Path,
@@ -786,6 +883,13 @@ def test_installer_uses_fixed_absolute_security_sensitive_paths():
 def test_installer_stops_timer_and_holds_the_controller_lock_during_overwrite():
     installer = _repo_text("deploy/ubuntu/install.sh")
     lines = _shell_logical_lines(installer)
+    preflight_name = next(
+        name
+        for name, body in _shell_functions(installer).items()
+        if "$BOOTSTRAP_JOURNAL_FILE" in body
+        and "python3" in body
+        and "awaiting_service" in body
+    )
     timer_stop = next(
         index
         for index, line in enumerate(lines)
@@ -818,6 +922,12 @@ def test_installer_stops_timer_and_holds_the_controller_lock_during_overwrite():
     )
     flock_words = shlex.split(lines[flock_index], comments=True)
     assert "-x" in flock_words or "--exclusive" in flock_words
+    revision_guard = next(
+        index
+        for index, line in enumerate(lines)
+        if index > flock_index
+        and preflight_name in shlex.split(line, comments=True)
+    )
 
     protected_installs = []
     for source in (
@@ -834,7 +944,13 @@ def test_installer_stops_timer_and_holds_the_controller_lock_during_overwrite():
         ]
         assert len(matches) == 1
         protected_installs.append(matches[0])
-    assert timer_stop < lock_open < flock_index < min(protected_installs)
+    assert (
+        lock_open
+        < flock_index
+        < revision_guard
+        < timer_stop
+        < min(protected_installs)
+    )
     unlocks = [
         index
         for index, line in enumerate(lines)
@@ -944,8 +1060,8 @@ def test_installer_quiesces_and_rejects_journal_before_host_mutation():
         )
     ]
     assert host_mutation_indexes
-    assert timer_stop_index < lock_index < journal_guard_index < journal_guard_end
-    assert journal_guard_end < min(host_mutation_indexes)
+    assert lock_index < journal_guard_index < journal_guard_end < timer_stop_index
+    assert timer_stop_index < min(host_mutation_indexes)
 
 
 def test_installer_creates_separate_users_and_narrow_directory_ownership():
@@ -1718,7 +1834,10 @@ def test_installer_preflights_bootstrap_journal_under_lock_before_host_mutation(
                 )
                 or (
                     Path(words[0]).name == "systemctl"
-                    and any(action in words for action in ("daemon-reload", "enable"))
+                    and any(
+                        action in words
+                        for action in ("stop", "disable", "daemon-reload", "enable")
+                    )
                 )
             )
         )
@@ -1726,6 +1845,127 @@ def test_installer_preflights_bootstrap_journal_under_lock_before_host_mutation(
     assert mutation_indexes
     assert flock_index < preflight_index < min(mutation_indexes)
     assert "fail" in preflight_body or "fail" in lines[preflight_index]
+
+
+def test_exact_bootstrap_marker_requires_installer_from_prepared_revision():
+    installer = _repo_text("deploy/ubuntu/install.sh")
+    preflight_bodies = [
+        body
+        for body in _shell_functions(installer).values()
+        if "$BOOTSTRAP_JOURNAL_FILE" in body
+        and "python3" in body
+        and "awaiting_service" in body
+    ]
+    assert len(preflight_bodies) == 1
+    preflight_body = preflight_bodies[0]
+    lines = _shell_logical_lines(preflight_body)
+
+    absent_guard = next(
+        index
+        for index, line in enumerate(lines)
+        if re.match(r"^if\b", line)
+        and "$BOOTSTRAP_JOURNAL_FILE" in line
+        and re.search(r"(?:^|\s)!?\s*-(?:e|f)(?:\s|\b)", line)
+    )
+    absent_guard_end = next(
+        index
+        for index in range(absent_guard + 1, len(lines))
+        if re.match(r"^fi\b", lines[index])
+    )
+    assert any(
+        re.fullmatch(r"return\s+0", line)
+        for line in lines[absent_guard + 1 : absent_guard_end]
+    ), "an absent bootstrap journal must skip the revision comparison"
+
+    required_artifacts = (
+        "deploy/ubuntu/release_controller.py",
+        "deploy/ubuntu/allowed_signers",
+        "deploy/systemd/honeybuy-tg.service",
+        "deploy/systemd/honeybuy-release-controller.service",
+        "deploy/systemd/honeybuy-release-controller.timer",
+    )
+    for relative_path in required_artifacts:
+        assert relative_path in preflight_body
+
+    prepared_release = next(
+        index
+        for index, line in enumerate(lines)
+        if "$APP_DIR/releases/" in line
+        and re.search(r"\$\{?deployed_sha\}?", line)
+    )
+    journal_validation = next(
+        index
+        for index, line in enumerate(lines)
+        if "$marker_status" in line and re.search(r"(?:==|-eq)\s*0", line)
+    )
+    assert absent_guard_end < journal_validation < prepared_release
+
+    source_checks = [
+        line
+        for line in lines[prepared_release:]
+        if "$REPO_ROOT/" in line and "-f" in line and "-L" in line
+    ]
+    prepared_checks = [
+        line
+        for line in lines[prepared_release:]
+        if re.search(r"\$(?:prepared_)?release/", line)
+        and "-f" in line
+        and "-L" in line
+    ]
+    assert source_checks, "installer sources must be regular non-symlinks"
+    assert prepared_checks, "prepared-release artifacts must be regular non-symlinks"
+
+    comparisons = [
+        line
+        for line in lines[prepared_release:]
+        if (words := shlex.split(line, comments=True))
+        and "cmp" in [Path(word).name for word in words]
+        and "$REPO_ROOT/" in line
+        and re.search(r"\$(?:prepared_)?release/", line)
+    ]
+    assert comparisons, "all control-plane artifacts must be compared byte-for-byte"
+    comparison_index = lines.index(comparisons[0])
+    assert comparison_index > prepared_release
+
+    actionable_failures = [
+        line.casefold()
+        for line in lines[comparison_index:]
+        if "fail" in shlex.split(line, comments=True)
+    ]
+    assert any(
+        "exact" in line
+        and "revision" in line
+        and ("$deployed_sha" in line or "prepared" in line)
+        for line in actionable_failures
+    ), "revision mismatch must explain how to rerun the exact prepared revision"
+
+
+def test_bootstrap_revision_preflight_accepts_only_exact_artifacts(tmp_path):
+    installer = _repo_text("deploy/ubuntu/install.sh")
+    exact = _run_bootstrap_preflight(
+        installer,
+        tmp_path / "exact",
+        marker_exists=True,
+    )
+    no_marker = _run_bootstrap_preflight(
+        installer,
+        tmp_path / "no-marker",
+        marker_exists=False,
+    )
+    mismatch = _run_bootstrap_preflight(
+        installer,
+        tmp_path / "mismatch",
+        marker_exists=True,
+        mismatch="deploy/ubuntu/release_controller.py",
+    )
+
+    assert exact.returncode == 0, exact.stderr
+    assert no_marker.returncode == 0, no_marker.stderr
+    assert mismatch.returncode != 0
+    mismatch_output = f"{mismatch.stdout}\n{mismatch.stderr}".casefold()
+    assert "exact" in mismatch_output
+    assert "revision" in mismatch_output
+    assert "a" * 40 in mismatch_output or "prepared" in mismatch_output
 
 
 def test_awaiting_service_preflight_requires_exact_inactive_managed_unit():

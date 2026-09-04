@@ -450,9 +450,12 @@ installer passes:
    existing database, creates `current` and `deployed-sha`, and leaves an exact
    `awaiting_service` bootstrap journal. It neither migrates nor starts the bot.
 3. **Second installer pass:** while the bot remains inactive, rerun the same
-   installer revision. It validates that exact pending state, installs the bot
-   unit, changes the control-plane manifest to `installed`, and enables the bot
-   service and the persistent timer.
+   installer revision. It validates that exact pending state and byte-compares
+   all five control-plane artifacts with the prepared immutable release before
+   changing the timer or installed control plane. It then installs the bot unit,
+   changes the control-plane manifest to `installed`, and enables the bot
+   service and the persistent timer. A mismatch is a hard stop: rerun the
+   installer from the exact reviewed candidate revision named in the error.
 4. **Start and confirm:** start `honeybuy-tg.service`, confirm its
    `ExecStartPre` and process are healthy, then wait for the next timer run or
    start `honeybuy-release-controller.service` once more. Only an `installed`
