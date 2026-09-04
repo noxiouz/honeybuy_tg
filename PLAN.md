@@ -243,7 +243,7 @@ Optional metrics:
   the required `offline` job for the final `main` push.
 - [x] Obtain final independent review of the integrated guarded-deployment
   change.
-- [ ] Configure and verify the required public-GitHub `main` ruleset: strict
+- [x] Configure and verify the required public-GitHub `main` ruleset: strict
   `offline`, Rebase and merge only, linear history, no force/delete, and no
   administrator or actor bypass.
 - [ ] Complete and verify the two-pass legacy production bootstrap.
@@ -312,15 +312,11 @@ Optional metrics:
 
 1. Run the mandatory Linux/root/systemd containment step on the final `main`
    push; the same-repository PR check is green.
-2. Configure and verify the public GitHub `main` rules: pull requests, Rebase
-   and merge only, strict/up-to-date exact check `offline`, linear history, no
-   force push or deletion, and no administrator or actor bypass. Do not require
-   signed commits on rewritten `main`.
-3. From the exact reviewed source revision, take and verify an off-path
+2. From the exact reviewed source revision, take and verify an off-path
    production database backup and perform the documented two-pass legacy
    bootstrap. Invoke the controller only through its systemd service and leave
    the timer disabled until the second installer pass records `installed`.
-4. Verify the bootstrap receipt, deployed SHA, `current`/`previous` links,
+3. Verify the bootstrap receipt, deployed SHA, `current`/`previous` links,
    installed control-plane manifest, timer schedule, controller journals,
    quarantine, backup permissions, database-only health check, and stable bot
    service. Do not return to `git pull`, `rsync`, or in-place release updates.
