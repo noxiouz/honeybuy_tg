@@ -2371,7 +2371,7 @@ def test_allowed_signer_is_git_scoped_and_matches_expected_fingerprint():
     assert fingerprint == EXPECTED_SIGNER_FINGERPRINT
 
 
-def test_installer_validates_signer_and_never_replaces_existing_trust():
+def test_installer_validates_signer_and_never_replaces_existing_trust(tmp_path):
     installer = _repo_text("deploy/ubuntu/install.sh")
     assert EXPECTED_SIGNER_FINGERPRINT in installer
     assert 'namespaces="git"' in installer
@@ -2384,30 +2384,86 @@ def test_installer_validates_signer_and_never_replaces_existing_trust():
         and _line_has_shell_target(line, ("$ALLOWED_SIGNERS_FILE",))
         for line in _shell_logical_lines(installer)
     )
+    install_commands = [
+        shlex.split(line, comments=True)
+        for line in _shell_logical_lines(installer)
+        if "install"
+        in [Path(word).name for word in shlex.split(line, comments=True)]
+    ]
+    assert not any(
+        {"-n", "--no-clobber"}.intersection(words) for words in install_commands
+    )
+
+    install_once_name = "install_file_if_absent"
+    install_once_body = _shell_functions(installer)[install_once_name]
+    assert re.search(r"(?m)^\s*temporary=.*\bmktemp\b", install_once_body)
+    assert re.search(r"(?m)^\s*if\s+ln\s+-T\s+--\s+", install_once_body)
+    assert re.search(
+        r'\[\[\s+-e\s+"\$destination"\s+\|\|\s+-L\s+"\$destination"\s+\]\]',
+        install_once_body,
+    )
+
     signer_installs = [
         line
-        for line in _install_line_for(
-            installer,
-            "$ALLOWED_SIGNERS_FILE",
-            directory=False,
-        )
-        if "deploy/ubuntu/allowed_signers" in line
+        for line in _shell_logical_lines(installer)
+        if shlex.split(line, comments=True)
+        and shlex.split(line, comments=True)[0] == install_once_name
     ]
     assert len(signer_installs) == 1
     words = shlex.split(signer_installs[0], comments=True)
-    assert "-n" in words or "--no-clobber" in words
-    _assert_install_ownership(
-        installer,
+    assert words == [
+        install_once_name,
+        "$REPO_ROOT/deploy/ubuntu/allowed_signers",
         "$ALLOWED_SIGNERS_FILE",
-        owner="root",
-        group="root",
-        directory=False,
-        mode=0o644,
-    )
+        "0644",
+        "root",
+        "root",
+    ]
     assert not re.search(
-        r"\b(?:rm|mv)\b[^\n]*(?:\$ALLOWED_SIGNERS_FILE|allowed_signers)",
+        r"\bmv\b[^\n]*(?:\$ALLOWED_SIGNERS_FILE|allowed_signers)",
         installer,
     )
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_text("trusted signer\n", encoding="utf-8")
+    invoke_install_once = f"""
+set -euo pipefail
+fail() {{
+  printf '%s\n' "$1" >&2
+  exit 1
+}}
+ln() {{
+  if [[ "${{1:-}}" == -T ]]; then shift; fi
+  if [[ "${{1:-}}" == -- ]]; then shift; fi
+  command ln "$@"
+}}
+{install_once_name}() {{
+{install_once_body}
+}}
+{install_once_name} "$1" "$2" 0644 "$3" "$4"
+"""
+    command = [
+        "bash",
+        "-c",
+        invoke_install_once,
+        "--",
+        str(source),
+        str(destination),
+        str(source.stat().st_uid),
+        str(source.stat().st_gid),
+    ]
+
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    original_inode = destination.stat().st_ino
+    assert destination.read_text(encoding="utf-8") == "trusted signer\n"
+    assert destination.stat().st_mode & 0o777 == 0o644
+
+    source.write_text("rotated signer\n", encoding="utf-8")
+    subprocess.run(command, check=True, capture_output=True, text=True)
+
+    assert destination.stat().st_ino == original_inode
+    assert destination.read_text(encoding="utf-8") == "trusted signer\n"
 
 
 def test_migrate_cli_runs_without_starting_bot(tmp_path, monkeypatch, capsys):

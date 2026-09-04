@@ -246,6 +246,37 @@ atomic_replace_file() {
   mv -T -- "$temporary" "$destination"
 }
 
+install_file_if_absent() {
+  local source=$1
+  local destination=$2
+  local mode=$3
+  local owner=$4
+  local group=$5
+  local destination_dir
+  local temporary
+
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    return 0
+  fi
+
+  destination_dir=$(dirname -- "$destination")
+  temporary=$(mktemp "$destination_dir/.${destination##*/}.XXXXXXXX")
+  if ! install -m "$mode" -o "$owner" -g "$group" "$source" "$temporary"; then
+    rm -f -- "$temporary"
+    fail "could not prepare $destination"
+  fi
+  if ln -T -- "$temporary" "$destination" 2>/dev/null; then
+    rm -f -- "$temporary"
+    return 0
+  fi
+
+  rm -f -- "$temporary"
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    return 0
+  fi
+  fail "could not install $destination without replacing it"
+}
+
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   fail "run this installer as root"
 fi
@@ -422,7 +453,10 @@ fi
 
 validate_signer_file "$REPO_ROOT/deploy/ubuntu/allowed_signers"
 validate_signer_file "$ALLOWED_SIGNERS_FILE"
-install -n -m 0644 -o root -g root "$REPO_ROOT/deploy/ubuntu/allowed_signers" "$ALLOWED_SIGNERS_FILE"
+install_file_if_absent \
+  "$REPO_ROOT/deploy/ubuntu/allowed_signers" \
+  "$ALLOWED_SIGNERS_FILE" \
+  0644 root root
 validate_signer_file "$ALLOWED_SIGNERS_FILE"
 
 STAGING_DIR=$(mktemp -d /tmp/honeybuy-install.XXXXXXXX)
