@@ -2,7 +2,8 @@
 
 ## System Context
 
-Honeybuy runs as a single Python process. Aiogram long-polls Telegram and
+Honeybuy's request-serving runtime is a single Python process. Aiogram
+long-polls Telegram and
 dispatches updates to handlers built inside `build_dispatcher`. The handlers
 authorize the request, call domain or infrastructure helpers, persist state in
 SQLite, and send or edit Telegram messages.
@@ -49,25 +50,41 @@ Both reach `app.main` in
 [`src/honeybuy_tg/app.py`](../src/honeybuy_tg/app.py). Startup proceeds as
 follows:
 
-1. Load and validate `Settings` from the process environment and `.env`.
-2. If the sole argument is `migrate`, migrate the configured SQLite database,
-   run `PRAGMA integrity_check`, print the result, and exit.
-3. Configure process logging.
-4. Start the Prometheus exporter if enabled.
-5. Construct `Storage` and enter the asynchronous bot runtime.
-6. `run_bot` initializes or migrates the database, creates the Telegram bot,
+1. Inspect the command-line arguments.
+2. For `migrate` or `healthcheck`, load only `DATABASE_PATH`, perform the
+   database command, and exit without loading bot settings or contacting the
+   network.
+3. With no arguments, load and validate the full `Settings` from the process
+   environment and `.env`.
+4. Configure process logging.
+5. Start the Prometheus exporter if enabled.
+6. Construct `Storage` and enter the asynchronous bot runtime.
+7. `run_bot` initializes or migrates the database, creates the Telegram bot,
    registers slash-command suggestions, builds the dispatcher, and starts long
    polling.
 
-Any other command-line arguments terminate with usage guidance. Settings are
-validated before argument dispatch, so the migrate-only command still needs a
-valid bot token and owner identity in the current implementation.
+Any other command-line arguments terminate with usage guidance.
+
+## Manual Deployment
+
+The operator selects, builds, and installs releases manually. CI runs offline
+checks and has no deployment job.
+
+The systemd template `deploy/systemd/honeybuy-tg.service` starts the release
+selected by `/opt/honeybuy-tg/current` as the `honeybuy` user. Runtime secrets
+come from `/etc/honeybuy-tg/env`, and SQLite stays outside release directories
+under `/var/lib/honeybuy-tg`. Its `ExecStartPre` runs the application's
+database-only health check. Migration is an explicit operator step before
+starting a new release.
+
+See [Operations And Testing](operations-and-testing.md#manual-ubuntu-deployment)
+for the manual procedure.
 
 ## Module Boundaries
 
 | Module | Responsibility | Important entry points |
 | --- | --- | --- |
-| `app.py` | Process composition and the migration CLI | `main` |
+| `app.py` | Bot composition and database-only maintenance commands | `main` |
 | `config.py` | Environment parsing, defaults, and owner validation | `Settings`, `load_settings` |
 | `telegram_bot.py` | Aiogram routes, access checks, inline queries and callbacks, dependency construction, reply context, Telegram I/O, and voice conversion | `build_dispatcher`, `run_bot` |
 | `service.py` | Shopping and recipe use cases, inline-item normalization, identity matching, backfill, and deduplication | `ShoppingListService` |
