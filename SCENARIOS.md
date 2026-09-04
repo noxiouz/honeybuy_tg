@@ -108,6 +108,41 @@ Given the bot starts,
 when it configures Telegram commands,
 then Telegram should expose suggestions for all supported slash commands.
 
+## Routing Diagnostics
+
+### TRACE-001 Explain An Incoming Message
+
+Given the configured owner has access to the current chat,
+when they send `/trace 123` or reply to the original incoming message with
+`/trace`,
+then the bot returns its recent routing stages without calling AI. The lookup
+uses only the current chat and that incoming message ID. A reply to a bot
+response does not infer the original request. In a group the explanation is
+visible to the group.
+
+Only one positive ASCII message ID up to `2147483647` is accepted. Arguments
+combined with a reply, extra arguments, and external or cross-chat replies are
+rejected. Missing and expired traces receive the same response. Non-owners and
+owners in unauthorized chats cannot retrieve traces.
+
+### TRACE-002 Bounded Private Diagnostics
+
+Given an incoming `Update.message`, including ignored text or unsupported media,
+when routing completes, fails, or is cancelled,
+then diagnostics record a bounded sequence of stable stage/reason/outcome codes
+and an independent correlation ID. AI metadata describes the configured model,
+prompt revision, duration and validation result where applicable; it contains
+no prompt, input, transcript, audio, recipe body, response payload, secret,
+username, or arbitrary exception text. Unknown configured model names are
+redacted. Trace failures do not change the shopping, recipe, or voice result.
+
+Traces expire after 24 hours and storage retains at most 1,000 records with at
+most 32 events per record. Reads and writes prune expired traces; there is no
+background cleanup. Context is reset after every request, including failures
+and cancellations. Callbacks, inline updates, edits, channel/business posts,
+membership and reaction updates are outside this message trace scope. Existing
+raw-content event history is separate and is not sanitized by this feature.
+
 ## Shopping List Commands
 
 ### SHOP-001 Add Item

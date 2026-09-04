@@ -28,6 +28,7 @@ also means:
 | `authorized_chats` | `chat_id` | Groups explicitly authorized by the owner; authorization is upserted |
 | `shopping_items` | generated `id`, every query constrained by `chat_id` | Active, bought, and removed item history; ordinary cleanup changes status rather than deleting rows |
 | `events` | generated `id`, contains `chat_id` and `user_id` | Selective input, parse, and error diagnostics; not a complete audit log |
+| `routing_traces` | `(chat_id, message_id)` | Bounded typed routing diagnostics, 24-hour expiry and global 1,000-record cap |
 | `bot_messages` | `(chat_id, message_id)` | Telegram response kind and item IDs for reply-context actions |
 | `pending_confirmations` | generated `id`, looked up with `chat_id` | Single-use voice and recipe-overwrite confirmation state encoded in JSON |
 | `inline_capture_intents` | SHA-256 `token_hash`, every lookup also bound to `requester_id` | Expiring, single-use authority to add one literal item to an explicit private or authorized-group destination |
@@ -300,6 +301,28 @@ A pasted recipe can therefore remain in `events.raw_text` after the recipe is
 deleted. There is no redaction or retention policy. Database backups inherit the
 same sensitive content.
 
+## Routing Traces
+
+Routing diagnostics use `routing_traces`, independently of `events`. A trace
+contains a correlation ID, rule revision, terminal outcome and at most 32
+typed events. Only finite reason/stage/status codes and bounded safe AI
+model/revision/timing metadata are accepted. Input text, prompts, transcripts,
+audio, recipe bodies, model output and arbitrary exception strings are not
+part of this schema. Unknown configured model names are redacted. Serialized
+records are capped at 16 KiB and owner-facing output at 4,096 characters.
+
+Rows expire after 24 hours. Trace reads and writes opportunistically remove
+expired rows, and writes trim the global store to the newest 1,000 records in
+deterministic order. Expired traces cannot be retrieved even while the bot is
+idle; physical deletion happens on later trace activity, without a background
+job. Backups and SQLite free pages are not securely erased by this retention
+policy. This feature does not clean or migrate sensitive historical `events`.
+
+Lookup requires an explicit current-chat ID and incoming message ID. It never
+uses request context as tenant authority. Trace persistence and lookup failures
+are isolated from domain operations; traces are diagnostic evidence, not a
+complete audit or transaction ledger.
+
 ## Caches
 
 Both caches persist an absolute `expires_at` and are upserted with a configurable
@@ -313,7 +336,7 @@ to the global identity cache.
 
 ## Migrations
 
-The current schema version is `2`, stored in `PRAGMA user_version`.
+The current schema version is `3`, stored in `PRAGMA user_version`.
 `run_migrations`:
 
 1. acquires `BEGIN IMMEDIATE` when it does not already own a transaction;
@@ -325,7 +348,9 @@ The current schema version is `2`, stored in `PRAGMA user_version`.
 Version 1 creates missing tables and indexes and repairs a few known legacy
 table shapes by adding canonical identity and shop-category columns. It does not
 backfill identity values. Version 2 adds the inline-capture intent table and its
-requester/status/creation index without changing existing rows. If a database
+requester/status/creation index without changing existing rows. Version 3 adds
+the bounded routing-trace table and retention index without modifying existing
+domain or event rows. If a database
 already advertises the current version, the migration runner does not reconcile
 arbitrary missing schema objects.
 

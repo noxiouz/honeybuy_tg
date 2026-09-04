@@ -1,4 +1,7 @@
 import json
+import asyncio
+from contextlib import asynccontextmanager
+from time import monotonic
 from pathlib import Path
 import re
 from typing import Literal, TypeVar
@@ -15,6 +18,7 @@ from pydantic import (
 
 from honeybuy_tg.metrics import AIRequestReport, record_ai_request_async
 from honeybuy_tg.models import ItemIdentity
+from honeybuy_tg.tracing import Reason, Stage, record
 from honeybuy_tg.prompts import (
     CATEGORY_PROMPT,
     ITEM_NORMALIZATION_PROMPT,
@@ -22,10 +26,42 @@ from honeybuy_tg.prompts import (
     RECIPE_EXTRACT_PROMPT,
     SHOPPING_TEXT_PROMPT,
     VOICE_TRANSCRIPTION_PROMPT,
+    PromptSpec,
 )
 
 
 ResponseModelT = TypeVar("ResponseModelT", bound="AIResponseModel")
+
+
+@asynccontextmanager
+async def traced_ai_request(*, spec: PromptSpec, model: str):
+    """Keep metrics and provider semantics intact; trace only closed metadata."""
+    report = None
+    started = monotonic()
+    reason = Reason.ERROR
+    schema = "not_validated"
+    try:
+        async with record_ai_request_async(operation=spec.operation) as report:
+            yield report
+        reason = Reason.VALIDATED
+        schema = "not_applicable" if spec.operation == "voice_transcription" else "valid"
+    except asyncio.CancelledError:
+        reason = Reason.CANCELLED
+        raise
+    except Exception:
+        if report is not None and report.status == "invalid_response":
+            reason = Reason.INVALID_SCHEMA
+            schema = "invalid"
+        raise
+    finally:
+        if spec.operation == "voice_transcription":
+            schema = "not_applicable"
+        try:
+            record(Stage.AI, reason, operation=spec.operation, revision=spec.revision,
+                   fingerprint=spec.fingerprint, model=model, schema=schema,
+                   duration_ms=min(86400000, max(0, int((monotonic() - started) * 1000))))
+        except Exception:
+            pass
 
 
 def clean_required_text(value: str) -> str:
@@ -164,7 +200,7 @@ class VoiceTranscriber:
         self.model = model
 
     async def transcribe(self, audio_path: Path) -> str:
-        async with record_ai_request_async(operation="voice_transcription"):
+        async with traced_ai_request(spec=VOICE_TRANSCRIPTION_PROMPT, model=self.model):
             with audio_path.open("rb") as audio_file:
                 result = await self.client.audio.transcriptions.create(
                     file=audio_file,
@@ -188,7 +224,7 @@ class ShoppingItemCategorizer:
         if not items:
             return {}
 
-        async with record_ai_request_async(operation="category_parse") as report:
+        async with traced_ai_request(spec=CATEGORY_PROMPT, model=self.model) as report:
             result = await self.client.responses.create(
                 model=self.model,
                 instructions=CATEGORY_PROMPT.instructions,
@@ -220,7 +256,7 @@ class ShoppingItemNormalizer:
         if not unique_names:
             return {}
 
-        async with record_ai_request_async(operation="item_normalize") as report:
+        async with traced_ai_request(spec=ITEM_NORMALIZATION_PROMPT, model=self.model) as report:
             result = await self.client.responses.create(
                 model=self.model,
                 instructions=ITEM_NORMALIZATION_PROMPT.instructions,
@@ -250,7 +286,7 @@ class ShoppingTextParser:
         self.model = model
 
     async def parse(self, text: str) -> dict[str, object]:
-        async with record_ai_request_async(operation="text_parse") as report:
+        async with traced_ai_request(spec=SHOPPING_TEXT_PROMPT, model=self.model) as report:
             result = await self.client.responses.create(
                 model=self.model,
                 instructions=SHOPPING_TEXT_PROMPT.instructions,
@@ -278,7 +314,7 @@ class RecipeExtractor:
         source_url: str | None,
         page_text: str,
     ) -> dict[str, object]:
-        async with record_ai_request_async(operation="recipe_extract") as report:
+        async with traced_ai_request(spec=RECIPE_EXTRACT_PROMPT, model=self.model) as report:
             result = await self.client.responses.create(
                 model=self.model,
                 instructions=RECIPE_EXTRACT_PROMPT.instructions,
@@ -307,7 +343,7 @@ class RecipeCommandParser:
         self.model = model
 
     async def parse(self, text: str) -> dict[str, object]:
-        async with record_ai_request_async(operation="recipe_command_parse") as report:
+        async with traced_ai_request(spec=RECIPE_COMMAND_PROMPT, model=self.model) as report:
             result = await self.client.responses.create(
                 model=self.model,
                 instructions=RECIPE_COMMAND_PROMPT.instructions,

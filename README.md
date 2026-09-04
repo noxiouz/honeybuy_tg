@@ -136,6 +136,11 @@ for the operator procedure and runtime prerequisites.
 - `/delete_recipe solyanka` - delete a saved recipe from the current chat.
 - `/reanalyze` - reanalyze a replied-to voice message.
 - `/text_parse_mode` - configure natural text parsing for the current chat.
+- `/trace 123` - owner-only routing explanation for a recent incoming message
+  in this chat; alternatively reply to that incoming message with `/trace`.
+  Explanations posted in a group are visible to its members. Traces contain
+  bounded diagnostic codes, expire after 24 hours, and never call AI to explain
+  a decision.
 
 ## Cross-Chat Inline Capture
 

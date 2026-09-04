@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from honeybuy_tg.migrations import run_migrations
+from honeybuy_tg.tracing import MAX_BYTES, MAX_RECORDS, clean_trace
 from honeybuy_tg.models import (
     ItemIdentity,
     ItemStatus,
@@ -106,6 +107,46 @@ class Storage:
     async def init(self) -> None:
         with self.connect() as db:
             run_migrations(db, database_path=self.database_path)
+
+    @staticmethod
+    def _prune_routing_traces(db: sqlite3.Connection, now: datetime) -> None:
+        db.execute("DELETE FROM routing_traces WHERE created_at <= ?",
+                   (serialize_datetime(now - timedelta(hours=24)),))
+        db.execute("""DELETE FROM routing_traces WHERE rowid IN (
+            SELECT rowid FROM routing_traces
+            ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?
+        )""", (MAX_RECORDS,))
+
+    async def save_routing_trace(self, *, chat_id: int, message_id: int,
+                                 trace: dict, now: datetime | None = None) -> None:
+        try:
+            payload = json.dumps(clean_trace(trace))
+            timestamp = now if now is not None else datetime.now(UTC)
+            with self.connect() as db:
+                db.execute("PRAGMA busy_timeout = 0")
+                db.execute("""INSERT OR REPLACE INTO routing_traces
+                    (chat_id, message_id, created_at, trace_json) VALUES (?, ?, ?, ?)""",
+                           (chat_id, message_id, serialize_datetime(timestamp), payload))
+                self._prune_routing_traces(db, timestamp)
+                db.commit()
+        except Exception:
+            return
+
+    async def get_routing_trace(self, *, chat_id: int, message_id: int,
+                                now: datetime | None = None) -> dict | None:
+        try:
+            timestamp = now if now is not None else datetime.now(UTC)
+            with self.connect() as db:
+                db.execute("PRAGMA busy_timeout = 0")
+                self._prune_routing_traces(db, timestamp)
+                row = db.execute("""SELECT trace_json FROM routing_traces
+                    WHERE chat_id = ? AND message_id = ?""", (chat_id, message_id)).fetchone()
+                db.commit()
+            if row is None or len(row["trace_json"].encode()) > MAX_BYTES:
+                return None
+            return clean_trace(json.loads(row["trace_json"]))
+        except Exception:
+            return None
 
     async def authorize_chat(
         self,

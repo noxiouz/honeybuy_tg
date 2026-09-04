@@ -17,6 +17,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
+from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
@@ -92,7 +93,52 @@ from honeybuy_tg.storage import (
     recipe_state_digest,
 )
 
+from honeybuy_tg.tracing import (
+    Outcome, Reason, RoutingTrace, Stage, current_trace, record, render_trace,
+)
+
 logger = logging.getLogger(__name__)
+
+
+class RoutingTraceMiddleware(BaseMiddleware):
+    def __init__(self, storage: Storage) -> None:
+        self.storage = storage
+
+    async def __call__(self, handler, event, data):
+        token = None
+        trace = None
+        try:
+            trace = RoutingTrace()
+            token = current_trace.set(trace)
+            record(Stage.ROUTING, Reason.RECEIVED)
+            if event.from_user is None:
+                record(Stage.AUTH, Reason.MISSING_SENDER, outcome=Outcome.IGNORED)
+        except Exception:
+            pass
+        try:
+            result = await handler(event, data)
+            if result is UNHANDLED:
+                record(Stage.ROUTING, Reason.UNSUPPORTED_CONTENT, outcome=Outcome.IGNORED)
+            return result
+        except asyncio.CancelledError:
+            record(Stage.ROUTING, Reason.CANCELLED, outcome=Outcome.CANCELLED)
+            raise
+        except Exception:
+            record(Stage.ROUTING, Reason.ERROR, outcome=Outcome.FAILED)
+            raise
+        finally:
+            if trace is not None:
+                trace.closed = True
+            if token is not None:
+                current_trace.reset(token)
+            if trace is not None:
+                try:
+                    await self.storage.save_routing_trace(
+                        chat_id=event.chat.id, message_id=event.message_id,
+                        trace=trace.snapshot(),
+                    )
+                except Exception:
+                    pass
 
 LAST_ADDED_REFERENCE = "__last_added__"
 HANDLED_MESSAGE_REACTION = "👀"
@@ -197,11 +243,18 @@ async def parse_text_command_with_ai_fallback(
         try:
             parsed = parsed_command_from_ai(await text_parser.parse(text))
             if parsed.action != ParsedAction.UNKNOWN:
+                record(Stage.SHOPPING, Reason.ACCEPTED, action=parsed.action.value)
                 return parsed
+            record(Stage.SHOPPING, Reason.UNKNOWN)
             ai_unknown = parsed
         except Exception:
+            record(Stage.SHOPPING, Reason.ERROR)
             logger.exception("Failed to parse shopping text with AI")
+    else:
+        record(Stage.SHOPPING, Reason.AI_UNAVAILABLE)
     local_parsed = parse_shopping_text(text, default_action=default_action)
+    record(Stage.SHOPPING, Reason.LOCAL_UNKNOWN if local_parsed.action == ParsedAction.UNKNOWN
+           else Reason.LOCAL_ACTION, action=local_parsed.action.value)
     if local_parsed.action != ParsedAction.UNKNOWN:
         return local_parsed
     if ai_unknown is not None and (
@@ -509,6 +562,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
 
     async def is_allowed_message(message: Message) -> bool:
         if message.from_user is None:
+            record(Stage.AUTH, Reason.MISSING_SENDER, outcome=Outcome.IGNORED)
             return False
 
         user_id = message.from_user.id
@@ -540,7 +594,9 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
 
     async def require_allowed(message: Message) -> bool:
         if await is_allowed_message(message):
+            record(Stage.AUTH, Reason.ACCEPTED)
             return True
+        record(Stage.AUTH, Reason.UNAUTHORIZED, outcome=Outcome.IGNORED)
         if message.from_user and is_owner_user(
             user_id=message.from_user.id,
             username=message.from_user.username,
@@ -779,6 +835,9 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         source: str,
         items: list[ShoppingItem],
     ) -> None:
+        # The domain calls finished before this helper; delivery may still fail.
+        record(Stage.ACTION, Reason.COMPLETED, action=("add_recipe" if source == "recipe" else
+               {"add": "add_items", "remove": "remove_items", "bought": "mark_bought"}.get(action, "unknown")))
         sent = await message.answer(text)
         record_shopping_action(action=action, source=source, count=len(items))
         await save_item_result_message(message=sent, kind=kind, items=items)
@@ -808,6 +867,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 ensure_ascii=False,
             ),
         )
+        record(Stage.RECIPE, Reason.CONFIRMATION_PENDING, outcome=Outcome.CONFIRMATION_PENDING)
         await message.answer(
             f"Recipe already exists: {existing_recipe.name}\n"
             f"Replace it with {extracted_recipe.name}?",
@@ -821,6 +881,13 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         learn_request = parse_learn_recipe_request(text)
         add_request = parse_add_recipe_request(text)
         alias_request = parse_recipe_alias_request(text)
+        if learn_request or add_request or alias_request:
+            record(Stage.RECIPE, Reason.DETERMINISTIC_MATCH,
+                   action="learn_recipe" if learn_request else "add_recipe" if add_request else "recipe_alias")
+        elif not should_try_ai_recipe_command(text):
+            record(Stage.RECIPE, Reason.MARKER_ABSENT)
+        elif recipe_command_parser is None:
+            record(Stage.RECIPE, Reason.AI_UNAVAILABLE)
         if (
             learn_request is None
             and add_request is None
@@ -833,8 +900,11 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                     await recipe_command_parser.parse(text)
                 )
             except Exception:
+                record(Stage.RECIPE, Reason.ERROR)
                 logger.exception("Failed to parse recipe command with AI")
             else:
+                record(Stage.RECIPE, Reason.UNKNOWN if recipe_command.action == "unknown" else Reason.ACCEPTED,
+                       action=recipe_command.action)
                 if (
                     recipe_command.action == "learn_recipe"
                     and recipe_command.name is not None
@@ -856,6 +926,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                     add_request = AddRecipeRequest(name=recipe_command.name)
 
         if alias_request is not None:
+            record(Stage.ACTION, Reason.SELECTED, action="recipe_alias")
             try:
                 recipe = await service.add_recipe_alias(
                     chat_id=message.chat.id,
@@ -864,14 +935,17 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                     user_id=message.from_user.id,
                 )
             except RecipeAliasConflictError as error:
+                record(Stage.RECIPE, Reason.AMBIGUOUS, outcome=Outcome.REJECTED)
                 await message.answer(
                     f"Alias already points to recipe: {error.recipe.name}"
                 )
                 return True
             except ValueError:
+                record(Stage.RECIPE, Reason.UNKNOWN, outcome=Outcome.REJECTED)
                 await message.answer("Usage: /recipe_alias pancakes = breakfast")
                 return True
             if recipe is None:
+                record(Stage.RECIPE, Reason.MISSING, outcome=Outcome.REJECTED)
                 await message.answer(
                     f"I do not know recipe: {alias_request.recipe_name}"
                 )
@@ -879,10 +953,13 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             await message.answer(
                 f"Saved alias for {recipe.name}: {alias_request.alias}"
             )
+            record(Stage.ACTION, Reason.COMPLETED, action="recipe_alias")
             return True
 
         if learn_request is not None:
+            record(Stage.ACTION, Reason.SELECTED, action="learn_recipe")
             if recipe_extractor is None:
+                record(Stage.RECIPE, Reason.AI_UNAVAILABLE, outcome=Outcome.REJECTED)
                 await message.answer(
                     "Recipe learning needs OPENAI_API_KEY because the recipe must be "
                     "converted into ingredients."
@@ -909,12 +986,14 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 )
                 return True
             except RecipeAliasConflictError as error:
+                record(Stage.RECIPE, Reason.AMBIGUOUS, outcome=Outcome.REJECTED)
                 await message.answer(
                     f"Recipe name conflicts with alias: {error.alias}\n"
                     f"Alias already points to recipe: {error.recipe.name}"
                 )
                 return True
             except Exception as error:
+                record(Stage.RECIPE, Reason.ERROR, outcome=Outcome.FAILED)
                 logger.exception("Failed to learn recipe")
                 await storage.log_event(
                     chat_id=message.chat.id,
@@ -931,6 +1010,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 )
                 return True
 
+            record(Stage.ACTION, Reason.COMPLETED, action="learn_recipe")
             await storage.log_event(
                 chat_id=message.chat.id,
                 user_id=message.from_user.id,
@@ -953,8 +1033,10 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         if add_request is None:
             return False
 
+        record(Stage.ACTION, Reason.SELECTED, action="add_recipe")
         recipe = await service.get_recipe(chat_id=message.chat.id, name=add_request.name)
         if recipe is None:
+            record(Stage.RECIPE, Reason.MISSING, outcome=Outcome.REJECTED)
             await message.answer(
                 f"I do not know recipe: {add_request.name}\n\n"
                 "Teach it first: выучи солянка https://... or paste the recipe text."
@@ -1016,11 +1098,13 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             if item.id not in categories_by_item_id
         ]
         if not uncached_items or categorizer is None:
+            record(Stage.CATEGORY, Reason.CACHE_HIT if not uncached_items else Reason.AI_UNAVAILABLE)
             return categories_by_item_id
 
         try:
             ai_categories = await categorizer.categorize(uncached_items)
         except Exception:
+            record(Stage.CATEGORY, Reason.LOCAL_FALLBACK)
             logger.exception("Failed to categorize shopping list with AI")
             return categories_by_item_id
 
@@ -1043,6 +1127,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
     ) -> None:
         prefix = f"Transcript: {transcript}\n\n" if transcript else ""
         source = "voice" if transcript else "text"
+        record(Stage.ACTION, Reason.SELECTED, action=parsed.action.value)
 
         if message.from_user is None:
             return
@@ -1105,9 +1190,11 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             if transcript:
                 await message.answer(f"Transcript: {transcript}")
             await send_list(message)
+            record(Stage.ACTION, Reason.COMPLETED, action=parsed.action.value)
             return
 
         clarification = parsed.clarification_question or "I did not understand that."
+        record(Stage.ACTION, Reason.UNKNOWN, outcome=Outcome.REJECTED)
         await message.answer(prefix + clarification)
 
     async def update_items_from_ids(
@@ -1174,10 +1261,12 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                     kind="added",
                 )
             if row is None or row["kind"] != "added":
+                record(Stage.REPLY, Reason.MISSING, outcome=Outcome.REJECTED)
                 await message.answer("I do not know which added items to undo.")
                 return True
             item_ids = parse_item_ids(row["item_ids"])
             if not item_ids:
+                record(Stage.REPLY, Reason.MISSING, outcome=Outcome.REJECTED)
                 await message.answer("That message has no tracked shopping items.")
                 return True
             await update_items_from_ids(
@@ -1186,9 +1275,11 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 action=ParsedAction.REMOVE_ITEMS,
                 source="reply_context",
             )
+            record(Stage.REPLY, Reason.HANDLED)
             return True
 
         if target_reply is None:
+            record(Stage.REPLY, Reason.MISSING)
             return False
         if parsed.action not in {ParsedAction.REMOVE_ITEMS, ParsedAction.MARK_BOUGHT}:
             return False
@@ -1200,14 +1291,17 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             message_id=target_reply.message_id,
         )
         if row is None:
+            record(Stage.REPLY, Reason.MISSING, outcome=Outcome.REJECTED)
             await message.answer("I cannot map that reply to shopping-list items.")
             return True
 
         item_ids = parse_item_ids(row["item_ids"])
         if not item_ids:
+            record(Stage.REPLY, Reason.MISSING, outcome=Outcome.REJECTED)
             await message.answer("That message has no tracked shopping items.")
             return True
         if row["kind"] != "added" and len(item_ids) > 1:
+            record(Stage.REPLY, Reason.AMBIGUOUS, outcome=Outcome.REJECTED)
             await message.answer(
                 "That message has multiple items. Reply with the exact item name."
             )
@@ -1219,6 +1313,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             action=parsed.action,
             source="reply_context",
         )
+        record(Stage.REPLY, Reason.HANDLED)
         return True
 
     async def ask_voice_items_confirmation(
@@ -1310,6 +1405,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         source: str,
     ) -> None:
         if command_message.from_user is None or voice_message.voice is None:
+            record(Stage.VOICE, Reason.MISSING_SENDER, outcome=Outcome.IGNORED)
             return
         source_message_id = voice_message_id(
             voice_message=voice_message,
@@ -1339,6 +1435,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 command_message.from_user.id,
             )
             record_voice_rejection("duration_limit")
+            record(Stage.VOICE, Reason.DURATION_LIMIT, outcome=Outcome.REJECTED)
             await command_message.answer(
                 "Voice message is too long. "
                 f"Limit: {settings.max_voice_duration_seconds} seconds."
@@ -1354,6 +1451,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 command_message.from_user.id,
             )
             record_voice_rejection("file_size_limit")
+            record(Stage.VOICE, Reason.FILE_SIZE_LIMIT, outcome=Outcome.REJECTED)
             await command_message.answer(
                 "Voice message file is too large. "
                 f"Limit: {settings.max_voice_file_size_bytes // 1_000_000} MB."
@@ -1362,6 +1460,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         if transcriber is None:
             logger.info("Rejecting voice message because OPENAI_API_KEY is missing")
             record_voice_rejection("openai_api_key_missing")
+            record(Stage.VOICE, Reason.AI_UNAVAILABLE, outcome=Outcome.REJECTED)
             await command_message.answer(
                 "OPENAI_API_KEY is not configured for voice messages."
             )
@@ -1394,6 +1493,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                     command_message.from_user.id,
                 )
                 record_voice_rejection("transcript_length_limit")
+                record(Stage.VOICE, Reason.TRANSCRIPT_LENGTH_LIMIT, outcome=Outcome.REJECTED)
                 await command_message.answer(
                     "Transcribed text is too long. "
                     f"Limit: {settings.max_transcript_characters} characters."
@@ -1447,6 +1547,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                         transcript=transcript,
                         items=candidate.items,
                     )
+                    record(Stage.VOICE, Reason.CONFIRMATION_PENDING, outcome=Outcome.CONFIRMATION_PENDING)
                     return
 
             await storage.log_event(
@@ -1477,6 +1578,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 list(parsed.items),
             )
         except Exception as error:
+            record(Stage.VOICE, Reason.ERROR, outcome=Outcome.FAILED)
             logger.exception("Failed to process voice message")
             await storage.log_event(
                 chat_id=command_message.chat.id,
@@ -1879,6 +1981,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
 
     @router.message(Command("whoami"))
     async def whoami(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="whoami")
         if message.from_user is None:
             return
         await message.answer(
@@ -1889,18 +1992,21 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
 
     @router.message(Command("start"))
     async def start(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="start")
         if not await require_allowed(message):
             return
         await message.answer(help_text())
 
     @router.message(Command("help"))
     async def help_command(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="help")
         if not await require_allowed(message):
             return
         await message.answer(help_text())
 
     @router.message(Command("authorize"))
     async def authorize(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="authorize")
         if message.from_user is None:
             return
         if not is_owner_user(
@@ -1908,6 +2014,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             username=message.from_user.username,
             settings=settings,
         ):
+            record(Stage.AUTH, Reason.UNAUTHORIZED, outcome=Outcome.IGNORED)
             return
 
         await storage.authorize_chat(
@@ -1920,12 +2027,14 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
 
     @router.message(Command("list"))
     async def list_items(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="list")
         if not await require_allowed(message):
             return
         await send_list(message)
 
     @router.message(Command("shop"))
     async def shop(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="shop")
         if not await require_allowed(message):
             return
         items = await service.list_active_deduplicated(chat_id=message.chat.id)
@@ -1961,6 +2070,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
 
     @router.message(Command("add"))
     async def add_item(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="add")
         if message.from_user is None or not await require_allowed(message):
             return
         name = command_argument(message.text, "/add")
@@ -1971,6 +2081,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 user_id=message.from_user.id,
             )
         except ValueError:
+            record(Stage.ACTION, Reason.UNKNOWN, outcome=Outcome.REJECTED)
             await message.answer("Usage: /add milk")
             return
         await answer_item_result(
@@ -1984,12 +2095,14 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
 
     @router.message(Command("remove"))
     async def remove_item(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="remove")
         if not await require_allowed(message):
             return
         name = command_argument(message.text, "/remove")
         try:
             removed = await service.remove_by_name(chat_id=message.chat.id, name=name)
         except ValueError:
+            record(Stage.ACTION, Reason.UNKNOWN, outcome=Outcome.REJECTED)
             await message.answer("Usage: /remove milk")
             return
         await answer_item_result(
@@ -2003,6 +2116,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
 
     @router.message(Command("bought"))
     async def bought_item(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="bought")
         if not await require_allowed(message):
             return
         name = command_argument(message.text, "/bought")
@@ -2011,6 +2125,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 chat_id=message.chat.id, name=name
             )
         except ValueError:
+            record(Stage.ACTION, Reason.UNKNOWN, outcome=Outcome.REJECTED)
             await message.answer("Usage: /bought milk")
             return
         await answer_item_result(
@@ -2024,14 +2139,17 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
 
     @router.message(Command("clear_bought"))
     async def clear_bought(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="clear_bought")
         if not await require_allowed(message):
             return
         count = await service.clear_bought(chat_id=message.chat.id)
+        record(Stage.ACTION, Reason.COMPLETED, action="clear_bought")
         record_shopping_action(action="clear_bought", source="command", count=count)
         await message.answer(f"Cleared bought items: {count}")
 
     @router.message(Command("clear"))
     async def clear_active(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="clear")
         if message.from_user is None:
             return
         if not is_owner_user(
@@ -2039,6 +2157,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             username=message.from_user.username,
             settings=settings,
         ):
+            record(Stage.AUTH, Reason.UNAUTHORIZED, outcome=Outcome.IGNORED)
             return
         if not await require_allowed(message):
             return
@@ -2046,21 +2165,25 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             "Clear the whole active shopping list in this chat?",
             reply_markup=clear_list_keyboard(),
         )
+        record(Stage.ACTION, Reason.CONFIRMATION_PENDING, outcome=Outcome.CONFIRMATION_PENDING)
 
     @router.message(Command("recipes"))
     async def recipes(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="recipes")
         if not await require_allowed(message):
             return
         await message.answer(format_recipe_list(await service.list_recipes(chat_id=message.chat.id)))
 
     @router.message(Command("recipe_alias"))
     async def recipe_alias(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="recipe_alias")
         if message.from_user is None or not await require_allowed(message):
             return
         alias_request = parse_recipe_alias_argument(
             command_argument(message.text, "/recipe_alias")
         )
         if alias_request is None:
+            record(Stage.RECIPE, Reason.UNKNOWN, outcome=Outcome.REJECTED)
             await message.answer("Usage: /recipe_alias pancakes = breakfast")
             return
         try:
@@ -2071,32 +2194,39 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 user_id=message.from_user.id,
             )
         except RecipeAliasConflictError as error:
+            record(Stage.RECIPE, Reason.AMBIGUOUS, outcome=Outcome.REJECTED)
             await message.answer(f"Alias already points to recipe: {error.recipe.name}")
             return
         except ValueError:
+            record(Stage.RECIPE, Reason.UNKNOWN, outcome=Outcome.REJECTED)
             await message.answer("Usage: /recipe_alias pancakes = breakfast")
             return
         if recipe is None:
+            record(Stage.RECIPE, Reason.MISSING, outcome=Outcome.REJECTED)
             await message.answer(f"I do not know recipe: {alias_request.recipe_name}")
             return
         await message.answer(f"Saved alias for {recipe.name}: {alias_request.alias}")
 
     @router.message(Command("delete_recipe"))
     async def delete_recipe(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="delete_recipe")
         if not await require_allowed(message):
             return
         name = command_argument(message.text, "/delete_recipe")
         if not name:
+            record(Stage.RECIPE, Reason.UNKNOWN, outcome=Outcome.REJECTED)
             await message.answer("Usage: /delete_recipe solyanka")
             return
         recipe = await service.delete_recipe(chat_id=message.chat.id, name=name)
         if recipe is None:
+            record(Stage.RECIPE, Reason.MISSING, outcome=Outcome.REJECTED)
             await message.answer(f"I do not know recipe: {name}")
             return
         await message.answer(f"Deleted recipe: {recipe.name}")
 
     @router.message(Command("text_parse_mode"))
     async def text_parse_mode(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="text_parse_mode")
         if message.from_user is None:
             return
         if not is_owner_user(
@@ -2104,6 +2234,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             username=message.from_user.username,
             settings=settings,
         ):
+            record(Stage.AUTH, Reason.UNAUTHORIZED, outcome=Outcome.IGNORED)
             return
         if not await require_allowed(message):
             return
@@ -2111,6 +2242,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
         requested_mode = command_argument(message.text, "/text_parse_mode")
         if requested_mode:
             if requested_mode not in {"off", "mention", "all"}:
+                record(Stage.ROUTING, Reason.UNKNOWN, outcome=Outcome.REJECTED)
                 await message.answer("Usage: /text_parse_mode off|mention|all")
                 return
             await storage.set_chat_text_parse_mode(
@@ -2133,6 +2265,36 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             text_parse_mode_text(current_mode),
             reply_markup=text_parse_mode_keyboard(current_mode),
         )
+
+    @router.message(Command("trace"))
+    async def trace_command(message: Message) -> None:
+        record(Stage.ROUTING, Reason.COMMAND_MATCHED, command="trace")
+        if message.from_user is None or not is_owner_user(
+            user_id=message.from_user.id, username=message.from_user.username,
+            settings=settings,
+        ):
+            record(Stage.AUTH, Reason.UNAUTHORIZED, outcome=Outcome.IGNORED)
+            return
+        if not await require_allowed(message):
+            return
+        tokens = (message.text or "").split()
+        reply = message.reply_to_message
+        target = None
+        if not message.external_reply:
+            if len(tokens) == 2 and reply is None and re.fullmatch(r"[0-9]{1,10}", tokens[1]):
+                target = int(tokens[1])
+            elif len(tokens) == 1 and reply is not None and reply.chat.id == message.chat.id:
+                target = reply.message_id
+        if target is None or not 0 < target <= 2147483647:
+            record(Stage.ROUTING, Reason.UNKNOWN, outcome=Outcome.REJECTED)
+            await message.answer("Usage: /trace <message_id> or reply to the original message with /trace")
+            return
+        try:
+            trace = await storage.get_routing_trace(chat_id=message.chat.id, message_id=target)
+            explanation = render_trace(trace) if trace is not None else "Trace unavailable (missing or expired)."
+        except Exception:
+            explanation = "Trace unavailable (missing or expired)."
+        await message.answer(explanation, parse_mode=None)
 
     @router.message(F.voice)
     async def voice_message(message: Message, bot: Bot) -> None:
@@ -2165,10 +2327,12 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                 )
                 return
             if is_explicit_voice_reanalysis_command(message.text):
+                record(Stage.VOICE, Reason.MISSING, outcome=Outcome.REJECTED)
                 await message.answer("Reply to a voice message and mention me.")
                 return
 
         if is_explicit_voice_reanalysis_command(message.text):
+            record(Stage.VOICE, Reason.MISSING, outcome=Outcome.REJECTED)
             await message.answer("Reply to a voice message and mention me.")
             return
 
@@ -2229,6 +2393,13 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
                     ),
                     status="ok",
                 )
+            else:
+                record(Stage.SHOPPING, Reason.UNKNOWN, outcome=Outcome.IGNORED)
+        else:
+            reason = (Reason.SLASH_COMMAND_IGNORED if (message.text or "").startswith("/")
+                      else Reason.TEXT_MODE_OFF if text_parse_mode == "off"
+                      else Reason.MENTION_MISSING)
+            record(Stage.ROUTING, reason, outcome=Outcome.IGNORED)
 
     @router.callback_query(F.data.startswith(INLINE_CAPTURE_PREFIX))
     async def inline_capture_callback(callback: CallbackQuery, bot: Bot) -> None:
@@ -2486,6 +2657,7 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
     router.message.middleware(MetricsMiddleware())
     router.callback_query.middleware(MetricsMiddleware())
     dispatcher = Dispatcher()
+    dispatcher.message.outer_middleware(RoutingTraceMiddleware(storage))
     dispatcher.include_router(router)
     return dispatcher
 
@@ -2530,6 +2702,7 @@ def help_text() -> str:
             "/text_parse_mode - configure natural text parsing in this chat",
             "Reply to a voice message with @bot_username to reanalyze it",
             "/whoami - show user and chat IDs",
+            "/trace message_id - owner-only routing diagnostics (or reply to original)",
         ]
     )
 
@@ -2597,6 +2770,7 @@ async def set_bot_commands(bot: Bot) -> None:
             BotCommand(command="start", description="Start bot"),
             BotCommand(command="help", description="Show help"),
             BotCommand(command="whoami", description="Show user and chat IDs"),
+            BotCommand(command="trace", description="Owner: explain message routing"),
             BotCommand(command="authorize", description="Authorize this chat"),
             BotCommand(command="list", description="Show shopping list"),
             BotCommand(command="shop", description="Shopping checklist mode"),

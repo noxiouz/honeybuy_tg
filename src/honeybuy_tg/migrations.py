@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -304,6 +304,18 @@ def run_migrations(
             _migrate_to_2(db)
             _set_user_version(db, 2)
             applied_versions.append(2)
+
+        if old_version < 3:
+            db.execute("""CREATE TABLE routing_traces (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                trace_json TEXT NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
+            )""")
+            db.execute("CREATE INDEX idx_routing_traces_created ON routing_traces(created_at)")
+            _set_user_version(db, 3)
+            applied_versions.append(3)
 
         new_version = get_user_version(db)
         if started_transaction:
