@@ -2104,6 +2104,43 @@ def test_installer_coherence_accepts_only_production_v2_release_manifest(tmp_pat
     assert parser_rejects_wrong_lock or shell_compares_lock_digest
 
 
+def test_installer_coherence_accepts_only_exact_linux_lib64_symlink():
+    installer = _repo_text("deploy/ubuntu/install.sh")
+    coherence_functions = _coherence_function_names(installer)
+    assert len(coherence_functions) == 1
+    coherence_body = _shell_functions(installer)[coherence_functions.pop()]
+    lines = _shell_logical_lines(coherence_body)
+
+    assert any(
+        re.search(
+            r'\[\[\s+"\$link_relative"\s+==\s+"?\.venv/lib64"?\s+]]',
+            line,
+        )
+        for line in lines
+    )
+    assert any(
+        "readlink -- \"$link\"" in line
+        and re.search(r'==\s+"?lib"?\s+]]', line)
+        for line in lines
+    )
+    assert any(
+        '-d "$release/.venv/lib"' in line
+        and '! -L "$release/.venv/lib"' in line
+        for line in lines
+    )
+    assert any(
+        re.search(
+            r'\[\[\s+"\$link_target"\s+==\s+"\$release/\.venv/lib"\s+]]',
+            line,
+        )
+        for line in lines
+    )
+    assert any(
+        "link_relative" in line and r"\.venv/bin/python(3(\.[0-9]+)?)?" in line
+        for line in lines
+    )
+
+
 def test_incoherent_install_preserves_bot_and_directs_to_explicit_bootstrap():
     installer = _repo_text("deploy/ubuntu/install.sh")
     lines = _shell_logical_lines(installer)

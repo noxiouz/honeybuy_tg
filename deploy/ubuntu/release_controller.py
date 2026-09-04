@@ -5598,7 +5598,24 @@ def _metadata_snapshot(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _safe_venv_symlink(relative: tuple[str, ...], target: str) -> bool:
+def _safe_venv_symlink(
+    relative: tuple[str, ...],
+    target: str,
+    *,
+    parent_descriptor: int,
+) -> bool:
+    if relative == ("lib64",):
+        if target != "lib":
+            return False
+        try:
+            library = os.stat(
+                "lib",
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError:
+            return False
+        return stat.S_ISDIR(library.st_mode)
     if len(relative) != 2 or relative[0] != "bin":
         return False
     if not _is_python_executable_name(relative[1]):
@@ -5706,6 +5723,7 @@ def _digest_directory_nofollow(
                 or not _safe_venv_symlink(
                     child_relative[len(venv_prefix) :],
                     target,
+                    parent_descriptor=descriptor,
                 )
             ):
                 raise OSError("unsafe virtualenv symlink")
@@ -5873,7 +5891,11 @@ def _copy_directory_nofollow(
                 os.close(source_child)
         elif stat.S_ISLNK(before.st_mode):
             target = os.readlink(name, dir_fd=source)
-            if not _safe_venv_symlink(child_relative, target):
+            if not _safe_venv_symlink(
+                child_relative,
+                target,
+                parent_descriptor=source,
+            ):
                 raise OSError("unsafe virtualenv symlink")
             encoded_target = target.encode("utf-8", errors="surrogateescape")
             _digest_record(
@@ -6016,6 +6038,19 @@ def _is_allowed_venv_symlink(root: Path, path: Path) -> bool:
         relative = path.relative_to(root)
     except ValueError:
         return False
+    if relative.parts == (".venv", "lib64"):
+        try:
+            target = os.readlink(path)
+            library = root / ".venv/lib"
+            metadata = os.lstat(library)
+            resolved = path.resolve(strict=True)
+        except OSError:
+            return False
+        return (
+            target == "lib"
+            and stat.S_ISDIR(metadata.st_mode)
+            and resolved == library
+        )
     if len(relative.parts) != 3 or relative.parts[:2] != (".venv", "bin"):
         return False
     if not _is_python_executable_name(relative.name):

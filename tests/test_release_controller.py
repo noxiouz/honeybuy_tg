@@ -3535,6 +3535,156 @@ def test_expected_venv_python_symlinks_are_preserved_and_chowned_without_followi
     assert set(symlink_paths).issubset(set(lchowned))
 
 
+def _create_linux_lib64_layout(
+    virtualenv: Path,
+    *,
+    target: str,
+    lib_kind: str,
+) -> None:
+    lib = virtualenv / "lib"
+    if lib_kind == "directory":
+        lib.mkdir(parents=True)
+    elif lib_kind == "file":
+        lib.parent.mkdir(parents=True, exist_ok=True)
+        lib.write_bytes(b"not a directory")
+    elif lib_kind == "symlink":
+        actual_lib = virtualenv / "actual-lib"
+        actual_lib.mkdir(parents=True)
+        lib.symlink_to(actual_lib.name, target_is_directory=True)
+    elif lib_kind != "missing":
+        raise AssertionError(f"unexpected lib kind: {lib_kind}")
+    if target == "other":
+        (virtualenv / "other").mkdir(parents=True)
+    (virtualenv / "lib64").symlink_to(target, target_is_directory=True)
+
+
+def test_linux_lib64_virtualenv_layout_is_sealed_and_remains_ready(
+    controller_module,
+    tmp_path,
+):
+    config = _config(controller_module, tmp_path)
+    _write_deployed_state(config)
+
+    def create_lib64_layout(
+        call: RunCall,
+        _occurrence: int,
+    ) -> subprocess.CompletedProcess | None:
+        if _command_kind(call) == "uv-sync":
+            assert call.cwd is not None
+            _create_linux_lib64_layout(
+                call.cwd / ".venv",
+                target="lib",
+                lib_kind="directory",
+            )
+        return None
+
+    events: list[str] = []
+    runner = FakeRunner(
+        _trusted_scenario(config, call_hook=create_lib64_layout),
+        events,
+    )
+    controller = _controller(
+        controller_module,
+        config,
+        runner,
+        _trusted_http(_workflow_payload(_workflow_run(TARGET_SHA)), events),
+    )
+
+    result = controller.reconcile()
+
+    _assert_status(result, "prepared")
+    release = config.releases_dir / TARGET_SHA
+    lib64 = release / ".venv/lib64"
+    assert lib64.is_symlink()
+    assert lib64.readlink() == Path("lib")
+    assert (release / ".venv/lib").is_dir()
+    assert controller._ready_release_is_safe(release, TARGET_SHA)
+
+
+@pytest.mark.parametrize(
+    ("target", "lib_kind"),
+    [
+        pytest.param("../uv.lock", "directory", id="escaping-target"),
+        pytest.param("other", "directory", id="wrong-target"),
+        pytest.param("lib", "missing", id="missing-lib-directory"),
+        pytest.param("lib", "file", id="lib-is-file"),
+        pytest.param("lib", "symlink", id="lib-is-symlink"),
+    ],
+)
+def test_release_sealing_rejects_unsafe_linux_lib64_layouts(
+    controller_module,
+    tmp_path,
+    target,
+    lib_kind,
+):
+    config = _config(controller_module, tmp_path)
+    _write_deployed_state(config)
+
+    def create_lib64_layout(
+        call: RunCall,
+        _occurrence: int,
+    ) -> subprocess.CompletedProcess | None:
+        if _command_kind(call) == "uv-sync":
+            assert call.cwd is not None
+            _create_linux_lib64_layout(
+                call.cwd / ".venv",
+                target=target,
+                lib_kind=lib_kind,
+            )
+        return None
+
+    events: list[str] = []
+    result = _controller(
+        controller_module,
+        config,
+        FakeRunner(
+            _trusted_scenario(config, call_hook=create_lib64_layout),
+            events,
+        ),
+        _trusted_http(_workflow_payload(_workflow_run(TARGET_SHA)), events),
+    ).reconcile()
+
+    _assert_status(result, "rejected")
+    assert result.reason == "failed to seal build output"
+    assert not (config.releases_dir / TARGET_SHA).exists()
+    assert not (config.releases_dir / f".{TARGET_SHA}.tmp").exists()
+
+
+@pytest.mark.parametrize(
+    ("target", "lib_kind", "expected"),
+    [
+        pytest.param("lib", "directory", True, id="exact-linux-layout"),
+        pytest.param("../uv.lock", "directory", False, id="escaping-target"),
+        pytest.param("other", "directory", False, id="wrong-target"),
+        pytest.param("lib", "missing", False, id="missing-lib-directory"),
+        pytest.param("lib", "file", False, id="lib-is-file"),
+        pytest.param("lib", "symlink", False, id="lib-is-symlink"),
+    ],
+)
+def test_ready_release_accepts_only_exact_linux_lib64_layout(
+    controller_module,
+    tmp_path,
+    target,
+    lib_kind,
+    expected,
+):
+    config = _config(controller_module, tmp_path)
+    release = _create_ready_release(config, TARGET_SHA)
+    _create_linux_lib64_layout(
+        release / ".venv",
+        target=target,
+        lib_kind=lib_kind,
+    )
+    controller = _controller(
+        controller_module,
+        config,
+        FakeRunner(_scenario(config), []),
+        FakeHttp(_workflow_payload(_workflow_run(TARGET_SHA)), []),
+    )
+
+    assert controller._ready_release_is_safe(release, TARGET_SHA) is expected
+
+
 @pytest.mark.parametrize(
     ("relative_path", "target"),
     [
@@ -4697,6 +4847,11 @@ def test_production_v2_ready_manifest_round_trips_and_detects_tampering(
     config = _config(controller_module, tmp_path)
     object.__setattr__(config, "test_mode", False)
     release = _create_ready_release(config, TARGET_SHA)
+    _create_linux_lib64_layout(
+        release / ".venv",
+        target="lib",
+        lib_kind="directory",
+    )
 
     controller_module._finalize_release_tree(
         release,

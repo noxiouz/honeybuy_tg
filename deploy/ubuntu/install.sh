@@ -202,6 +202,13 @@ deployment_state_is_coherent() {
   while IFS= read -r -d '' link; do
     [[ "$(stat -c '%U:%G' -- "$link")" == root:root ]] || return 1
     link_relative=${link#"$release"/}
+    if [[ "$link_relative" == ".venv/lib64" ]]; then
+      [[ "$(readlink -- "$link")" == "lib" ]] || return 1
+      [[ -d "$release/.venv/lib" && ! -L "$release/.venv/lib" ]] || return 1
+      link_target=$(readlink -f -- "$link") || return 1
+      [[ "$link_target" == "$release/.venv/lib" ]] || return 1
+      continue
+    fi
     [[ "$link_relative" =~ ^\.venv/bin/python(3(\.[0-9]+)?)?$ ]] || return 1
     link_target=$(readlink -f -- "$link") || return 1
     link_target_name=${link_target##*/}
