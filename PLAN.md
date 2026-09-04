@@ -235,11 +235,12 @@ Optional metrics:
   bootstrap, recovery, backup, rollback, receipts, quarantine, and the
   database-only health check.
 - [x] After integration, `tests/test_deploy.py tests/test_release_controller.py`
-  passed with 413 passed and 2 skipped, the full offline suite passed with 819
+  passed with 415 passed and 2 skipped, the full offline suite passed with 821
   passed and 3 skipped, Ruff passed, and `git diff HEAD --check` passed.
+- [x] Confirm the mandatory Linux/root/systemd containment step passes inside
+  the required `offline` job for a same-repository PR.
 - [ ] Confirm the mandatory Linux/root/systemd containment step passes inside
-  the required `offline` job for a same-repository PR and the final `main`
-  push.
+  the required `offline` job for the final `main` push.
 - [x] Obtain final independent review of the integrated guarded-deployment
   change.
 - [ ] Configure and verify the required public-GitHub `main` ruleset: strict
@@ -309,8 +310,8 @@ Optional metrics:
 
 ## Current Next Steps
 
-1. Run the mandatory Linux/root/systemd containment step in the
-   same-repository PR's `offline` job and on the final `main` push.
+1. Run the mandatory Linux/root/systemd containment step on the final `main`
+   push; the same-repository PR check is green.
 2. Configure and verify the public GitHub `main` rules: pull requests, Rebase
    and merge only, strict/up-to-date exact check `offline`, linear history, no
    force push or deletion, and no administrator or actor bypass. Do not require
