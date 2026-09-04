@@ -465,7 +465,10 @@ class SubprocessRunner:
             population = self._cgroup_population(unit)
             if population == 0:
                 self._reset_failed_unit(unit)
-            elif not (population is None and self._unit_is_exactly_unloaded(unit)):
+            elif not (
+                population is None
+                and self._unit_has_released_terminal_without_cgroup(unit)
+            ):
                 raise ContainmentFailure("timed-out workload cgroup did not empty")
             raise subprocess.TimeoutExpired(
                 payload,
@@ -490,29 +493,20 @@ class SubprocessRunner:
             )
         if observation is None:
             self._fail_after_launch(unit, "transient unit status is unavailable")
-        unloaded = observation.load_state == "not-found"
-        if unloaded:
-            if (
-                observation.active_state != "inactive"
-                or observation.sub_state != "dead"
-                or observation.control_group
-                or self._cgroup_path(unit).exists()
-            ):
-                self._fail_after_launch(
-                    unit,
-                    "unloaded transient unit state is inconsistent",
-                )
-        elif (
-            observation.load_state != "loaded"
-            or observation.active_state not in {"inactive", "failed"}
-            or observation.sub_state not in {"dead", "failed"}
-            or observation.control_group != f"/system.slice/{unit}"
-        ):
+        released_without_cgroup = self._released_terminal_without_cgroup(
+            unit,
+            observation,
+        )
+        loaded_with_cgroup = self._loaded_terminal_with_expected_cgroup(
+            unit,
+            observation,
+        )
+        if not released_without_cgroup and not loaded_with_cgroup:
             self._fail_after_launch(
                 unit,
                 "transient unit did not reach an exact terminal state",
             )
-        else:
+        if loaded_with_cgroup:
             self._require_empty_cgroup(unit)
 
         returncode = process.returncode
@@ -521,7 +515,7 @@ class SubprocessRunner:
                 unit,
                 "systemd-run did not report a return code",
             )
-        if unloaded:
+        if observation.load_state == "not-found":
             # Exact unloaded+missing is the only safe state in which systemd
             # has already discarded the execution properties.  The bounded
             # `systemd-run --wait` status is then the remaining exit evidence.
@@ -828,7 +822,7 @@ class SubprocessRunner:
         if stop.returncode != 0:
             if (
                 self._cgroup_population(unit) is None
-                and self._unit_is_exactly_unloaded(unit)
+                and self._unit_has_released_terminal_without_cgroup(unit)
             ):
                 return
             raise ContainmentFailure("failed to stop transient unit")
@@ -856,7 +850,8 @@ class SubprocessRunner:
         while True:
             population = self._cgroup_population(unit)
             if population == 0 or (
-                population is None and self._unit_is_exactly_unloaded(unit)
+                population is None
+                and self._unit_has_released_terminal_without_cgroup(unit)
             ):
                 return True
             remaining = deadline - time.monotonic()
@@ -875,10 +870,64 @@ class SubprocessRunner:
         observation = self._observe_transient(unit)
         return bool(
             observation is not None
+            and self._released_terminal_without_cgroup(unit, observation)
             and observation.load_state == "not-found"
-            and observation.active_state == "inactive"
+        )
+
+    def _unit_has_released_terminal_without_cgroup(self, unit: str) -> bool:
+        observation = self._observe_transient(unit)
+        return bool(
+            observation is not None
+            and self._released_terminal_without_cgroup(unit, observation)
+        )
+
+    def _released_terminal_without_cgroup(
+        self,
+        unit: str,
+        observation: TransientUnitObservation,
+        *,
+        allow_failed_loaded: bool = True,
+    ) -> bool:
+        if observation.control_group or self._cgroup_path(unit).exists():
+            return False
+        if observation.load_state == "not-found":
+            return (
+                observation.active_state == "inactive"
+                and observation.sub_state == "dead"
+            )
+        if observation.load_state != "loaded":
+            return False
+        if (
+            observation.active_state == "inactive"
             and observation.sub_state == "dead"
-            and not observation.control_group
+        ):
+            return True
+        return bool(
+            allow_failed_loaded
+            and observation.active_state == "failed"
+            and observation.sub_state == "failed"
+        )
+
+    def _loaded_terminal_with_expected_cgroup(
+        self,
+        unit: str,
+        observation: TransientUnitObservation,
+    ) -> bool:
+        if (
+            observation.load_state != "loaded"
+            or observation.control_group != f"/system.slice/{unit}"
+            or not self._cgroup_path(unit).exists()
+        ):
+            return False
+        return (
+            (
+                observation.active_state == "inactive"
+                and observation.sub_state == "dead"
+            )
+            or (
+                observation.active_state == "failed"
+                and observation.sub_state == "failed"
+            )
         )
 
     def _reset_failed_unit(self, unit: str) -> None:
@@ -893,9 +942,11 @@ class SubprocessRunner:
             raise ContainmentFailure("failed to reset transient unit")
         deadline = time.monotonic() + self._containment_poll_window()
         while True:
-            if (
-                self._unit_is_exactly_unloaded(unit)
-                and not self._cgroup_path(unit).exists()
+            observation = self._observe_transient(unit)
+            if observation is not None and self._released_terminal_without_cgroup(
+                unit,
+                observation,
+                allow_failed_loaded=False,
             ):
                 return
             remaining = deadline - time.monotonic()

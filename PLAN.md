@@ -235,7 +235,7 @@ Optional metrics:
   bootstrap, recovery, backup, rollback, receipts, quarantine, and the
   database-only health check.
 - [x] After integration, `tests/test_deploy.py tests/test_release_controller.py`
-  passed with 404 passed and 2 skipped, the full offline suite passed with 810
+  passed with 413 passed and 2 skipped, the full offline suite passed with 819
   passed and 3 skipped, Ruff passed, and `git diff HEAD --check` passed.
 - [ ] Confirm the mandatory Linux/root/systemd containment step passes inside
   the required `offline` job for a same-repository PR and the final `main`
