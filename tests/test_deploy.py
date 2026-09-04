@@ -2810,9 +2810,11 @@ ln() {{
 
 def test_migrate_cli_runs_without_starting_bot(tmp_path, monkeypatch, capsys):
     database_path = tmp_path / "cli.sqlite3"
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
-    monkeypatch.setenv("OWNER_USER_ID", "1")
-    monkeypatch.setenv("DATABASE_PATH", str(database_path))
+    _configure_healthcheck(monkeypatch, tmp_path, database_path)
+    monkeypatch.setattr(
+        "honeybuy_tg.app.run_bot",
+        lambda *_args: pytest.fail("migrate must not start Telegram"),
+    )
 
     main(["migrate"])
 
@@ -2824,18 +2826,18 @@ def test_migrate_cli_runs_without_starting_bot(tmp_path, monkeypatch, capsys):
         assert db.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
 
 
-def test_migrate_cli_still_requires_runtime_settings(tmp_path, monkeypatch):
+def test_migrate_cli_requires_database_path(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DATABASE_PATH", raising=False)
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("OWNER_USER_ID", raising=False)
     monkeypatch.delenv("OWNER_USERNAME", raising=False)
-    database_path = tmp_path / "must-not-be-created.sqlite3"
-    monkeypatch.setenv("DATABASE_PATH", str(database_path))
 
-    with pytest.raises(SystemExit, match="Invalid configuration"):
+    with pytest.raises(SystemExit) as exit_info:
         main(["migrate"])
 
-    assert not database_path.exists()
+    assert "DATABASE_PATH" in str(exit_info.value)
+    assert not (tmp_path / "data/honeybuy.sqlite3").exists()
 
 
 def test_normal_startup_still_requires_runtime_settings(tmp_path, monkeypatch):
