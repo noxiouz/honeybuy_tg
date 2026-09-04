@@ -4884,12 +4884,13 @@ class _FakeHostProcess:
         argv,
         *,
         stdout: bytes = b"",
+        stderr: bytes = b"",
         returncode: int | None = 0,
         communicate_effects: list[object] | None = None,
     ):
         self.args = tuple(str(argument) for argument in argv)
         self.stdout_data = stdout
-        self.stderr_data = b""
+        self.stderr_data = stderr
         self.returncode = returncode
         self.communicate_effects = list(communicate_effects or [])
         self.pid = self._next_pid
@@ -4966,6 +4967,8 @@ def _fake_transient_host(
     populated: int | None,
     states: tuple[_SyntheticTransientState, ...] = (),
     workload_returncode: int = 0,
+    workload_stdout: bytes = b"",
+    workload_stderr: bytes = b"",
     workload_communicate_effects: tuple[object, ...] = (),
 ):
     systemd_run_path = Path("/test-tools/systemd-run")
@@ -4993,6 +4996,8 @@ def _fake_transient_host(
                 )
             return _FakeHostProcess(
                 normalized,
+                stdout=workload_stdout,
+                stderr=workload_stderr,
                 returncode=workload_returncode,
                 communicate_effects=list(workload_communicate_effects),
             )
@@ -5170,6 +5175,96 @@ def test_failed_retained_terminal_unit_is_reset_without_requiring_unload(
         and call[1] in {"stop", "kill"}
         for call in calls
     )
+    assert killpg_calls == []
+
+
+def test_manager_enforced_runtime_limit_is_reported_as_timeout_expired(
+    controller_module,
+    tmp_path,
+    monkeypatch,
+):
+    payload = (
+        "/candidate/.venv/bin/python",
+        "-c",
+        "import time; time.sleep(30)",
+    )
+    runner, calls, killpg_calls, _cgroup_root = _fake_transient_host(
+        controller_module,
+        tmp_path,
+        monkeypatch,
+        populated=None,
+        states=(
+            _SyntheticTransientState(
+                active_state="failed",
+                sub_state="failed",
+                result="timeout",
+                exec_main_code="killed",
+                exit_status=15,
+                control_group="",
+            ),
+            _SyntheticTransientState(control_group=""),
+        ),
+        workload_returncode=1,
+        workload_stdout=b"captured before manager timeout",
+        workload_stderr=b"runtime limit reached",
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
+        runner.run(payload, uid=10001, gid=10002, env={})
+
+    assert raised.value.cmd == payload
+    assert raised.value.timeout == 0.5
+    assert raised.value.output == b"captured before manager timeout"
+    assert raised.value.stderr == b"runtime limit reached"
+    systemctl_actions = [
+        call[1]
+        for call in calls
+        if Path(call[0]) == Path("/test-tools/systemctl")
+    ]
+    assert systemctl_actions.count("reset-failed") == 1
+    assert not {"stop", "kill"}.intersection(systemctl_actions)
+    assert killpg_calls == []
+
+
+def test_manager_timeout_with_successful_client_status_fails_closed(
+    controller_module,
+    tmp_path,
+    monkeypatch,
+):
+    runner, calls, killpg_calls, _cgroup_root = _fake_transient_host(
+        controller_module,
+        tmp_path,
+        monkeypatch,
+        populated=None,
+        states=(
+            _SyntheticTransientState(
+                active_state="failed",
+                sub_state="failed",
+                result="timeout",
+                exec_main_code="killed",
+                exit_status=15,
+                control_group="",
+            ),
+            _SyntheticTransientState(control_group=""),
+        ),
+        workload_returncode=0,
+    )
+
+    with pytest.raises(controller_module.ContainmentFailure):
+        runner.run(
+            ("/candidate/.venv/bin/python", "-c", "pass"),
+            uid=10001,
+            gid=10002,
+            env={},
+        )
+
+    systemctl_actions = [
+        call[1]
+        for call in calls
+        if Path(call[0]) == Path("/test-tools/systemctl")
+    ]
+    assert systemctl_actions.count("reset-failed") == 1
+    assert not {"stop", "kill"}.intersection(systemctl_actions)
     assert killpg_calls == []
 
 
