@@ -309,7 +309,7 @@ Optional metrics:
 - [ ] Add log rotation notes or config for the Ubuntu service.
 - [ ] Define retention for deployment backups, receipts, quarantine, and old
   immutable releases.
-- [ ] Reject a bootstrap installer revision that differs from the prepared
+- [x] Reject a bootstrap installer revision that differs from the prepared
   baseline before the installer mutates timer or control-plane state.
 - [ ] Preserve a bounded, redacted transient-workload failure reason so errors
   such as systemd `CHDIR` are not reported as database incompatibility.
@@ -320,27 +320,24 @@ Optional metrics:
 
 ## Current Next Steps
 
-1. Add an installer preflight that rejects a bootstrap installer revision that
-   differs from the prepared baseline before changing the timer, controller,
-   units, or control-plane manifest.
-2. Surface bounded, redacted transient-workload diagnostics, including
+1. Surface bounded, redacted transient-workload diagnostics, including
    systemd pre-exec failures such as `CHDIR`, without exposing workload output
    or environment secrets.
-3. Extend the real Linux/root/systemd integration test so it exercises
+2. Extend the real Linux/root/systemd integration test so it exercises
    work-directory traversal and proves that the documented `systemctl --wait`
    boundary waits for a `Type=exec` controller to terminate.
-4. Run the first release-qualified live text-routing baseline with a separate
+3. Run the first release-qualified live text-routing baseline with a separate
    `HONEYBUY_EVAL_OPENAI_API_KEY`, the full maintained corpus, and at least three
    repetitions. Use the configured production parse model as the baseline and
    require every release gate in `docs/operations-and-testing.md` to pass.
-5. Watch production logs during the first identity-touching smoke run against
+4. Watch production logs during the first identity-touching smoke run against
    old rows, explicitly including `/list`, `/shop`, `/remove`, and `/bought`,
    because those paths can backfill canonical identities and remove duplicate
    active rows.
-6. Enable inline mode manually with `@BotFather` `/setinline` and confirm the bot
+5. Enable inline mode manually with `@BotFather` `/setinline` and confirm the bot
    remains an administrator in every authorized group intended as an inline
    destination. `/setinlinefeedback` is not required.
-7. Run manual Telegram smoke checks in private chat and group chat:
+6. Run manual Telegram smoke checks in private chat and group chat:
    authorization, inline capture into both eligible destination kinds with an
    explicit confirmation and replay attempt, `/add`, `/list`, `/shop`,
    `/remove`, `/bought`, voice input, recipe link learning, pasted recipe
@@ -348,5 +345,5 @@ Optional metrics:
    the Russian routing regressions that distinguish saved-recipe requests such
    as `купи ингредиенты для солянки` from ordinary shopping phrases such as
    `купи продукты` and `купи на завтра молоко`.
-8. Keep product work paused until deploy and smoke checks are complete. The next
+7. Keep product work paused until deploy and smoke checks are complete. The next
    product candidate remains better due-date support in rendered lists.

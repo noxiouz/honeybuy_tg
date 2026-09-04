@@ -119,6 +119,8 @@ validate_signer_file() {
 preflight_bootstrap_journal() {
   local deployed_sha
   local marker_status
+  local prepared_release
+  local relative_path
 
   assert_not_symlink "$BOOTSTRAP_JOURNAL_FILE"
   assert_safe_existing "$BOOTSTRAP_JOURNAL_FILE" file root root private 0600
@@ -136,6 +138,19 @@ preflight_bootstrap_journal() {
   marker_status=$?
   set -e
   [[ "$marker_status" -eq 0 ]] || fail "bootstrap marker is not the exact awaiting_service state"
+
+  prepared_release="$APP_DIR/releases/$deployed_sha"
+  for relative_path in \
+    deploy/ubuntu/release_controller.py \
+    deploy/ubuntu/allowed_signers \
+    deploy/systemd/honeybuy-tg.service \
+    deploy/systemd/honeybuy-release-controller.service \
+    deploy/systemd/honeybuy-release-controller.timer
+  do
+    [[ -f "$REPO_ROOT/$relative_path" && ! -L "$REPO_ROOT/$relative_path" ]] || fail "installer artifact $relative_path is unsafe or missing; rerun from exact reviewed candidate revision $deployed_sha"
+    [[ -f "$prepared_release/$relative_path" && ! -L "$prepared_release/$relative_path" ]] || fail "prepared artifact $relative_path is unsafe or missing; rerun from exact reviewed candidate revision $deployed_sha"
+    cmp -s -- "$REPO_ROOT/$relative_path" "$prepared_release/$relative_path" || fail "control-plane artifact mismatch for $relative_path; rerun from exact reviewed candidate revision $deployed_sha"
+  done
 }
 
 require_awaiting_service_bot_inactive() {
@@ -309,11 +324,6 @@ do
   [[ -f "$source_file" && ! -L "$source_file" ]] || fail "unsafe or missing installer source: $source_file"
 done
 
-if systemctl cat "$TIMER_NAME" >/dev/null 2>&1; then
-  systemctl stop "$TIMER_NAME"
-  systemctl disable "$TIMER_NAME"
-fi
-
 assert_not_symlink "$LOCK_DIR"
 assert_safe_existing "$LOCK_DIR" directory root root private
 install -d -m 0700 -o root -g root "$LOCK_DIR"
@@ -327,6 +337,13 @@ if [[ -e "$JOURNAL_FILE" || -L "$JOURNAL_FILE" ]]; then
 fi
 preflight_bootstrap_journal
 require_awaiting_service_bot_inactive
+if systemctl cat "$TIMER_NAME" >/dev/null 2>&1; then
+  systemctl stop "$TIMER_NAME"
+  systemctl disable "$TIMER_NAME"
+fi
+if systemctl cat "$CONTROLLER_SERVICE_NAME" >/dev/null 2>&1; then
+  systemctl stop "$CONTROLLER_SERVICE_NAME"
+fi
 assert_not_symlink "$CONTROL_PLANE_MANIFEST_FILE"
 assert_safe_existing "$CONTROL_PLANE_MANIFEST_FILE" file root root private 0600
 
