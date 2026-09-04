@@ -364,7 +364,7 @@ def _command_kind(call: RunCall) -> str:
         return "archive"
     if len(argv) >= 2 and argv[1] == "sync":
         return "uv-sync"
-    if argv[-2:] == ("-c", "import honeybuy_tg"):
+    if argv[-2:] == ("-c", "import honeybuy_tg.app"):
         return "import-smoke"
     if argv[-2:] == ("honeybuy_tg", "migrate"):
         return "migrate"
@@ -2345,8 +2345,9 @@ def test_prepares_exact_release_with_locked_unprivileged_build_and_import_smoke(
     )
     assert smoke_call.argv == (
         str(build_directory / ".venv/bin/python"),
+        "-I",
         "-c",
-        "import honeybuy_tg",
+        "import honeybuy_tg.app",
     )
     assert smoke_call.cwd == build_directory
     assert smoke_call.uid == config.build_uid
@@ -3533,6 +3534,82 @@ def test_expected_venv_python_symlinks_are_preserved_and_chowned_without_followi
     promoted_symlinks = [release / path.relative_to(staging) for path in symlink_paths]
     assert all(path.is_symlink() for path in promoted_symlinks)
     assert set(symlink_paths).issubset(set(lchowned))
+
+
+@pytest.mark.parametrize(
+    ("build_mode", "sealed_mode"),
+    [
+        pytest.param(0o600, 0o644, id="owner-private-data"),
+        pytest.param(0o640, 0o644, id="group-readable-data"),
+        pytest.param(0o700, 0o755, id="owner-private-executable"),
+        pytest.param(0o751, 0o755, id="partially-readable-executable"),
+    ],
+)
+def test_sealed_virtualenv_normalizes_files_for_runtime_access(
+    controller_module,
+    tmp_path,
+    build_mode,
+    sealed_mode,
+):
+    config = _config(controller_module, tmp_path)
+    _write_deployed_state(config)
+    relative_artifact = Path("lib/python3.13/site-packages/private_artifact.py")
+
+    def create_private_build_artifact(
+        call: RunCall,
+        _occurrence: int,
+    ) -> subprocess.CompletedProcess | None:
+        if _command_kind(call) != "uv-sync":
+            return None
+        assert call.cwd is not None
+        artifact = call.cwd / ".venv" / relative_artifact
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"VALUE = 1\n")
+        artifact.chmod(build_mode)
+        return None
+
+    events: list[str] = []
+    result = _controller(
+        controller_module,
+        config,
+        FakeRunner(
+            _trusted_scenario(config, call_hook=create_private_build_artifact),
+            events,
+        ),
+        _trusted_http(_workflow_payload(_workflow_run(TARGET_SHA)), events),
+    ).reconcile()
+
+    _assert_status(result, "prepared")
+    sealed_artifact = config.releases_dir / TARGET_SHA / ".venv" / relative_artifact
+    assert stat.S_IMODE(sealed_artifact.stat().st_mode) == sealed_mode
+    assert sealed_artifact.stat().st_uid == config.release_uid
+    assert sealed_artifact.stat().st_gid == config.release_gid
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "unsafe_mode"),
+    [
+        pytest.param("uv.lock", 0o640, id="non-world-readable-file"),
+        pytest.param(".venv/bin", 0o700, id="non-world-traversable-directory"),
+    ],
+)
+def test_ready_release_rejects_runtime_inaccessible_permission_drift(
+    controller_module,
+    tmp_path,
+    relative_path,
+    unsafe_mode,
+):
+    config = _config(controller_module, tmp_path)
+    release = _create_ready_release(config, TARGET_SHA)
+    (release / relative_path).chmod(unsafe_mode)
+    controller = _controller(
+        controller_module,
+        config,
+        FakeRunner(_scenario(config), []),
+        FakeHttp(_workflow_payload(_workflow_run(TARGET_SHA)), []),
+    )
+
+    assert not controller._ready_release_is_safe(release, TARGET_SHA)
 
 
 def _create_linux_lib64_layout(

@@ -2141,6 +2141,24 @@ def test_installer_coherence_accepts_only_exact_linux_lib64_symlink():
     )
 
 
+def test_installer_coherence_requires_runtime_readable_canonical_modes():
+    installer = _repo_text("deploy/ubuntu/install.sh")
+    coherence_functions = _coherence_function_names(installer)
+    assert len(coherence_functions) == 1
+    coherence_body = _shell_functions(installer)[coherence_functions.pop()]
+    lines = _shell_logical_lines(coherence_body)
+
+    assert any(
+        'find "$release" -xdev -type d ! -perm 0755 -print -quit' in line
+        for line in lines
+    )
+    assert any(
+        'find "$release" -xdev -type f ! -perm 0644 ! -perm 0755 -print -quit'
+        in line
+        for line in lines
+    )
+
+
 def test_incoherent_install_preserves_bot_and_directs_to_explicit_bootstrap():
     installer = _repo_text("deploy/ubuntu/install.sh")
     lines = _shell_logical_lines(installer)
