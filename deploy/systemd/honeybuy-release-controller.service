@@ -1,0 +1,38 @@
+[Unit]
+Description=Honeybuy release controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=root
+Group=root
+UMask=0027
+ExecStart=/usr/bin/python3 /usr/local/lib/honeybuy/release_controller.py deploy
+TimeoutStartSec=30min
+TimeoutStopSec=5min
+RuntimeMaxSec=30min
+KillMode=control-group
+SendSIGKILL=yes
+RuntimeDirectory=honeybuy-release-controller
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/opt/honeybuy-tg /var/lib/honeybuy-release-controller /var/lib/honeybuy-tg /var/backups/honeybuy-tg /var/cache/honeybuy-tg/uv /run/honeybuy-release-controller
