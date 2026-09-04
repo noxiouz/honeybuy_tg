@@ -531,6 +531,18 @@ class SubprocessRunner:
                     unit,
                     "systemd manager and workload status disagree",
                 )
+        elif observation.result == "timeout":
+            self._reset_failed_unit(unit)
+            if returncode == 0:
+                raise ContainmentFailure(
+                    "systemd manager and workload timeout status disagree"
+                )
+            raise subprocess.TimeoutExpired(
+                payload,
+                self._timeout_seconds,
+                output=stdout,
+                stderr=stderr,
+            )
         else:
             if observation.exit_status < 0:
                 self._fail_after_launch(
