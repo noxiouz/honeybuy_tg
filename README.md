@@ -132,6 +132,8 @@ for the operator procedure and runtime prerequisites.
 - `/clear_bought` - remove bought items from active history.
 - `/clear` - clear the whole active list in the current chat, with confirmation.
 - `/recipes` - show saved recipes.
+- `/recipe pancakes` - view a saved recipe's ingredients, quantities, aliases,
+  and source.
 - `/recipe_alias pancakes = breakfast` - add another name for a saved recipe.
 - `/delete_recipe solyanka` - delete a saved recipe from the current chat.
 - `/reanalyze` - reanalyze a replied-to voice message.
@@ -264,9 +266,13 @@ For URL learning, the bot fetches the recipe page; for pasted text, it uses the
 pasted body as the source. In both cases OpenAI extracts grocery ingredients,
 the bot stores them in SQLite for the current chat, and later adds them to the
 shopping list when requested. Voice reuse commands use AI as a fallback, so the
-wording does not need to match exactly. `/recipes` lists saved aliases. Delete a
-saved recipe from the current chat with `/delete_recipe солянка`; deletion uses
-the saved recipe name, not aliases or loose recipe-reuse matching.
+wording does not need to match exactly. `/recipes` lists saved aliases. Use
+`/recipe солянка` or `/recipe суп` to inspect the complete saved recipe by name
+or alias. Viewing works without OpenAI, reads only the current chat, and does
+not add ingredients or fetch the source. Long cards arrive in consecutive
+messages; the stored source is shown as literal text without a link preview.
+Delete a saved recipe from the current chat with `/delete_recipe солянка`;
+deletion uses the saved recipe name, not aliases or loose recipe-reuse matching.
 
 ## Metrics
 

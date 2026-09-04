@@ -1,6 +1,6 @@
 # Honeybuy Functional Scenarios
 
-Last updated: 2026-09-03
+Last updated: 2026-09-05
 
 This document is the functional specification for known user-visible behavior of
 the Honeybuy Telegram bot. It describes what the bot must do, not how the code is
@@ -703,6 +703,47 @@ then the bot rejects the stale overwrite and asks the user to learn it again.
 Given a recipe overwrite callback contains malformed data,
 when the bot receives it,
 then the bot rejects it with an invalid confirmation message.
+
+### RECIPE-019 View Saved Recipe
+
+Given a recipe is saved in the current chat,
+when an authorized user sends `/recipe recipe-name` or `/recipe alias`,
+then the bot shows its complete saved name, all aliases, ordered ingredients
+with their stored quantities, and source when present. Missing aliases,
+ingredients, or source are identified explicitly.
+
+Viewing uses the existing saved-recipe lookup, including normalized names,
+aliases, and loose Russian-ending matches. It works without OpenAI and in every
+natural-text parse mode, does not fetch the source, and does not change recipes,
+shopping items, confirmations, or shopping-message context.
+
+### RECIPE-020 Missing Or Unknown Recipe Card
+
+Given an authorized user sends `/recipe` without a nonblank name,
+then the bot returns usage guidance. Given the requested recipe is absent or
+was deleted, the bot returns bounded guidance referring to `/recipes`.
+
+### RECIPE-021 Complete And Safe Recipe Card Delivery
+
+Given saved fields contain HTML syntax, long values, or supplementary Unicode,
+when the bot displays the recipe,
+then every field is preserved as literal text and long cards are delivered in
+consecutive messages within Telegram's text limit. Each message has valid HTML
+and a visible heading, including continuations through long whitespace runs.
+
+Sources are displayed as literal code text with link previews disabled; stored
+non-HTTP(S) or malformed sources must not become clickable unsafe links. Cards
+have no action or pagination buttons.
+
+### RECIPE-022 Recipe Card Authorization And Chat Isolation
+
+Given an authorized private user or member of an authorized group requests a
+recipe card, only recipes belonging to that chat may be read or displayed.
+Names, aliases, ingredients, and sources from another chat must not be exposed.
+Unauthorized users and chats must not read recipe state.
+
+Commands addressed to this bot, including `/recipe@HoneyBuyBot pancakes`, are
+supported; a command addressed to another bot must not display a card.
 
 ## Deduplication And Matching
 

@@ -16,7 +16,7 @@ from tempfile import TemporaryDirectory
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
@@ -27,6 +27,7 @@ from aiogram.types import (
     InlineQuery,
     InlineQueryResultArticle,
     InputTextMessageContent,
+    LinkPreviewOptions,
     Message,
     ReactionTypeEmoji,
     TelegramObject,
@@ -45,6 +46,7 @@ from honeybuy_tg.formatting import (
     format_added,
     format_item,
     format_items,
+    format_recipe_card,
     format_recipe_list,
     format_recipe_saved,
     format_shop_mode,
@@ -2053,6 +2055,33 @@ def build_dispatcher(settings: Settings, storage: Storage) -> Dispatcher:
             return
         await message.answer(format_recipe_list(await service.list_recipes(chat_id=message.chat.id)))
 
+    @router.message(Command("recipe"))
+    async def recipe_card(message: Message, command: CommandObject) -> None:
+        if not await require_allowed(message):
+            return
+        name = (command.args or "").strip()
+        if not name:
+            await message.answer(
+                "Usage: /recipe name-or-alias",
+                parse_mode="HTML",
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+            return
+        recipe = await service.get_recipe(chat_id=message.chat.id, name=name)
+        if recipe is None:
+            await message.answer(
+                "Recipe not found. Send /recipes to see saved recipes.",
+                parse_mode="HTML",
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+            return
+        for part in format_recipe_card(recipe):
+            await message.answer(
+                part,
+                parse_mode="HTML",
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+
     @router.message(Command("recipe_alias"))
     async def recipe_alias(message: Message) -> None:
         if message.from_user is None or not await require_allowed(message):
@@ -2525,6 +2554,7 @@ def help_text() -> str:
             "/clear_bought - clear bought items",
             "/clear - clear the whole active list with confirmation",
             "/recipes - show saved recipes",
+            "/recipe name-or-alias - view a saved recipe",
             "/recipe_alias pancakes = breakfast - add a recipe alias",
             "/delete_recipe solyanka - delete a saved recipe",
             "/text_parse_mode - configure natural text parsing in this chat",
@@ -2606,6 +2636,7 @@ async def set_bot_commands(bot: Bot) -> None:
             BotCommand(command="clear_bought", description="Clear bought items"),
             BotCommand(command="clear", description="Clear active list"),
             BotCommand(command="recipes", description="Show saved recipes"),
+            BotCommand(command="recipe", description="View a saved recipe by name or alias"),
             BotCommand(command="recipe_alias", description="Add a recipe alias"),
             BotCommand(command="delete_recipe", description="Delete a saved recipe"),
             BotCommand(command="reanalyze", description="Reanalyze replied voice"),
