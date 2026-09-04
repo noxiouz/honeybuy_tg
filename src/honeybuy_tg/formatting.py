@@ -139,6 +139,57 @@ def format_recipe_list(recipes: list[Recipe]) -> str:
     return "\n".join(lines)
 
 
+def format_recipe_card(recipe: Recipe) -> list[str]:
+    """Render all saved fields as independently valid, bounded HTML messages."""
+    title = "Saved recipe"
+    heading = f"<b>{title}</b>\n"
+    content_limit = 4096 - len(title) - 1
+    fields = [
+        (recipe.name, False),
+        (f"\n\nAliases: {', '.join(recipe.aliases) if recipe.aliases else 'none'}", False),
+        ("\n\nIngredients:" if recipe.ingredients else "\n\nIngredients: none", False),
+    ]
+    fields.extend(
+        (f"\n• {format_recipe_ingredient(ingredient)}", False)
+        for ingredient in recipe.ingredients
+    )
+    fields.append(("\n\nSource: ", False))
+    fields.append((recipe.source_url, True) if recipe.source_url else ("none", False))
+
+    messages = []
+    body: list[str] = []
+    body_units = 0
+    for raw_text, is_source in fields:
+        for fragment, units in _recipe_card_fragments(raw_text, content_limit):
+            # Keep each ordinary ingredient row together when it fits a page.
+            if body_units + units > content_limit:
+                messages.append(heading + "".join(body))
+                body = []
+                body_units = 0
+            escaped = escape(fragment)
+            body.append(f"<code>{escaped}</code>" if is_source else escaped)
+            body_units += units
+    messages.append(heading + "".join(body))
+    return messages
+
+
+def _recipe_card_fragments(text: str, limit: int) -> list[tuple[str, int]]:
+    """Split raw text at Python characters, retaining every UTF-16 code unit."""
+    fragments = []
+    start = 0
+    units = 0
+    for index, character in enumerate(text):
+        character_units = 2 if ord(character) > 0xFFFF else 1
+        if units + character_units > limit:
+            fragments.append((text[start:index], units))
+            start = index
+            units = 0
+        units += character_units
+    if start < len(text):
+        fragments.append((text[start:], units))
+    return fragments
+
+
 def group_items_by_category(
     items: list[ShoppingItem],
     *,

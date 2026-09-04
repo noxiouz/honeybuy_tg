@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
+from html import unescape
 import json
 import re
 import sqlite3
@@ -16,6 +17,7 @@ from aiogram.methods import (
     GetMe,
     SendMessage,
     SetMessageReaction,
+    SetMyCommands,
 )
 from aiogram.types import Chat, File, Message, ResultChatMemberUnion, Update, User
 from pydantic import TypeAdapter
@@ -28,6 +30,7 @@ from honeybuy_tg.telegram_bot import (
     build_dispatcher,
     build_shop_session_keyboard,
     get_effective_text_parse_mode,
+    help_text,
     is_explicit_voice_reanalysis_command,
     is_context_item_reference,
     is_last_added_reference,
@@ -40,6 +43,7 @@ from honeybuy_tg.telegram_bot import (
     recipe_ingredients_from_ai,
     recipe_name_from_ai,
     should_parse_text_message,
+    set_bot_commands,
     strip_bot_mention,
     voice_reply_context_message,
 )
@@ -109,6 +113,8 @@ class FakeTelegramSession(BaseSession):
                 user_id=method.user_id,
             )
         if isinstance(method, AnswerInlineQuery):
+            return True
+        if isinstance(method, SetMyCommands):
             return True
         if isinstance(method, SetMessageReaction):
             if self.fail_reactions:
@@ -3615,6 +3621,372 @@ async def test_effective_text_parse_mode_uses_default():
         )
         == "mention"
     )
+
+
+def recipe_card_update(text, *, chat_id=1, chat_type="private", user_id=42, update_id=1):
+    message = {
+        "message_id": update_id + 10,
+        "date": int(datetime.now(UTC).timestamp()),
+        "chat": {"id": chat_id, "type": chat_type},
+        "text": text,
+        "entities": [{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}],
+    }
+    if user_id is not None:
+        message["from"] = {"id": user_id, "is_bot": False, "first_name": "User"}
+    return Update.model_validate({"update_id": update_id, "message": message})
+
+
+def recipe_card_messages(session, *, chat_id=1):
+    sent = [request for request in session.requests if isinstance(request, SendMessage)]
+    assert sent, "The recipe command must reply"
+    for request in sent:
+        assert request.chat_id == chat_id
+        assert request.parse_mode == "HTML"
+        assert request.link_preview_options is not None
+        assert request.link_preview_options.is_disabled is True
+        assert request.reply_markup is None
+        visible = unescape(re.sub(r"<[^>]*>", "", request.text))
+        assert visible.strip()
+        assert len(visible.encode("utf-16-le")) // 2 <= 4096
+    return sent
+
+
+async def make_recipe_card_dispatcher(tmp_path, **setting_overrides):
+    storage = Storage(tmp_path / "test.sqlite3")
+    await storage.init()
+    await storage.save_recipe(
+        chat_id=1, name="Pancakes", source_url="https://example.test/pancakes",
+        created_by=42, ingredients=[("flour", "200 g"), ("salt", None)],
+    )
+    await storage.add_recipe_alias(
+        chat_id=1, recipe_name="Pancakes", alias="breakfast", created_by=42,
+    )
+    settings = Settings(
+        _env_file=None, TELEGRAM_BOT_TOKEN="123456:ABCDEF", OWNER_USER_ID=42,
+        **{"OPENAI_API_KEY": None, **setting_overrides},
+    )
+    session = FakeTelegramSession()
+    return storage, build_dispatcher(settings, storage), session, Bot(
+        settings.telegram_bot_token, session=session,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["off", "mention", "all"])
+@pytest.mark.parametrize("text, argument", [
+    ("/recipe pancakes", "pancakes"),
+    ("/recipe breakfast", "breakfast"),
+    ("/recipe   PANCAKES  ", "PANCAKES"),
+    ("/recipe@HoneyBuyBot\tpancakes", "pancakes"),
+    ("/recipe@hOnEyBuYbOt\n breakfast \n", "breakfast"),
+])
+async def test_recipe_command_uses_saved_lookup_in_every_text_mode(
+    tmp_path, monkeypatch, mode, text, argument,
+):
+    storage, dispatcher, session, bot = await make_recipe_card_dispatcher(
+        tmp_path, TEXT_PARSE_MODE=mode,
+    )
+    calls = []
+    original_get = ShoppingListService.get_recipe
+
+    async def get_recipe(self, *, chat_id, name):
+        calls.append((chat_id, name))
+        return await original_get(self, chat_id=chat_id, name=name)
+
+    monkeypatch.setattr(ShoppingListService, "get_recipe", get_recipe)
+    with storage.connect() as db:
+        before = tuple(db.iterdump())
+
+    await dispatcher.feed_update(bot, recipe_card_update(text))
+
+    sent = recipe_card_messages(session)
+    visible = unescape("\n".join(request.text for request in sent))
+    for field in ("Pancakes", "breakfast", "flour", "200 g", "salt",
+                  "https://example.test/pancakes"):
+        assert field in visible
+    assert calls == [(1, argument)]
+    with storage.connect() as db:
+        assert tuple(db.iterdump()) == before
+
+
+@pytest.mark.asyncio
+async def test_recipe_command_preserves_loose_russian_lookup(tmp_path):
+    storage, dispatcher, session, bot = await make_recipe_card_dispatcher(tmp_path)
+    await storage.save_recipe(
+        chat_id=1, name="Солянка", source_url=None, created_by=42,
+        ingredients=[("огурцы", "2 шт")],
+    )
+
+    await dispatcher.feed_update(bot, recipe_card_update("/recipe солянки"))
+
+    sent = recipe_card_messages(session)
+    assert "Солянка" in sent[0].text
+    assert "огурцы" in sent[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["/recipe", "/recipe   ", "/recipe@HoneyBuyBot\n\t"])
+async def test_recipe_command_without_name_gives_usage_before_lookup(tmp_path, monkeypatch, text):
+    _, dispatcher, session, bot = await make_recipe_card_dispatcher(tmp_path)
+
+    async def forbidden_lookup(*args, **kwargs):
+        pytest.fail("A missing recipe name must not reach the service")
+
+    monkeypatch.setattr(ShoppingListService, "get_recipe", forbidden_lookup)
+
+    await dispatcher.feed_update(bot, recipe_card_update(text))
+
+    sent = [request for request in session.requests if isinstance(request, SendMessage)]
+    assert len(sent) == 1
+    assert "usage" in sent[0].text.casefold()
+    assert "/recipe " in sent[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name", ["unknown", "?" * 4500, "pancakes"], ids=["unknown", "long", "deleted"],
+)
+async def test_recipe_command_unknown_or_deleted_name_has_bounded_guidance(tmp_path, name):
+    storage, dispatcher, session, bot = await make_recipe_card_dispatcher(tmp_path)
+    await storage.delete_recipe(chat_id=1, name="pancakes")
+
+    await dispatcher.feed_update(bot, recipe_card_update(f"/recipe {name}"))
+
+    sent = [request for request in session.requests if isinstance(request, SendMessage)]
+    assert len(sent) == 1
+    assert "/recipes" in sent[0].text
+    assert len(sent[0].text) < 512
+    assert sent[0].reply_markup is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_id, chat_type, user_id, authorized, allowed", [
+    (1, "private", 42, False, ""),
+    (1, "private", 7, False, "7"),
+    (-100, "supergroup", 7, True, ""),
+])
+async def test_recipe_command_is_available_to_authorized_chat_members(
+    tmp_path, chat_id, chat_type, user_id, authorized, allowed,
+):
+    storage, dispatcher, session, bot = await make_recipe_card_dispatcher(
+        tmp_path, ALLOWED_USER_IDS=allowed,
+    )
+    if authorized:
+        await storage.authorize_chat(
+            chat_id=chat_id, chat_type=chat_type, title="Household", authorized_by=42,
+        )
+        await storage.save_recipe(
+            chat_id=chat_id, name="Pancakes", source_url=None, created_by=42,
+            ingredients=[("group flour", "1 cup")],
+        )
+
+    await dispatcher.feed_update(bot, recipe_card_update(
+        "/recipe pancakes", chat_id=chat_id, chat_type=chat_type, user_id=user_id,
+    ))
+
+    assert "Pancakes" in recipe_card_messages(session, chat_id=chat_id)[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_id, chat_type, user_id", [
+    (1, "private", 7),
+    (-100, "supergroup", 7),
+    (-100, "supergroup", 42),
+    (-100, "supergroup", None),
+])
+async def test_recipe_command_authorizes_before_reading_recipe_state(
+    tmp_path, monkeypatch, chat_id, chat_type, user_id,
+):
+    storage, dispatcher, session, bot = await make_recipe_card_dispatcher(tmp_path)
+    if user_id is None:
+        await storage.authorize_chat(
+            chat_id=chat_id, chat_type=chat_type, title="Household", authorized_by=42,
+        )
+
+    async def forbidden_lookup(*args, **kwargs):
+        pytest.fail("Unauthorized requests must not read recipe state")
+
+    monkeypatch.setattr(ShoppingListService, "get_recipe", forbidden_lookup)
+    monkeypatch.setattr(Storage, "get_recipe", forbidden_lookup)
+
+    await dispatcher.feed_update(bot, recipe_card_update(
+        "/recipe pancakes", chat_id=chat_id, chat_type=chat_type, user_id=user_id,
+    ))
+
+    sent = [request for request in session.requests if isinstance(request, SendMessage)]
+    if user_id == 42:
+        assert len(sent) == 1 and "/authorize" in sent[0].text
+    else:
+        assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_recipe_command_addressed_to_other_bot_is_ignored(tmp_path, monkeypatch):
+    _, dispatcher, session, bot = await make_recipe_card_dispatcher(
+        tmp_path, TEXT_PARSE_MODE="all",
+    )
+
+    async def forbidden_lookup(*args, **kwargs):
+        pytest.fail("Commands addressed to another bot must not read recipes")
+
+    monkeypatch.setattr(ShoppingListService, "get_recipe", forbidden_lookup)
+
+    await dispatcher.feed_update(bot, recipe_card_update("/recipe@OtherBot pancakes"))
+
+    assert not any(isinstance(request, SendMessage) for request in session.requests)
+
+
+@pytest.mark.asyncio
+async def test_recipe_command_is_chat_scoped_for_names_aliases_and_source(tmp_path):
+    storage, dispatcher, session, bot = await make_recipe_card_dispatcher(tmp_path)
+    await storage.save_recipe(
+        chat_id=2, name="Pancakes", source_url="https://remote.test/secret",
+        created_by=42, ingredients=[("remote ingredient", "999 units")],
+    )
+    await storage.add_recipe_alias(
+        chat_id=2, recipe_name="Pancakes", alias="remote alias", created_by=42,
+    )
+    for update_id, (chat_id, name) in enumerate([
+        (1, "pancakes"), (2, "pancakes"), (1, "remote alias"), (2, "breakfast"),
+    ], 1):
+        session.requests.clear()
+        await dispatcher.feed_update(bot, recipe_card_update(
+            f"/recipe {name}", chat_id=chat_id, update_id=update_id,
+        ))
+        sent = [request for request in session.requests if isinstance(request, SendMessage)]
+        assert sent
+        assert all(request.chat_id == chat_id for request in sent)
+        text = "\n".join(request.text for request in sent)
+        if name != "pancakes":
+            assert "/recipes" in text
+        elif chat_id == 1:
+            assert "flour" in text and "200 g" in text
+            assert "remote" not in text and "999 units" not in text
+        else:
+            assert "remote ingredient" in text and "https://remote.test/secret" in text
+            assert "breakfast" not in text and "example.test" not in text
+
+
+@pytest.mark.asyncio
+async def test_recipe_card_delivery_is_complete_offline_and_read_only(tmp_path, monkeypatch):
+    class ForbiddenAI:
+        def __init__(self, *, api_key, model):
+            pass
+
+        def __getattr__(self, name):
+            pytest.fail(f"Recipe viewing must not access AI operation {name}")
+
+    async def forbidden_external_call(*args, **kwargs):
+        pytest.fail("Recipe viewing must not fetch sources or mutate ingredients")
+
+    for adapter in (
+        "RecipeExtractor", "RecipeCommandParser", "ShoppingTextParser",
+        "ShoppingItemCategorizer", "ShoppingItemNormalizer", "VoiceTranscriber",
+    ):
+        monkeypatch.setattr(f"honeybuy_tg.telegram_bot.{adapter}", ForbiddenAI)
+    monkeypatch.setattr(
+        "honeybuy_tg.telegram_bot.fetch_recipe_page_text", forbidden_external_call,
+    )
+    monkeypatch.setattr(ShoppingListService, "add_recipe_ingredients", forbidden_external_call)
+    monkeypatch.setattr("honeybuy_tg.telegram_bot.is_ffmpeg_available", lambda: True)
+    storage, dispatcher, session, bot = await make_recipe_card_dispatcher(
+        tmp_path, OPENAI_API_KEY="test", TEXT_PARSE_MODE="all",
+    )
+    source = "javascript:<script>" + " \t\n" * 2000 + "🙂&literal=&amp;"
+    await storage.save_recipe(
+        chat_id=1, name="Long recipe <b>literal</b>", source_url=source,
+        created_by=42, ingredients=[("flour & raw", '2 "cups"')],
+    )
+    await storage.add_item(chat_id=1, name="keep this item", created_by=42)
+    await storage.create_pending_confirmation(
+        chat_id=1, user_id=42, source_message_id=9, items_json='["keep pending"]',
+    )
+    await storage.save_bot_message(
+        chat_id=1, message_id=90, kind="added", item_ids="1",
+    )
+    with storage.connect() as db:
+        before = tuple(db.iterdump())
+
+    await dispatcher.feed_update(bot, recipe_card_update("/recipe Long recipe <b>literal</b>"))
+
+    sent = recipe_card_messages(session)
+    assert len(sent) > 1
+    texts = [request.text for request in sent]
+    assert "Long recipe &lt;b&gt;literal&lt;/b&gt;" in texts[0]
+    assert "".join(
+        unescape(code) for text in texts for code in re.findall(r"<code>(.*?)</code>", text, re.S)
+    ) == source
+    assert all("<a" not in text.casefold() for text in texts)
+    assert all(isinstance(request, (SendMessage, GetMe)) for request in session.requests)
+    with storage.connect() as db:
+        assert tuple(db.iterdump()) == before
+
+
+def test_help_advertises_viewing_one_saved_recipe():
+    assert any(line.startswith("/recipe ") for line in help_text().splitlines())
+
+
+@pytest.mark.asyncio
+async def test_recipe_card_partial_delivery_can_be_retried_without_state_changes(
+    tmp_path, monkeypatch,
+):
+    storage, dispatcher, session, bot = await make_recipe_card_dispatcher(tmp_path)
+    source = "https://example.test/" + "Ω🙂&" * 2500
+    await storage.save_recipe(
+        chat_id=1, name="Pancakes", source_url=source, created_by=42,
+        ingredients=[("flour", "200 g")], overwrite=True,
+    )
+    await storage.add_item(chat_id=1, name="keep this item", created_by=42)
+    with storage.connect() as db:
+        before = tuple(db.iterdump())
+    original_request = session.make_request
+    send_attempts = 0
+
+    async def fail_second_send(bot, method, timeout=None):
+        nonlocal send_attempts
+        if isinstance(method, SendMessage):
+            send_attempts += 1
+            if send_attempts == 2:
+                raise RuntimeError("Telegram delivery unavailable")
+        return await original_request(bot, method, timeout=timeout)
+
+    monkeypatch.setattr(session, "make_request", fail_second_send)
+
+    with pytest.raises(RuntimeError, match="Telegram delivery unavailable"):
+        await dispatcher.feed_update(bot, recipe_card_update("/recipe pancakes"))
+
+    assert send_attempts == 2
+    assert len(recipe_card_messages(session)) == 1
+    with storage.connect() as db:
+        assert tuple(db.iterdump()) == before
+
+    monkeypatch.setattr(session, "make_request", original_request)
+    session.requests.clear()
+    await dispatcher.feed_update(bot, recipe_card_update("/recipe pancakes", update_id=2))
+
+    sent = recipe_card_messages(session)
+    assert len(sent) > 1
+    assert "Pancakes" in sent[0].text
+    assert "".join(
+        unescape(code) for request in sent
+        for code in re.findall(r"<code>(.*?)</code>", request.text, re.S)
+    ) == source
+    with storage.connect() as db:
+        assert tuple(db.iterdump()) == before
+
+
+@pytest.mark.asyncio
+async def test_bot_command_menu_advertises_recipe_card_offline():
+    session = FakeTelegramSession()
+    bot = Bot("123456:ABCDEF", session=session)
+
+    await set_bot_commands(bot)
+
+    menus = [request for request in session.requests if isinstance(request, SetMyCommands)]
+    assert len(menus) == 1
+    commands = {command.command: command.description for command in menus[0].commands}
+    assert "recipe" in commands and commands["recipe"]
+    assert {"recipes", "recipe_alias", "delete_recipe"} <= commands.keys()
 
 
 @pytest.mark.asyncio

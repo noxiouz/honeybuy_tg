@@ -196,9 +196,29 @@ Saved recipes are managed with:
 
 ```text
 /recipes
+/recipe pancakes
 /recipe_alias pancakes = breakfast
 /delete_recipe pancakes
 ```
+
+`/recipe name-or-alias` displays the complete saved name, all aliases, ordered
+ingredient names and quantity strings, and the stored source. It uses the same
+chat-scoped lookup as reuse, including normalized names, aliases, and the loose
+Russian-ending heuristic. It needs no OpenAI key, works in every natural-text
+parse mode, and performs no recipe-page fetch or shopping-list mutation.
+
+The card explicitly identifies missing aliases, ingredients, and source.
+Long fields and cards are split into consecutive, independently valid HTML
+messages with a visible heading on every part. Values are escaped before
+delivery, and sources are rendered as literal code text with link previews
+disabled, including malformed or non-HTTP(S) stored values. There are no card
+callbacks or interaction state. If Telegram delivery fails partway through,
+the user can repeat the read-only command.
+
+An empty `/recipe` argument returns usage guidance; an unknown or deleted
+recipe returns guidance referring to `/recipes`. Authorization runs before
+lookup, and another chat's names, aliases, and source are never read for the
+card.
 
 Natural alias forms also accept separators such as `as`, `to`, and `как`.
 Aliases are unique within a chat and cannot collide with another recipe name or

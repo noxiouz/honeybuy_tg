@@ -1,6 +1,6 @@
 # Honeybuy Telegram Bot Plan
 
-Last updated: 2026-09-04
+Last updated: 2026-09-05
 
 ## Goal
 
@@ -56,7 +56,7 @@ stores state locally in SQLite.
 - Unauthorized private users and unauthorized group chats are blocked.
 - Telegram slash command suggestions are registered on bot startup.
 - Commands: `/whoami`, `/start`, `/help`, `/authorize`, `/list`, `/shop`,
-  `/add`, `/remove`, `/bought`, `/clear_bought`, `/clear`, `/recipes`,
+  `/add`, `/remove`, `/bought`, `/clear_bought`, `/clear`, `/recipes`, `/recipe`,
   `/recipe_alias`, `/delete_recipe`, `/reanalyze`, and `/text_parse_mode`.
 - `/clear` requires inline-button confirmation.
 - Cross-chat inline capture offers a personalized private/authorized-group
@@ -76,6 +76,9 @@ stores state locally in SQLite.
 - Recipe memory from public recipe links: learn, store, list, delete, and reuse recipes.
 - Pasted recipe text can be learned and saved without requiring a public URL.
 - Saved recipes can have chat-scoped aliases and be reused by any alias.
+- AI-001: `/recipe name-or-alias` displays a complete saved recipe card in
+  bounded consecutive messages, with escaped fields and a literal source.
+  Viewing is deterministic and reads only the current chat's saved data.
 - Recipe ingredients are deduplicated against active shopping-list items.
 - AI item identity normalization deduplicates equivalent items across languages,
   such as `water` and `вода`, and improves bought/remove matching.
