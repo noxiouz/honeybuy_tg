@@ -4932,42 +4932,81 @@ def _systemd_option(argv: tuple[str, ...], name: str) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class _SyntheticTransientState:
+    load_state: str = "loaded"
+    active_state: str = "inactive"
+    sub_state: str = "dead"
+    result: str = "success"
+    exec_main_code: str = "exited"
+    exit_status: int = 0
+    control_group: str = "/system.slice/{unit}"
+
+
+def _synthetic_transient_status(
+    state: _SyntheticTransientState,
+    unit: str,
+) -> bytes:
+    return (
+        f"ControlGroup={state.control_group.format(unit=unit)}\n"
+        f"LoadState={state.load_state}\n"
+        f"ActiveState={state.active_state}\n"
+        f"SubState={state.sub_state}\n"
+        f"Result={state.result}\n"
+        f"ExecMainCode={state.exec_main_code}\n"
+        f"ExecMainStatus={state.exit_status}\n"
+    ).encode("ascii")
+
+
 def _fake_transient_host(
     controller_module,
     tmp_path,
     monkeypatch,
     *,
-    populated: int,
+    populated: int | None,
+    states: tuple[_SyntheticTransientState, ...] = (),
+    workload_returncode: int = 0,
+    workload_communicate_effects: tuple[object, ...] = (),
 ):
     systemd_run_path = Path("/test-tools/systemd-run")
     systemctl_path = Path("/test-tools/systemctl")
     cgroup_root = tmp_path / "sys/fs/cgroup"
     calls: list[tuple[str, ...]] = []
     killpg_calls: list[int] = []
+    status_index = 0
+    default_state = _SyntheticTransientState()
 
     def fake_popen(argv, **_kwargs):
+        nonlocal status_index
         normalized = tuple(str(argument) for argument in argv)
         calls.append(normalized)
         executable = Path(normalized[0])
         if executable == systemd_run_path:
             unit = _systemd_option(normalized, "--unit")
             assert unit is not None
-            unit_cgroup = cgroup_root / "system.slice" / unit
-            unit_cgroup.mkdir(parents=True)
-            (unit_cgroup / "cgroup.events").write_text(
-                f"populated {populated}\nfrozen 0\n",
-                encoding="ascii",
-            )
-            return _FakeHostProcess(normalized)
-        if executable == systemctl_path and "show" in normalized:
-            unit = normalized[-1]
+            if populated is not None:
+                unit_cgroup = cgroup_root / "system.slice" / unit
+                unit_cgroup.mkdir(parents=True)
+                (unit_cgroup / "cgroup.events").write_text(
+                    f"populated {populated}\nfrozen 0\n",
+                    encoding="ascii",
+                )
             return _FakeHostProcess(
                 normalized,
-                stdout=(
-                    f"ControlGroup=/system.slice/{unit}\n"
-                    "LoadState=loaded\nActiveState=inactive\nSubState=dead\n"
-                    "Result=success\nExecMainStatus=0\n"
-                ).encode("ascii"),
+                returncode=workload_returncode,
+                communicate_effects=list(workload_communicate_effects),
+            )
+        if executable == systemctl_path and "show" in normalized:
+            unit = normalized[-1]
+            state = (
+                states[min(status_index, len(states) - 1)]
+                if states
+                else default_state
+            )
+            status_index += 1
+            return _FakeHostProcess(
+                normalized,
+                stdout=_synthetic_transient_status(state, unit),
             )
         return _FakeHostProcess(normalized)
 
@@ -5042,6 +5081,213 @@ def test_workload_runner_uses_unique_transient_systemd_cgroup_and_observes_empty
         if Path(argv[0]) == Path("/test-tools/systemctl") and "show" in argv
     ]
     assert show_indices and calls.index(launch) < show_indices[0]
+    assert killpg_calls == []
+
+
+def test_retained_terminal_unit_after_cgroup_collection_is_accepted(
+    controller_module,
+    tmp_path,
+    monkeypatch,
+):
+    runner, calls, killpg_calls, cgroup_root = _fake_transient_host(
+        controller_module,
+        tmp_path,
+        monkeypatch,
+        populated=None,
+        states=(
+            _SyntheticTransientState(
+                load_state="loaded",
+                active_state="inactive",
+                sub_state="dead",
+                result="success",
+                exec_main_code="exited",
+                exit_status=0,
+                control_group="",
+            ),
+        ),
+    )
+    payload = ("/candidate/.venv/bin/python", "-c", "pass")
+
+    completed = runner.run(payload, uid=10001, gid=10002, env={})
+
+    assert completed.returncode == 0
+    launch = next(
+        call for call in calls if Path(call[0]) == Path("/test-tools/systemd-run")
+    )
+    unit = _systemd_option(launch, "--unit")
+    assert unit is not None
+    assert not (cgroup_root / "system.slice" / unit).exists()
+    assert not any(
+        Path(call[0]) == Path("/test-tools/systemctl")
+        and call[1] in {"stop", "kill", "reset-failed"}
+        for call in calls
+    )
+    assert killpg_calls == []
+
+
+def test_failed_retained_terminal_unit_is_reset_without_requiring_unload(
+    controller_module,
+    tmp_path,
+    monkeypatch,
+):
+    runner, calls, killpg_calls, cgroup_root = _fake_transient_host(
+        controller_module,
+        tmp_path,
+        monkeypatch,
+        populated=None,
+        states=(
+            _SyntheticTransientState(
+                load_state="loaded",
+                active_state="failed",
+                sub_state="failed",
+                result="exit-code",
+                exec_main_code="exited",
+                exit_status=23,
+                control_group="",
+            ),
+            _SyntheticTransientState(control_group=""),
+        ),
+        workload_returncode=1,
+    )
+    payload = ("/candidate/.venv/bin/python", "-c", "raise SystemExit(23)")
+
+    completed = runner.run(payload, uid=10001, gid=10002, env={})
+
+    assert completed.returncode != 0
+    launch = next(
+        call for call in calls if Path(call[0]) == Path("/test-tools/systemd-run")
+    )
+    unit = _systemd_option(launch, "--unit")
+    assert unit is not None
+    assert not (cgroup_root / "system.slice" / unit).exists()
+    assert sum(
+        Path(call[0]) == Path("/test-tools/systemctl")
+        and call[1] == "reset-failed"
+        for call in calls
+    ) == 1
+    assert not any(
+        Path(call[0]) == Path("/test-tools/systemctl")
+        and call[1] in {"stop", "kill"}
+        for call in calls
+    )
+    assert killpg_calls == []
+
+
+def test_timeout_preserves_original_error_for_retained_terminal_unit_without_cgroup(
+    controller_module,
+    tmp_path,
+    monkeypatch,
+):
+    payload = ("/candidate/.venv/bin/python", "-c", "pass")
+    original_timeout = subprocess.TimeoutExpired(
+        ("/test-tools/systemd-run",),
+        0.5,
+        output=b"partial output",
+        stderr=b"deadline exceeded",
+    )
+    runner, calls, killpg_calls, cgroup_root = _fake_transient_host(
+        controller_module,
+        tmp_path,
+        monkeypatch,
+        populated=None,
+        states=(_SyntheticTransientState(control_group=""),),
+        workload_communicate_effects=(original_timeout, (b"", b"")),
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
+        runner.run(payload, uid=10001, gid=10002, env={})
+
+    assert raised.value.cmd == payload
+    assert raised.value.timeout == 0.5
+    assert raised.value.output == b"partial output"
+    assert raised.value.stderr == b"deadline exceeded"
+    launch = next(
+        call for call in calls if Path(call[0]) == Path("/test-tools/systemd-run")
+    )
+    unit = _systemd_option(launch, "--unit")
+    assert unit is not None
+    assert not (cgroup_root / "system.slice" / unit).exists()
+    assert any(
+        Path(call[0]) == Path("/test-tools/systemctl") and call[1] == "stop"
+        for call in calls
+    )
+    assert not any(
+        Path(call[0]) == Path("/test-tools/systemctl") and call[1] == "kill"
+        for call in calls
+    )
+    assert killpg_calls == []
+
+
+@pytest.mark.parametrize(
+    ("state", "populated"),
+    [
+        pytest.param(
+            _SyntheticTransientState(
+                active_state="active",
+                sub_state="running",
+                control_group="",
+            ),
+            None,
+            id="active-running-without-cgroup",
+        ),
+        pytest.param(
+            _SyntheticTransientState(
+                active_state="inactive",
+                sub_state="failed",
+            ),
+            0,
+            id="mixed-inactive-failed",
+        ),
+        pytest.param(
+            _SyntheticTransientState(
+                active_state="failed",
+                sub_state="dead",
+            ),
+            0,
+            id="mixed-failed-dead",
+        ),
+        pytest.param(
+            _SyntheticTransientState(control_group=""),
+            0,
+            id="empty-control-group-with-cgroup",
+        ),
+        pytest.param(
+            _SyntheticTransientState(control_group="/system.slice/{unit}"),
+            None,
+            id="expected-control-group-without-cgroup",
+        ),
+        pytest.param(
+            _SyntheticTransientState(
+                control_group="/system.slice/foreign.service",
+            ),
+            None,
+            id="foreign-control-group-without-cgroup",
+        ),
+    ],
+)
+def test_contradictory_transient_unit_and_cgroup_evidence_fails_closed(
+    controller_module,
+    tmp_path,
+    monkeypatch,
+    state,
+    populated,
+):
+    runner, _calls, killpg_calls, _cgroup_root = _fake_transient_host(
+        controller_module,
+        tmp_path,
+        monkeypatch,
+        populated=populated,
+        states=(state,),
+    )
+
+    with pytest.raises(controller_module.ContainmentFailure):
+        runner.run(
+            ("/candidate/.venv/bin/python", "-c", "pass"),
+            uid=10001,
+            gid=10002,
+            env={},
+        )
+
     assert killpg_calls == []
 
 
