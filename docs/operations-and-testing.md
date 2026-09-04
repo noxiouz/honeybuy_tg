@@ -296,6 +296,7 @@ release:
 | `/var/lib/honeybuy-release-controller/receipts/` | root, private | Successful deployment/bootstrap receipts by SHA |
 | `/var/lib/honeybuy-release-controller/quarantine/` | root, private | Rejected post-start candidate records by SHA |
 | `/var/lib/honeybuy-release-controller/scratch/` | root-controlled | Dry-run, clone, and restore staging |
+| `/var/lib/honeybuy-release-controller/empty/` | root, `0755`, below a `0711` state directory | Empty working directory for isolated migration and health checks |
 | `/var/backups/honeybuy-tg/` | root-controlled, private | Validated pre-migration SQLite backups |
 | `/run/honeybuy-release-controller/controller.lock` | root, `0600` | Single-controller flock |
 | `/usr/local/lib/honeybuy/release_controller.py` | root, executable | Installed controller program |
@@ -441,8 +442,9 @@ installer passes:
    installer immediately. Configure `/etc/honeybuy-tg/env` if the installer
    created it.
 2. **Quiesce and bootstrap:** make an operator backup, stop
-   `honeybuy-tg.service`, verify it is inactive, then run
-   `sudo systemctl start honeybuy-release-controller.service`. The controller
+   `honeybuy-tg.service`, verify it is inactive, then wait for the controller:
+   `sudo systemctl --wait start honeybuy-release-controller.service`. The
+   controller
    requires a safe `honeybuy`-owned `0600` SQLite file with the exact schema,
    verifies public `main`, builds the immutable baseline, checks it against the
    existing database, creates `current` and `deployed-sha`, and leaves an exact
@@ -456,6 +458,28 @@ installer passes:
    start `honeybuy-release-controller.service` once more. Only an `installed`
    manifest plus a stably healthy active service permits the controller to
    write the bootstrap receipt and clear the bootstrap journal.
+
+The installer intentionally accepts an existing bootstrap journal only at the
+exact `awaiting_service` boundary. If bootstrap stops at `intent` or
+`release_prepared`, do not rerun the installer and do not delete the journal or
+prepared release. Correct the underlying environment while keeping the bot
+inactive, then rerun the installed controller so its journal recovery owns the
+next transition.
+
+One historical controller used `/var/empty/honeybuy-healthcheck` as that empty
+working directory. On hosts where the root-owned `/var/empty` lacks search
+permission for `honeybuy`, an exact `release_prepared` recovery may temporarily
+add only the other-user search bit to `/var/empty`, run the installed controller
+once with `systemctl --wait`, and immediately restore the original mode even if
+the run fails. A plain `systemctl start` returns as soon as this `Type=exec`
+controller has executed, not when the controller has finished, so do not use
+that return as the restore boundary. Before doing so, verify the bot is
+inactive, the journal is exactly `release_prepared`, and neither `current` nor
+`deployed-sha` exists. The controller must then either
+reach `awaiting_service` or safely clear a stale uncommitted candidate before a
+new installer revision is used. Never leave the shared system directory more
+permissive and never replace this recovery with manual journal or release
+deletion.
 
 If the legacy database is not already at the schema expected by the chosen
 baseline, stop. Do not ask bootstrap to infer or migrate it. Handle that as an

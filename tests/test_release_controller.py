@@ -627,7 +627,7 @@ def _config(controller_module: ModuleType, tmp_path: Path):
     backup_dir = tmp_path / "var/backups/honeybuy-tg"
     trust_file = tmp_path / "etc/honeybuy-tg/allowed_signers"
     database_path = tmp_path / "var/lib/honeybuy-tg/honeybuy.sqlite3"
-    empty_work_dir = tmp_path / "var/empty/honeybuy-healthcheck"
+    empty_work_dir = state_dir / "empty"
     for directory in (
         source_repo,
         releases_dir,
@@ -4823,6 +4823,9 @@ def test_production_identity_policy_is_explicit_and_defaults_to_root_releases(
     assert defaults.test_mode is False
     assert defaults.release_uid == 0
     assert defaults.release_gid == 0
+    assert defaults.empty_work_dir == Path(
+        "/var/lib/honeybuy-release-controller/empty"
+    )
 
 
 @pytest.mark.parametrize(
@@ -5278,7 +5281,7 @@ def test_workload_runner_uses_unique_transient_systemd_cgroup_and_observes_empty
 
     completed = runner.run(
         ("/candidate/.venv/bin/python", "-m", "honeybuy_tg", "migrate"),
-        cwd=Path("/var/empty/honeybuy-healthcheck"),
+        cwd=Path("/var/lib/honeybuy-release-controller/empty"),
         uid=10001,
         gid=10002,
         env={"DATABASE_PATH": "/var/lib/honeybuy-tg/honeybuy.sqlite3"},
@@ -5635,7 +5638,7 @@ def test_nonempty_transient_cgroup_is_a_fatal_containment_failure(
     with pytest.raises(containment_failure):
         runner.run(
             ("/candidate/.venv/bin/python", "-m", "honeybuy_tg", "migrate"),
-            cwd=Path("/var/empty/honeybuy-healthcheck"),
+            cwd=Path("/var/lib/honeybuy-release-controller/empty"),
             uid=10001,
             gid=10002,
             env={"DATABASE_PATH": "/var/lib/honeybuy-tg/honeybuy.sqlite3"},
@@ -5705,7 +5708,7 @@ def test_post_launch_workload_communicate_error_attempts_cleanup_and_is_fatal(
     with pytest.raises(controller_module.ContainmentFailure):
         controller._run_command(
             ("/candidate/.venv/bin/python", "-m", "honeybuy_tg", "migrate"),
-            cwd=Path("/var/empty/honeybuy-healthcheck"),
+            cwd=Path("/var/lib/honeybuy-release-controller/empty"),
             uid=10001,
             gid=10002,
             env={"DATABASE_PATH": "/var/lib/honeybuy-tg/honeybuy.sqlite3"},

@@ -328,7 +328,7 @@ class ControllerConfig:
     release_gid: int = 0
     runtime_uid: int | None = None
     runtime_gid: int | None = None
-    empty_work_dir: Path = Path("/var/empty/honeybuy-healthcheck")
+    empty_work_dir: Path = Path("/var/lib/honeybuy-release-controller/empty")
     api_timeout_seconds: float = 5.0
     command_timeout_seconds: float = 120.0
     management_timeout_seconds: float = 10.0

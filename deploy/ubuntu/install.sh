@@ -6,6 +6,7 @@ ENV_DIR=/etc/honeybuy-tg
 DATA_DIR=/var/lib/honeybuy-tg
 CACHE_DIR=/var/cache/honeybuy-tg
 STATE_DIR=/var/lib/honeybuy-release-controller
+EMPTY_WORK_DIR=$STATE_DIR/empty
 BACKUP_DIR=/var/backups/honeybuy-tg
 LOCK_DIR=/run/honeybuy-release-controller
 LOCK_PATH=/run/honeybuy-release-controller/controller.lock
@@ -419,6 +420,8 @@ assert_not_symlink "$CACHE_DIR/uv"
 assert_safe_existing "$CACHE_DIR/uv" directory honeybuy-build honeybuy-build protected
 assert_not_symlink "$STATE_DIR"
 assert_safe_existing "$STATE_DIR" directory root root protected
+assert_not_symlink "$EMPTY_WORK_DIR"
+assert_safe_existing "$EMPTY_WORK_DIR" directory root root protected
 assert_not_symlink "$REPOSITORY_DIR"
 assert_safe_existing "$REPOSITORY_DIR" directory root root protected
 assert_not_symlink "$STATE_DIR/scratch"
@@ -435,8 +438,6 @@ assert_not_symlink /usr/local/lib/honeybuy
 assert_safe_existing /usr/local/lib/honeybuy directory root root protected
 assert_not_symlink "$UV_BIN"
 assert_safe_existing "$UV_BIN" file root root protected
-assert_not_symlink /var/empty/honeybuy-healthcheck
-assert_safe_existing /var/empty/honeybuy-healthcheck directory root root protected
 assert_not_symlink "$RELEASE_CONTROLLER_BIN"
 assert_safe_existing "$RELEASE_CONTROLLER_BIN" file root root protected
 assert_not_symlink "/etc/systemd/system/$SERVICE_NAME.service"
@@ -453,11 +454,11 @@ install -d -m 0750 -o honeybuy -g honeybuy "$DATA_DIR"
 install -d -m 0755 -o root -g root "$CACHE_DIR"
 install -d -m 0755 -o honeybuy-build -g honeybuy-build "$CACHE_DIR/uv"
 install -d -m 0711 -o root -g root "$STATE_DIR"
+install -d -m 0755 -o root -g root "$EMPTY_WORK_DIR"
 install -d -m 0700 -o root -g root "$STATE_DIR/repository"
 install -d -m 0711 -o root -g root "$STATE_DIR/scratch"
 install -d -m 0700 -o root -g root "$BACKUP_DIR"
 install -d -m 0755 -o root -g root /usr/local/lib/honeybuy
-install -d -m 0755 -o root -g root /var/empty/honeybuy-healthcheck
 
 if [[ ! -e "$ENV_FILE" ]]; then
   install -m 0600 -o root -g root "$REPO_ROOT/deploy/ubuntu/env.example" "$ENV_FILE"
