@@ -101,87 +101,111 @@ uv run ruff check .
 
 ## Ubuntu Deployment
 
-This project is deployed without Docker for now: a checkout under `/opt`, config
-under `/etc`, SQLite data under `/var/lib`, and a `systemd` service.
+The guarded production release path uses root-owned immutable releases rather
+than an application checkout. Converting a legacy host does not promise to
+delete every unused file from its former copy-deployment; those files are no
+longer execution or release inputs. The important paths are:
 
-On the Ubuntu server:
-
-```sh
-sudo apt update
-sudo apt install -y ca-certificates git
-sudo git clone <repo-url> /opt/honeybuy-tg
-cd /opt/honeybuy-tg
-sudo deploy/ubuntu/install.sh
+```text
+/opt/honeybuy-tg/releases/<git-sha>/       immutable application releases
+/opt/honeybuy-tg/current                   active-release symlink
+/opt/honeybuy-tg/previous                  rollback-release symlink
+/etc/honeybuy-tg/env                       runtime secrets
+/etc/honeybuy-tg/allowed_signers           Git signature verification key
+/var/lib/honeybuy-tg/honeybuy.sqlite3      live SQLite database
+/var/lib/honeybuy-release-controller/repository/  private bare Git repository
+/var/lib/honeybuy-release-controller/deployed-sha committed deployed SHA
+/var/lib/honeybuy-release-controller/*.json       journals/control-plane manifest
+/var/lib/honeybuy-release-controller/receipts/    successful release evidence
+/var/lib/honeybuy-release-controller/quarantine/  blocked candidate evidence
+/var/backups/honeybuy-tg/                  per-candidate SQLite backups
 ```
 
-Then edit secrets:
+`honeybuy-tg.service` runs the bot. `honeybuy-release-controller.service` is a
+root, `Type=exec` one-shot controller, and
+`honeybuy-release-controller.timer` starts it every five minutes with up to 30
+seconds of jitter and persistent catch-up after downtime. To request an
+immediate run, start the unit; never invoke the controller Python file directly:
 
 ```sh
-sudoedit /etc/honeybuy-tg/env
+sudo systemctl start honeybuy-release-controller.service
+sudo journalctl -u honeybuy-release-controller.service -n 100 --no-pager
 ```
 
-Start and inspect logs:
+The controller assumes the configured GitHub repository is public. Normal
+releases arrive only through a pull request merged with GitHub's **Rebase and
+merge** action. The exact candidate on `main` must have a successful `offline`
+push workflow, and GitHub must associate it with exactly one merged same-repo
+PR whose signed head has the identical Git tree. GitHub rewrites commits during
+Rebase and merge, so the rewritten commits on `main` are expected to be
+unsigned. Do **not** enable a signed-commit requirement on `main`.
 
-```sh
-sudo systemctl start honeybuy-tg
-sudo journalctl -u honeybuy-tg -f
-```
+Configure the `main` ruleset to require pull requests, require the exact
+`offline` check with the strict “branch must be up to date” option, allow only
+Rebase and merge, require linear history, reject force pushes and deletion, and
+allow no administrator or other bypass. Fork PRs are outside this deployment
+trust model.
 
-The installer also installs `ffmpeg`, installs `uv` to `/usr/local/bin` when
-missing, creates the `honeybuy` system user, and enables the service.
+The single `offline` Actions job is the required release gate. On every push
+and same-repository PR it includes the Linux/root/systemd containment test in
+addition to dependency sync, the full offline suite, Ruff, and the clean-diff
+check. Fork PRs still run the ordinary offline gates; only their root/systemd
+step is skipped because fork code is not trusted to run as root.
 
-To update a git-checkout deployment:
+The controller builds a candidate in a private staging directory, verifies and
+seals it, then atomically promotes it to `releases/<git-sha>`. Before changing
+the live service it dry-runs migration and the database-only health check on a
+clone. It then stops the bot, creates and validates a backup, migrates the live
+database, switches the release symlinks, restarts the bot, and requires stable
+health before recording a receipt. A failed post-start candidate is quarantined
+and is not retried automatically. Durable journals let a later controller run
+resume or roll back an interrupted activation.
 
-```sh
-cd /opt/honeybuy-tg
-sudo git pull
-sudo uv sync --frozen
-```
+The service runs `python -m honeybuy_tg healthcheck` in `ExecStartPre`. That
+command reads only `DATABASE_PATH`, clones the database into memory, and checks
+the exact schema, integrity, and foreign keys. It neither migrates the database
+nor contacts Telegram or OpenAI.
 
-The current production server is copy-deployed into `/opt/honeybuy-tg`. For that
-server, copy or sync the checked-out tree first instead of running `git pull`,
-then refresh dependencies:
+### Initial or legacy host bootstrap
 
-```sh
-# Example from the local checkout; replace host/path details for your server.
-rsync -a --delete \
-  --exclude .git \
-  --exclude .env \
-  --exclude data/ \
-  --exclude .venv/ \
-  --exclude .uv-cache/ \
-  --exclude .pytest_cache/ \
-  --exclude .ruff_cache/ \
-  --exclude __pycache__/ \
-  --exclude '*.pyc' \
-  ./ <server>:/opt/honeybuy-tg/
+Run `deploy/ubuntu/install.sh` as root from a separate trusted source checkout,
+not from `/opt/honeybuy-tg`. The installer pins `uv`, installs the signer and
+systemd control plane, and creates the runtime/build users and directories.
+Configure `/etc/honeybuy-tg/env` before starting the bot.
 
-cd /opt/honeybuy-tg
-sudo uv sync --frozen
-```
+An existing copy-deployed production database is adopted with exactly two
+installer passes:
 
-For schema-bearing updates, stop the bot before taking the SQLite backup and
-running migrations:
+1. Run the installer once. It writes a `bootstrap_pending` control-plane
+   manifest, verifies the installed bootstrap control plane, leaves the
+   automatic timer disabled, and intentionally exits nonzero to require the
+   remaining operator-controlled bootstrap steps.
+2. Stop `honeybuy-tg.service`, then run
+   `sudo systemctl start honeybuy-release-controller.service`. The controller
+   verifies `main`, creates the immutable baseline, and records
+   `awaiting_service`; it does not start the bot.
+3. Run the same installer a second time. It installs the new bot unit, writes
+   the `installed` manifest, and enables the service and timer.
+4. Start `honeybuy-tg.service`, verify it is active, and let the next timer run
+   finalize the bootstrap receipt. Starting the controller service once more is
+   the systemd-only way to request immediate finalization.
 
-```sh
-sudo systemctl stop honeybuy-tg
-sudo cp /var/lib/honeybuy-tg/honeybuy.sqlite3 \
-  /var/lib/honeybuy-tg/honeybuy.sqlite3.$(date -u +%Y%m%dT%H%M%SZ).bak
-sudo systemd-run --wait --pipe --collect \
-  --uid=honeybuy --gid=honeybuy \
-  --working-directory=/opt/honeybuy-tg \
-  --property=EnvironmentFile=/etc/honeybuy-tg/env \
-  --setenv=UV_CACHE_DIR=/var/cache/honeybuy-tg/uv \
-  /usr/local/bin/uv run python -m honeybuy_tg migrate
-sudo systemctl start honeybuy-tg
-sudo journalctl -u honeybuy-tg -f
-```
+The adopted database must already have the schema expected by the baseline
+release. Preserve a server-side backup before beginning. See
+[`docs/operations-and-testing.md`](docs/operations-and-testing.md#guarded-ubuntu-deployment)
+for preconditions, recovery states, control-plane updates, and verification.
 
-The bot still starts with no module arguments, and the explicit `migrate`
-command runs SQLite migrations and exits.
+After bootstrap, do not update `/opt/honeybuy-tg` with `git pull`, `rsync`, or
+an in-place `uv sync`. Those are legacy/emergency recovery techniques only and
+must be performed with the timer disabled, the bot stopped, and a verified
+backup. Normal application updates are produced solely by the release
+controller. A candidate that changes the controller, either systemd unit, the
+timer, or the signer is deliberately blocked until an operator runs the
+installer from that reviewed revision; automatic deployment never updates its
+own trust boundary.
 
-The service template lives at `deploy/systemd/honeybuy-tg.service`. The runtime
-env template lives at `deploy/ubuntu/env.example`.
+The service templates live under `deploy/systemd/`; the runtime environment
+template is `deploy/ubuntu/env.example`.
 
 ## Current Commands
 

@@ -1,6 +1,6 @@
 # Honeybuy Telegram Bot Plan
 
-Last updated: 2026-09-03
+Last updated: 2026-09-04
 
 ## Goal
 
@@ -11,15 +11,20 @@ stores state locally in SQLite.
 
 ## Current Status
 
-- The bot is implemented and deployed on Ubuntu with `systemd`.
+- The bot is implemented and the existing production bot runs on Ubuntu with
+  `systemd`.
 - The main runtime path is long polling via `aiogram`.
 - Local dependency management and command execution use `uv`.
 - SQLite is the source of truth for auth, lists, recipes, bot message context,
   AI caches, and event history.
 - SQLite schema changes are handled by explicit `PRAGMA user_version`
-  migrations. Normal bot startup runs migrations before polling, and
-  `uv run python -m honeybuy_tg migrate` runs them as a deployment step and
-  exits.
+  migrations. Application startup still initializes known migrations, while
+  the guarded production release path dry-runs and applies schema-bearing
+  changes under the release controller before the new bot starts.
+- A database-only `python -m honeybuy_tg healthcheck` reads only
+  `DATABASE_PATH`, checks the exact schema, integrity, and foreign keys on an
+  in-memory clone, and performs no migration or network call. The production
+  bot unit uses it as `ExecStartPre`.
 - OpenAI is used for voice transcription, natural command parsing, grocery
   categories, recipe extraction, recipe command fallback, and item identity
   normalization.
@@ -29,7 +34,25 @@ stores state locally in SQLite.
   offline graders, and an opt-in live model comparison runner with explicit
   release gates. Live evals require a separate key and never run in CI.
 - GitHub Actions runs locked dependency sync, the full offline test suite, Ruff,
-  and `git diff --check` on pushes and pull requests.
+  and `git diff --check` on pushes and pull requests. Its single required
+  `offline` job also runs the Linux/root/systemd containment test on pushes and
+  same-repository PRs; fork PRs skip only that privileged step.
+- The repository now contains the guarded automatic-deployment implementation:
+  root-owned immutable SHA releases, atomic `current`/`previous` links, a
+  private bare repository and controller state, activation/bootstrap journals,
+  validated backups, receipts, quarantine, a versioned control-plane
+  manifest, and a protected public-key signer. Required GitHub CI verification,
+  GitHub ruleset configuration, and the exact two-pass production bootstrap
+  remain before this becomes the production release path.
+- `honeybuy-release-controller.timer` checks every five minutes with up to 30
+  seconds of jitter and persistent catch-up. Manual controller runs are valid
+  only by starting its `Type=exec` systemd service, never by invoking the Python
+  program directly.
+- The release trust model assumes a public GitHub repository. It accepts a
+  GitHub-rewritten `main` commit only after the successful exact-SHA `offline`
+  push workflow and exactly one matching merged same-repository PR whose
+  SSH-signed head has the identical tree. GitHub's rewritten `main` commit is
+  intentionally not required to be signed.
 - PT-025 cross-chat inline capture is implemented and covered by offline
   service, storage, migration, and fake-Telegram integration tests. Enabling
   `/setinline` in `@BotFather` and the live Telegram smoke test are still
@@ -90,7 +113,8 @@ stores state locally in SQLite.
   checks, handlers, callbacks, and message context handling.
 - `formatting`: user-facing Telegram message formatting.
 - `metrics`: Prometheus counters, histograms, and exporter startup.
-- `deploy`: Ubuntu installer and `systemd` unit.
+- `deploy`: guarded Ubuntu installer, release controller, signer, and `systemd`
+  service/timer units.
 
 ## Key Data
 
@@ -143,29 +167,50 @@ Optional metrics:
 ## Deployment Notes
 
 - Production host: Ubuntu VPS.
-- App directory: `/opt/honeybuy-tg`.
-- Runtime env: `/etc/honeybuy-tg/env`.
-- SQLite database: `/var/lib/honeybuy-tg/honeybuy.sqlite3`.
-- Service: `honeybuy-tg`.
+- Immutable releases live at `/opt/honeybuy-tg/releases/<git-sha>`;
+  `/opt/honeybuy-tg/current` selects the active release and
+  `/opt/honeybuy-tg/previous` selects the rollback release.
+- Runtime secrets stay in `/etc/honeybuy-tg/env`; the live `honeybuy`-owned
+  `0600` database is `/var/lib/honeybuy-tg/honeybuy.sqlite3`.
+- `/var/lib/honeybuy-release-controller` holds the private bare repository,
+  deployed SHA, bootstrap/activation journals, receipts, quarantine, scratch
+  space, and the root-owned `0600` control-plane manifest.
+- Validated pre-migration backups live under `/var/backups/honeybuy-tg`.
+  `/etc/honeybuy-tg/allowed_signers` contains the protected public verification
+  key; no deployment private key belongs on the server.
+- `honeybuy-tg.service` runs the bot and its database-only `ExecStartPre`.
+  `honeybuy-release-controller.service` must be the controller's real
+  `MainPID`; its persistent timer runs every five minutes with jitter.
+- The public GitHub `main` rules must require pull requests, Rebase and merge,
+  strict/up-to-date status check `offline`, and linear history, while rejecting
+  force pushes and deletion and allowing no administrator or actor bypass. The
+  controller separately rejects fork PRs. Signed commits must not be required
+  on `main`, because GitHub rewrites rebase commits; trust comes from the signed
+  same-repository PR head, identical tree, and exact final-SHA push workflow.
+- Existing legacy production is adopted with exactly two executions of the
+  installer. Pass one installs a `bootstrap_pending` controller control plane
+  with the timer disabled, verifies it, and intentionally exits nonzero. With
+  the bot stopped, a systemd controller run creates the immutable baseline and
+  `awaiting_service` journal. Pass two validates that state, installs the bot
+  unit, records `installed`, and enables the service and timer. Start the bot,
+  then let the timer or another systemd controller run confirm health and write
+  the bootstrap receipt.
+- Automatic activation journals every boundary. Recovery converges or rolls
+  back on the next controller run; a failed post-start candidate is durably
+  quarantined and cannot be retried. The rollback intent is durable before
+  restoring the database or switching `current` back, and an old backup is not
+  replayed after the rollback start boundary.
+- Changes to the controller, signer, bot/controller units, or timer cross a
+  manual control-plane gate. The controller rejects such a candidate before
+  stop, migration, switch, or quarantine until an operator runs the installer
+  from that exact reviewed revision.
+- After bootstrap, never use `git pull`, `rsync`, in-place `uv sync`, or manual
+  copies as a normal release mechanism. Those commands are reserved for an
+  explicitly reviewed legacy/emergency recovery with the timer disabled, bot
+  stopped, and an independently verified backup.
 - The installer installs `ffmpeg` because Telegram voice notes need conversion
-  before transcription.
-- Deployment currently copies the working tree and optionally copies the local
-  SQLite database to the server.
-- The current server is copy-deployed. Use `git pull` only after converting
-  `/opt/honeybuy-tg` back to a git checkout.
-- Before changing the remote database, create a timestamped remote backup.
-- Deployment process for schema-bearing changes:
-  1. Copy/sync the app files under `/opt/honeybuy-tg`, or run `git pull` only
-     on a server directory that is a real git checkout.
-  2. Run `sudo uv sync --frozen` from `/opt/honeybuy-tg`.
-  3. Stop or otherwise quiesce `honeybuy-tg` so SQLite is not being written.
-  4. Back up `/var/lib/honeybuy-tg/honeybuy.sqlite3`.
-  5. Run the migration command with the service environment:
-     `uv run python -m honeybuy_tg migrate`.
-  6. Start or restart `honeybuy-tg`.
-  7. Watch `sudo journalctl -u honeybuy-tg -f`.
-- Keep the metrics exporter bound to localhost unless it is behind a trusted
-  network or reverse proxy.
+  before transcription. Keep the metrics exporter bound to localhost unless it
+  is behind a trusted network or reverse proxy.
 
 ## Verification Checklist
 
@@ -183,8 +228,24 @@ Optional metrics:
 - [x] Prompt contracts are versioned and fingerprinted in live-eval reports.
 - [x] GitHub Actions runs the full offline test and lint gates without Telegram
   or OpenAI credentials.
-- [x] `ruff check .` passes.
-- [x] `pytest -q` passes.
+- [x] Before the guarded-deployment work, the full offline baseline completed
+  with 668 passed and 3 skipped tests.
+- [x] Guarded deployment has deterministic controller/installer test coverage
+  for GitHub evidence, immutable preparation, containment, activation,
+  bootstrap, recovery, backup, rollback, receipts, quarantine, and the
+  database-only health check.
+- [x] After integration, `tests/test_deploy.py tests/test_release_controller.py`
+  passed with 404 passed and 2 skipped, the full offline suite passed with 810
+  passed and 3 skipped, Ruff passed, and `git diff HEAD --check` passed.
+- [ ] Confirm the mandatory Linux/root/systemd containment step passes inside
+  the required `offline` job for a same-repository PR and the final `main`
+  push.
+- [x] Obtain final independent review of the integrated guarded-deployment
+  change.
+- [ ] Configure and verify the required public-GitHub `main` ruleset: strict
+  `offline`, Rebase and merge only, linear history, no force/delete, and no
+  administrator or actor bypass.
+- [ ] Complete and verify the two-pass legacy production bootstrap.
 - [ ] A release-qualified live baseline eval has passed for the configured
   production parse model with the maintained corpus and at least three
   repetitions.
@@ -234,35 +295,46 @@ Optional metrics:
 
 ### Operations
 
-- [x] Document backup and migration commands for SQLite deploys.
+- [x] Implement the guarded immutable-release controller with durable recovery,
+  validated deployment backups, receipts, quarantine, and a manual
+  control-plane gate.
+- [x] Document guarded production backup, rollback, and migration behavior.
+- [x] Add the database-only health check command and production `ExecStartPre`.
 - [ ] Add a documented restore command for SQLite.
 - [ ] Add log rotation notes or config for the Ubuntu service.
-- [ ] Add a lightweight health check command.
+- [ ] Define retention for deployment backups, receipts, quarantine, and old
+  immutable releases.
 - [ ] Decide whether webhook mode is worth adding later.
 - [ ] Consider a `.deb` package after the deployment flow stabilizes.
 
 ## Current Next Steps
 
-1. Run the first release-qualified live text-routing baseline with a separate
+1. Run the mandatory Linux/root/systemd containment step in the
+   same-repository PR's `offline` job and on the final `main` push.
+2. Configure and verify the public GitHub `main` rules: pull requests, Rebase
+   and merge only, strict/up-to-date exact check `offline`, linear history, no
+   force push or deletion, and no administrator or actor bypass. Do not require
+   signed commits on rewritten `main`.
+3. From the exact reviewed source revision, take and verify an off-path
+   production database backup and perform the documented two-pass legacy
+   bootstrap. Invoke the controller only through its systemd service and leave
+   the timer disabled until the second installer pass records `installed`.
+4. Verify the bootstrap receipt, deployed SHA, `current`/`previous` links,
+   installed control-plane manifest, timer schedule, controller journals,
+   quarantine, backup permissions, database-only health check, and stable bot
+   service. Do not return to `git pull`, `rsync`, or in-place release updates.
+5. Run the first release-qualified live text-routing baseline with a separate
    `HONEYBUY_EVAL_OPENAI_API_KEY`, the full maintained corpus, and at least three
    repetitions. Use the configured production parse model as the baseline and
    require every release gate in `docs/operations-and-testing.md` to pass.
-2. After the live baseline passes, copy-deploy the current tree, including the
-   completed routing hardening, prompt contracts, eval system, recipe-flow,
-   normalization, cross-language matching, active-list dedupe, PT-025 inline
-   capture, and schema-v2 migration work. The current production host is
-   copy-deployed, so a repository push alone does not update it.
-3. Stop or quiesce `honeybuy-tg`, back up the remote SQLite database, run
-   `uv run python -m honeybuy_tg migrate` with the service environment, start or
-   restart `honeybuy-tg`, and watch production logs.
-4. Watch production logs during the first identity-touching smoke run against
+6. Watch production logs during the first identity-touching smoke run against
    old rows, explicitly including `/list`, `/shop`, `/remove`, and `/bought`,
    because those paths can backfill canonical identities and remove duplicate
    active rows.
-5. Enable inline mode manually with `@BotFather` `/setinline` and confirm the bot
+7. Enable inline mode manually with `@BotFather` `/setinline` and confirm the bot
    remains an administrator in every authorized group intended as an inline
    destination. `/setinlinefeedback` is not required.
-6. Run manual Telegram smoke checks in private chat and group chat:
+8. Run manual Telegram smoke checks in private chat and group chat:
    authorization, inline capture into both eligible destination kinds with an
    explicit confirmation and replay attempt, `/add`, `/list`, `/shop`,
    `/remove`, `/bought`, voice input, recipe link learning, pasted recipe
@@ -270,5 +342,5 @@ Optional metrics:
    the Russian routing regressions that distinguish saved-recipe requests such
    as `купи ингредиенты для солянки` from ordinary shopping phrases such as
    `купи продукты` and `купи на завтра молоко`.
-7. Keep product work paused until deploy and smoke checks are complete. The next
+9. Keep product work paused until deploy and smoke checks are complete. The next
    product candidate remains better due-date support in rendered lists.
