@@ -5562,6 +5562,21 @@ def test_linux_transient_runner_contains_setsid_descendants(
     if shutil.which("systemd-run") is None or shutil.which("systemctl") is None:
         pytest.skip("requires systemd-run and systemctl")
 
+    system_python_path = Path(sys.executable).resolve(strict=True)
+    protect_home_hidden_roots = (Path("/home"), Path("/root"), Path("/run/user"))
+    hidden_root = next(
+        (
+            root
+            for root in protect_home_hidden_roots
+            if system_python_path.is_relative_to(root)
+        ),
+        None,
+    )
+    assert hidden_root is None, (
+        "resolved test interpreter is hidden by ProtectHome=yes: "
+        f"sys.executable={sys.executable!r}, resolved={str(system_python_path)!r}, "
+        f"hidden_root={str(hidden_root)!r}"
+    )
     nobody = pwd.getpwnam("nobody")
     work_root = Path(tempfile.mkdtemp(prefix="honeybuy-containment-", dir="/run"))
     work_root.chmod(0o755)
@@ -5603,12 +5618,12 @@ def test_linux_transient_runner_contains_setsid_descendants(
         f"""
         import pathlib
         import subprocess
-        import sys
         import time
 
         child_pid = pathlib.Path({str(child_pid)!r})
+        system_python_path = {str(system_python_path)!r}
         subprocess.Popen(
-            [sys.executable, "-I", "-c", {child_code!r}],
+            [system_python_path, "-I", "-c", {child_code!r}],
             start_new_session=True,
             stdout={stream_expression},
             stderr={stream_expression},
@@ -5638,6 +5653,7 @@ def test_linux_transient_runner_contains_setsid_descendants(
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
+        system_python_path = pathlib.Path({str(system_python_path)!r})
 
         shown = subprocess.run(
             [
@@ -5667,18 +5683,22 @@ def test_linux_transient_runner_contains_setsid_descendants(
         }}
 
         runner = module.SubprocessRunner(
-            timeout_seconds=0.5,
+            timeout_seconds=2.0,
             management_timeout_seconds=2.0,
             controller_unit=unit,
         )
         descendant = runner.run(
-            (sys.executable, "-I", "-c", {parent_code!r}),
+            (str(system_python_path), "-I", "-c", {parent_code!r}),
             uid={nobody.pw_uid},
             gid={nobody.pw_gid},
             env={{}},
             writable_paths=(pathlib.Path({str(runtime_dir)!r}),),
         )
-        assert descendant.returncode == 0
+        assert descendant.returncode == 0, (
+            "descendant workload failed: "
+            f"returncode={{descendant.returncode}}, "
+            f"stdout={{descendant.stdout!r}}, stderr={{descendant.stderr!r}}"
+        )
         escaped_pid = int(pathlib.Path({str(child_pid)!r}).read_text(encoding="ascii"))
         pathlib.Path({str(trigger)!r}).touch()
         descendant_gone = False
@@ -5694,7 +5714,7 @@ def test_linux_transient_runner_contains_setsid_descendants(
         assert not pathlib.Path({str(mutation)!r}).exists()
 
         nonzero = runner.run(
-            (sys.executable, "-I", "-c", "raise SystemExit(23)"),
+            (str(system_python_path), "-I", "-c", "raise SystemExit(23)"),
             uid={nobody.pw_uid},
             gid={nobody.pw_gid},
             env={{}},
@@ -5704,7 +5724,12 @@ def test_linux_transient_runner_contains_setsid_descendants(
         timed_out = False
         try:
             runner.run(
-                (sys.executable, "-I", "-c", "import time; time.sleep(30)"),
+                (
+                    str(system_python_path),
+                    "-I",
+                    "-c",
+                    "import time; time.sleep(30)",
+                ),
                 uid={nobody.pw_uid},
                 gid={nobody.pw_gid},
                 env={{}},
@@ -5724,7 +5749,7 @@ def test_linux_transient_runner_contains_setsid_descendants(
             database_path=source_database,
             scratch_dir=pathlib.Path({str(scratch_dir)!r}),
             empty_work_dir=pathlib.Path({str(empty_work_dir)!r}),
-            system_python_path=pathlib.Path(sys.executable),
+            system_python_path=system_python_path,
             runtime_uid={nobody.pw_uid},
             runtime_gid={nobody.pw_gid},
             test_mode=False,
@@ -5771,7 +5796,7 @@ def test_linux_transient_runner_contains_setsid_descendants(
                 "--property=TimeoutStartSec=15s",
                 "--property=TimeoutStopSec=5s",
                 "--",
-                sys.executable,
+                str(system_python_path),
                 "-I",
                 "-c",
                 harness,
@@ -5783,7 +5808,12 @@ def test_linux_transient_runner_contains_setsid_descendants(
         )
         if child_pid.exists():
             escaped_pid = int(child_pid.read_text(encoding="ascii"))
-        assert completed.returncode == 0, completed.stderr.decode("utf-8", "replace")
+        assert completed.returncode == 0, (
+            "containment harness failed: "
+            f"returncode={completed.returncode}, "
+            f"stdout={completed.stdout.decode('utf-8', 'replace')!r}, "
+            f"stderr={completed.stderr.decode('utf-8', 'replace')!r}"
+        )
         result = _read_json(result_path)
         assert result["main_pid"] > 1
         assert result["descendant"] == "contained"
