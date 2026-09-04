@@ -387,9 +387,10 @@ After a qualifying merge, the timer performs the complete application update:
    service, controller timer, and allowed signer.
 4. Extract the authenticated tree into
    `/opt/honeybuy-tg/releases/.<sha>.tmp`, run `uv sync --frozen` as
-   `honeybuy-build`, run an import smoke test, seal the tree as root, write its
-   provenance manifest, and atomically rename only the completed tree to
-   `releases/<sha>`.
+   `honeybuy-build`, seal the tree as root with runtime-readable canonical
+   modes, then run an isolated `honeybuy_tg.app` import as `honeybuy-build`,
+   write its provenance manifest, and atomically rename only the completed
+   tree to `releases/<sha>`.
 5. Clone the live SQLite database and dry-run the candidate migration and
    database-only health check without stopping the bot.
 6. Re-fetch `main` and revalidate the candidate, installed control plane,

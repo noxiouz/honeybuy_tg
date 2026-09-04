@@ -199,6 +199,12 @@ deployment_state_is_coherent() {
   if find "$release" -xdev ! -type l \( ! -user root -o -perm /022 \) -print -quit | grep -q .; then
     return 1
   fi
+  if find "$release" -xdev -type d ! -perm 0755 -print -quit | grep -q .; then
+    return 1
+  fi
+  if find "$release" -xdev -type f ! -perm 0644 ! -perm 0755 -print -quit | grep -q .; then
+    return 1
+  fi
   while IFS= read -r -d '' link; do
     [[ "$(stat -c '%U:%G' -- "$link")" == root:root ]] || return 1
     link_relative=${link#"$release"/}

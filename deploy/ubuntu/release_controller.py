@@ -3176,7 +3176,12 @@ class ReleaseController:
             self._discard_release_staging(staging, sha)
             return _result(ResultStatus.REJECTED, "failed to seal build output", sha)
         smoke = self._run_command(
-            (str(staging / ".venv/bin/python"), "-c", "import honeybuy_tg"),
+            (
+                str(staging / ".venv/bin/python"),
+                "-I",
+                "-c",
+                "import honeybuy_tg.app",
+            ),
             cwd=staging,
             uid=self.config.build_uid,
             gid=self.config.build_gid,
@@ -5565,9 +5570,7 @@ def _open_directory_nofollow(path: Path) -> tuple[int, os.stat_result]:
 
 
 def _normalized_artifact_mode(metadata: os.stat_result) -> int:
-    mode = stat.S_IMODE(metadata.st_mode) & 0o755
-    mode &= ~0o022
-    return mode or 0o644
+    return 0o755 if metadata.st_mode & 0o111 else 0o644
 
 
 def _digest_record(
@@ -5953,10 +5956,7 @@ def _finalize_release_tree(
         if stat.S_ISDIR(metadata.st_mode):
             mode = 0o755
         elif stat.S_ISREG(metadata.st_mode):
-            mode = metadata.st_mode & 0o755
-            mode &= ~0o022
-            if mode == 0:
-                mode = 0o644
+            mode = _normalized_artifact_mode(metadata)
         else:
             raise OSError(f"release contains unsafe file type: {path}")
         _set_path_metadata(path, mode=mode, uid=uid, gid=gid)
@@ -6018,17 +6018,21 @@ def _tree_metadata_is_safe(root: Path, *, expected_uid: int, expected_gid: int) 
             metadata = path.lstat()
         except OSError:
             return False
-        if path.is_symlink():
+        if stat.S_ISLNK(metadata.st_mode):
             if not _is_allowed_venv_symlink(root, path):
                 return False
             if metadata.st_uid != expected_uid or metadata.st_gid != expected_gid:
                 return False
             continue
-        if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+        if stat.S_ISDIR(metadata.st_mode):
+            expected_modes = {0o755}
+        elif stat.S_ISREG(metadata.st_mode):
+            expected_modes = {0o644, 0o755}
+        else:
             return False
         if metadata.st_uid != expected_uid or metadata.st_gid != expected_gid:
             return False
-        if metadata.st_mode & 0o022:
+        if stat.S_IMODE(metadata.st_mode) not in expected_modes:
             return False
     return True
 
