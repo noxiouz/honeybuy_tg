@@ -333,7 +333,12 @@ Normal bot startup calls `Storage.init` and runs migrations before polling. The
 explicit migrate command additionally runs `PRAGMA integrity_check` after the
 migration commits. It does not run `PRAGMA foreign_key_check`.
 
-Before deploying code with a new schema version, stop the bot and make a
-timestamped copy of the SQLite file. An older binary intentionally refuses a
-newer `user_version`, so application rollback may also require restoring the
-matching database backup.
+For manual updates, stop the bot and ensure there are no other writers before
+backing up and migrating SQLite. Use SQLite's backup API or CLI `.backup` to
+create a consistent standalone backup; copying only the main file can omit
+committed WAL data. Validate the backup, then run the new release's `migrate`
+and database-only `healthcheck` commands before starting it.
+
+Do not run older code against a newer schema, or overwrite newer writes with a
+pre-update backup. Recovery is an explicit operator decision. See the
+[manual deployment procedure](operations-and-testing.md#manual-ubuntu-deployment).

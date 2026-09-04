@@ -63,7 +63,7 @@ Keep these properties intact when changing the project:
 src/honeybuy_tg/
   __init__.py       console-script entrypoint
   __main__.py       python -m entrypoint
-  app.py            settings, migrate command, process startup
+  app.py            bot startup and database-only maintenance commands
   config.py         environment-backed settings and validation
   telegram_bot.py   aiogram composition root, routes, callbacks, voice I/O
   service.py        shopping and recipe domain orchestration
@@ -77,7 +77,7 @@ src/honeybuy_tg/
   metrics.py        Prometheus instrumentation
 
 tests/               module-aligned unit and integration-style tests
-deploy/              Ubuntu installer, environment template, systemd unit
+deploy/              Bot systemd service and environment template
 README.md            quick start and operator guide
 SCENARIOS.md         user-visible functional contract
 PLAN.md              project status and backlog
@@ -94,9 +94,9 @@ The code is intentionally small and optimized for one household bot process:
 - `Storage` exposes `async` methods but uses synchronous `sqlite3` calls and
   normally opens a fresh connection for each operation. Large or parallel batch
   workloads would require a different persistence strategy.
-- The deployed topology is one long-polling process and one local SQLite file.
-  The repository has no HTTP application API, job queue, or multi-node
-  coordination.
+- The application topology is one long-polling process and one local SQLite
+  file, deployed manually. The repository has no HTTP application API, job
+  queue, or multi-node coordination.
 
 These are current implementation facts, not guarantees that future versions
 must preserve.

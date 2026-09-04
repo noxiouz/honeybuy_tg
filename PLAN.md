@@ -18,9 +18,9 @@ stores state locally in SQLite.
 - SQLite is the source of truth for auth, lists, recipes, bot message context,
   AI caches, and event history.
 - SQLite schema changes are handled by explicit `PRAGMA user_version`
-  migrations. Application startup still initializes known migrations, while
-  the guarded production release path dry-runs and applies schema-bearing
-  changes under the release controller before the new bot starts.
+  migrations. Normal bot startup loads full settings and initializes known
+  migrations; the `migrate` and `healthcheck` commands load only the database
+  path.
 - A database-only `python -m honeybuy_tg healthcheck` reads only
   `DATABASE_PATH`, checks the exact schema, integrity, and foreign keys on an
   in-memory clone, and performs no migration or network call. The production
@@ -30,29 +30,14 @@ stores state locally in SQLite.
   normalization.
 - Natural-text and recipe routing use versioned prompt contracts with strict
   response schemas and stable prompt fingerprints.
-- Text routing has a maintained 78-case bilingual eval corpus, deterministic
+- Text routing has a maintained bilingual eval corpus, deterministic
   offline graders, and an opt-in live model comparison runner with explicit
   release gates. Live evals require a separate key and never run in CI.
-- GitHub Actions runs locked dependency sync, the full offline test suite, Ruff,
-  and `git diff --check` on pushes and pull requests. Its single required
-  `offline` job also runs the Linux/root/systemd containment test on pushes and
-  same-repository PRs; fork PRs skip only that privileged step.
-- The guarded automatic-deployment path is active in production: root-owned
-  immutable SHA releases, atomic `current`/`previous` links, a private bare
-  repository and controller state, activation/bootstrap journals, validated
-  backups, receipts, quarantine, a versioned control-plane manifest, and a
-  protected public-key signer. The legacy baseline bootstrap has a durable
-  receipt, `e29dcee1358227f1320f24f719bba707ef6f1ef8` is deployed, and the
-  enabled timer has completed a healthy exact-main `NOOP` cycle.
-- `honeybuy-release-controller.timer` checks every five minutes with up to 30
-  seconds of jitter and persistent catch-up. Manual controller runs are valid
-  only by starting its `Type=exec` systemd service, never by invoking the Python
-  program directly.
-- The release trust model assumes a public GitHub repository. It accepts a
-  GitHub-rewritten `main` commit only after the successful exact-SHA `offline`
-  push workflow and exactly one matching merged same-repository PR whose
-  SSH-signed head has the identical tree. GitHub's rewritten `main` commit is
-  intentionally not required to be signed.
+- GitHub Actions runs locked dependency sync, the offline test suite, Ruff, and
+  `git diff --check` for pull requests and `main`. CI tests code only: it does
+  not SSH to production, deploy releases, or hold a deployment signing key.
+- Deployment is manual. CI runs offline checks only; no commit or tag triggers
+  a production release.
 - PT-025 cross-chat inline capture is implemented and covered by offline
   service, storage, migration, and fake-Telegram integration tests. Enabling
   `/setinline` in `@BotFather` and the live Telegram smoke test are still
@@ -95,8 +80,7 @@ stores state locally in SQLite.
 - AI item identity normalization deduplicates equivalent items across languages,
   such as `water` and `вода`, and improves bought/remove matching.
 - Category and item-normalization results are cached to control API cost.
-- Ubuntu deployment files exist for `systemd`, `uv`, persistent SQLite data, and
-  `ffmpeg`.
+- A systemd bot service and environment example support manual Ubuntu operation.
 
 ## Architecture
 
@@ -113,8 +97,7 @@ stores state locally in SQLite.
   checks, handlers, callbacks, and message context handling.
 - `formatting`: user-facing Telegram message formatting.
 - `metrics`: Prometheus counters, histograms, and exporter startup.
-- `deploy`: guarded Ubuntu installer, release controller, signer, and `systemd`
-  service/timer units.
+- `deploy`: bot systemd service and environment template for manual operation.
 
 ## Key Data
 
@@ -166,51 +149,16 @@ Optional metrics:
 
 ## Deployment Notes
 
-- Production host: Ubuntu VPS.
-- Immutable releases live at `/opt/honeybuy-tg/releases/<git-sha>`;
-  `/opt/honeybuy-tg/current` selects the active release and
-  `/opt/honeybuy-tg/previous` selects the rollback release.
-- Runtime secrets stay in `/etc/honeybuy-tg/env`; the live `honeybuy`-owned
-  `0600` database is `/var/lib/honeybuy-tg/honeybuy.sqlite3`.
-- `/var/lib/honeybuy-release-controller` holds the private bare repository,
-  deployed SHA, bootstrap/activation journals, receipts, quarantine, scratch
-  space, and the root-owned `0600` control-plane manifest.
-- Validated pre-migration backups live under `/var/backups/honeybuy-tg`.
-  `/etc/honeybuy-tg/allowed_signers` contains the protected public verification
-  key; no deployment private key belongs on the server.
-- `honeybuy-tg.service` runs the bot and its database-only `ExecStartPre`.
-  `honeybuy-release-controller.service` must be the controller's real
-  `MainPID`; its persistent timer runs every five minutes with jitter.
-- The public GitHub `main` rules must require pull requests, Rebase and merge,
-  strict/up-to-date status check `offline`, and linear history, while rejecting
-  force pushes and deletion and allowing no administrator or actor bypass. The
-  controller separately rejects fork PRs. Signed commits must not be required
-  on `main`, because GitHub rewrites rebase commits; trust comes from the signed
-  same-repository PR head, identical tree, and exact final-SHA push workflow.
-- Existing legacy production is adopted with exactly two executions of the
-  installer. Pass one installs a `bootstrap_pending` controller control plane
-  with the timer disabled, verifies it, and intentionally exits nonzero. With
-  the bot stopped, a systemd controller run creates the immutable baseline and
-  `awaiting_service` journal. Pass two validates that state, installs the bot
-  unit, records `installed`, and enables the service and timer. Start the bot,
-  then let the timer or another systemd controller run confirm health and write
-  the bootstrap receipt.
-- Automatic activation journals every boundary. Recovery converges or rolls
-  back on the next controller run; a failed post-start candidate is durably
-  quarantined and cannot be retried. The rollback intent is durable before
-  restoring the database or switching `current` back, and an old backup is not
-  replayed after the rollback start boundary.
-- Changes to the controller, signer, bot/controller units, or timer cross a
-  manual control-plane gate. The controller rejects such a candidate before
-  stop, migration, switch, or quarantine until an operator runs the installer
-  from that exact reviewed revision.
-- After bootstrap, never use `git pull`, `rsync`, in-place `uv sync`, or manual
-  copies as a normal release mechanism. Those commands are reserved for an
-  explicitly reviewed legacy/emergency recovery with the timer disabled, bot
-  stopped, and an independently verified backup.
-- The installer installs `ffmpeg` because Telegram voice notes need conversion
-  before transcription. Keep the metrics exporter bound to localhost unless it
-  is behind a trusted network or reverse proxy.
+- Deploy manually to the Ubuntu VPS after reviewing the revision and CI results.
+- The bot service uses `/opt/honeybuy-tg/current`; keep runtime secrets in
+  `/etc/honeybuy-tg/env` and SQLite data in `/var/lib/honeybuy-tg`.
+- Prepare dependencies in a separate release directory, stop the bot, make a
+  SQLite backup, run `migrate` and `healthcheck`, then select and start the
+  release. See `docs/operations-and-testing.md`.
+- Python 3.13, `uv`, and `ffmpeg` are host prerequisites.
+- Keep the metrics exporter bound to localhost unless it is behind a trusted
+  network or reverse proxy.
+- Repository changes do not alter services already installed on the host.
 
 ## Verification Checklist
 
@@ -226,31 +174,8 @@ Optional metrics:
   expiry/quota, pre/post-normalization authorization, privacy, replay, and
   fake-Telegram routing coverage.
 - [x] Prompt contracts are versioned and fingerprinted in live-eval reports.
-- [x] GitHub Actions runs the full offline test and lint gates without Telegram
-  or OpenAI credentials.
-- [x] Before the guarded-deployment work, the full offline baseline completed
-  with 668 passed and 3 skipped tests.
-- [x] Guarded deployment has deterministic controller/installer test coverage
-  for GitHub evidence, immutable preparation, containment, activation,
-  bootstrap, recovery, backup, rollback, receipts, quarantine, and the
-  database-only health check.
-- [x] After the production-found deployment fixes,
-  `tests/test_deploy.py tests/test_release_controller.py` passed with 436 passed
-  and 2 skipped, the full offline suite passed with 842 passed and 3 skipped,
-  Ruff passed, shell syntax passed, and `git diff --check` passed.
-- [x] Confirm the mandatory Linux/root/systemd containment step passes inside
-  the required `offline` job for a same-repository PR.
-- [x] Confirm the mandatory Linux/root/systemd containment step passes inside
-  the required `offline` job for the final `main` push (GitHub Actions run
-  `33886732004` for `e29dcee1358227f1320f24f719bba707ef6f1ef8`).
-- [x] Obtain final independent review of the integrated guarded-deployment
-  change.
-- [x] Configure and verify the required public-GitHub `main` ruleset: strict
-  `offline`, Rebase and merge only, linear history, no force/delete, and no
-  administrator or actor bypass.
-- [x] Complete and verify the two-pass legacy production bootstrap, its durable
-  baseline receipt, the subsequent immutable release deployment, and an
-  automatic healthy `NOOP` timer run.
+- [x] GitHub Actions runs offline test and lint gates without Telegram, OpenAI,
+  production SSH, or deployment signing credentials.
 - [ ] A release-qualified live baseline eval has passed for the configured
   production parse model with the maintained corpus and at least three
   repetitions.
@@ -300,50 +225,22 @@ Optional metrics:
 
 ### Operations
 
-- [x] Implement the guarded immutable-release controller with durable recovery,
-  validated deployment backups, receipts, quarantine, and a manual
-  control-plane gate.
-- [x] Document guarded production backup, rollback, and migration behavior.
 - [x] Add the database-only health check command and production `ExecStartPre`.
 - [ ] Add a documented restore command for SQLite.
 - [ ] Add log rotation notes or config for the Ubuntu service.
-- [ ] Define retention for deployment backups, receipts, quarantine, and old
-  immutable releases.
-- [x] Reject a bootstrap installer revision that differs from the prepared
-  baseline before the installer mutates timer or control-plane state.
-- [ ] Preserve a bounded, redacted transient-workload failure reason so errors
-  such as systemd `CHDIR` are not reported as database incompatibility.
-- [ ] Extend the Linux/root/systemd integration test to cover work-directory
-  traversal and the `Type=exec` completion boundary used by operator flows.
+- [ ] Define retention for database backups and old releases.
 - [ ] Decide whether webhook mode is worth adding later.
-- [ ] Consider a `.deb` package after the deployment flow stabilizes.
 
 ## Current Next Steps
 
-1. Surface bounded, redacted transient-workload diagnostics, including
-   systemd pre-exec failures such as `CHDIR`, without exposing workload output
-   or environment secrets.
-2. Extend the real Linux/root/systemd integration test so it exercises
-   work-directory traversal and proves that the documented `systemctl --wait`
-   boundary waits for a `Type=exec` controller to terminate.
-3. Run the first release-qualified live text-routing baseline with a separate
-   `HONEYBUY_EVAL_OPENAI_API_KEY`, the full maintained corpus, and at least three
-   repetitions. Use the configured production parse model as the baseline and
-   require every release gate in `docs/operations-and-testing.md` to pass.
-4. Watch production logs during the first identity-touching smoke run against
-   old rows, explicitly including `/list`, `/shop`, `/remove`, and `/bought`,
-   because those paths can backfill canonical identities and remove duplicate
-   active rows.
-5. Enable inline mode manually with `@BotFather` `/setinline` and confirm the bot
-   remains an administrator in every authorized group intended as an inline
-   destination. `/setinlinefeedback` is not required.
-6. Run manual Telegram smoke checks in private chat and group chat:
-   authorization, inline capture into both eligible destination kinds with an
-   explicit confirmation and replay attempt, `/add`, `/list`, `/shop`,
-   `/remove`, `/bought`, voice input, recipe link learning, pasted recipe
-   learning, recipe delete, overwrite confirmation, and recipe aliases. Include
-   the Russian routing regressions that distinguish saved-recipe requests such
-   as `купи ингредиенты для солянки` from ordinary shopping phrases such as
-   `купи продукты` and `купи на завтра молоко`.
-7. Keep product work paused until deploy and smoke checks are complete. The next
-   product candidate remains better due-date support in rendered lists.
+1. Deploy the selected revision manually and run private/group Telegram smoke
+   checks, including `/list`, `/shop`, `/remove`, and `/bought` against old
+   rows after identity changes.
+2. Run a release-qualified text-routing baseline with a separate
+   `HONEYBUY_EVAL_OPENAI_API_KEY`, the maintained corpus, and at least three
+   repetitions; apply the release gates in `docs/operations-and-testing.md`.
+3. Enable inline mode with `@BotFather` `/setinline` and check private and
+   authorized-group capture, explicit confirmation, and replay rejection.
+4. Smoke-test voice and recipe flows, including the Russian routing distinction
+   between `купи ингредиенты для солянки` and `купи на завтра молоко`.
+5. The next product candidate remains better due-date support in rendered lists.

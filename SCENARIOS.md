@@ -782,14 +782,23 @@ then startup runs migrations before polling.
 
 Given the operator runs `uv run python -m honeybuy_tg migrate`,
 when migrations finish,
-then the command exits without starting Telegram polling.
+then the command needs only `DATABASE_PATH` and exits without loading bot
+settings or starting Telegram polling.
 
-### OPS-003 Ubuntu Service
+### OPS-003 Manual Deployment
 
-Given the Ubuntu installer is used,
-when deployment completes,
-then the system has a `honeybuy-tg` systemd service, persistent data directory,
-runtime env file, `uv`, and `ffmpeg`.
+Given the operator selects a tested revision,
+when preparing a release,
+then the operator installs its locked dependencies, stops the bot, backs up
+SQLite, runs migration and healthcheck, selects the release, and starts the
+bot service. Commits and tags do not trigger deployment.
+
+### OPS-004 Database Health Check
+
+Given the operator runs `python -m honeybuy_tg healthcheck`,
+then only `DATABASE_PATH` is required, schema and integrity checks run without
+migration or network calls, and an invalid database produces a nonzero exit.
+The bot service runs this check before startup.
 
 ## Manual Smoke Scenarios
 
