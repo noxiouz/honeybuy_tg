@@ -27,6 +27,25 @@ REMOTE_DB_FIXTURE = Path("/tmp/honeybuy_remote.sqlite3")
 
 
 @pytest.mark.asyncio
+async def test_trace_migration_from_v2_preserves_items_and_is_idempotent(tmp_path):
+    database_path = tmp_path / "v2.sqlite3"
+    storage = Storage(database_path)
+    await storage.init()
+    await storage.add_item(chat_id=1, name="Milk", created_by=42)
+    with storage.connect() as db:
+        db.execute("DROP TABLE routing_traces")
+        db.execute("PRAGMA user_version = 2")
+        db.commit()
+    first = migrate_database_path(database_path)
+    second = migrate_database_path(database_path)
+    assert first.applied_versions == (3,)
+    assert first.integrity_check == "ok"
+    assert not second.changed
+    assert [item.name for item in await storage.list_items(chat_id=1)] == ["Milk"]
+    assert await storage.get_routing_trace(chat_id=1, message_id=10) is None
+
+
+@pytest.mark.asyncio
 async def test_items_are_scoped_by_chat(tmp_path):
     storage = Storage(tmp_path / "test.sqlite3")
     await storage.init()
@@ -1120,14 +1139,14 @@ def test_migrates_copied_remote_database_fixture(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_inline_capture_fresh_schema_is_version_two(tmp_path):
+async def test_inline_capture_fresh_schema_is_current_version(tmp_path):
     database_path = tmp_path / "fresh.sqlite3"
     storage = Storage(database_path)
 
     await storage.init()
 
     with sqlite3.connect(database_path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert "inline_capture_intents" in _table_names(db)
         assert {
@@ -1200,13 +1219,13 @@ def test_migrates_v1_database_to_inline_capture_schema_without_data_loss(tmp_pat
     first = migrate_database_path(database_path)
     second = migrate_database_path(database_path)
 
-    assert CURRENT_SCHEMA_VERSION == 2
+    assert CURRENT_SCHEMA_VERSION == 3
     assert first.old_version == 1
-    assert first.new_version == 2
-    assert first.applied_versions == (2,)
+    assert first.new_version == CURRENT_SCHEMA_VERSION
+    assert first.applied_versions == (2, 3)
     assert first.integrity_check == "ok"
     assert not second.changed
-    assert second.old_version == second.new_version == 2
+    assert second.old_version == second.new_version == CURRENT_SCHEMA_VERSION
     with sqlite3.connect(database_path) as db:
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert db.execute(

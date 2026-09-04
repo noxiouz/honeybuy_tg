@@ -96,6 +96,7 @@ for the manual procedure.
 | `ai.py` | OpenAI transcription, parsing, extraction, categorization, normalization, and strict response schemas | `VoiceTranscriber`, parser/extractor classes |
 | `formatting.py` | Pure user-facing list, recipe, and checklist rendering | `format_items`, `format_shop_session` |
 | `metrics.py` | Prometheus counters, gauges, and timing helpers | `start_metrics_exporter`, recording helpers |
+| `tracing.py` | Bounded typed request diagnostics and request-local correlation; no tenant authority | Routing trace lifecycle and safe event recording |
 
 `telegram_bot.py` is deliberately broader than a thin controller. It constructs
 all optional OpenAI clients, creates the service, defines handler-local helpers,
@@ -232,6 +233,14 @@ in [Ingestion And Recipes](ingestion-and-recipes.md).
   [`SCENARIOS.md`](../SCENARIOS.md) as well as code and tests.
 
 ## Current Scaling Assumptions
+
+Incoming message diagnostics wrap message routing before handler selection.
+Their request-local correlation is independent of authorization: persistence
+and owner lookup always receive an explicit chat ID. Routing and AI boundaries
+record finite codes and safe metadata in a dedicated short-lived trace store.
+Diagnostics are best-effort and do not change product decisions, provider
+prompts, or Prometheus label cardinality. See [Request Lifecycle](request-lifecycle.md)
+for coverage and [Persistence](persistence.md) for retention.
 
 The design assumes one low-volume bot process with a local SQLite file. The
 following would need explicit architectural work before introducing batch

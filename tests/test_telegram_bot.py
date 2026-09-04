@@ -498,7 +498,8 @@ async def test_mention_reply_to_external_voice_reprocesses_voice(
                                 "first_name": "Sender",
                             },
                         },
-                        "chat": {"id": 1, "type": "private"},
+                        "chat": {"id": 2, "type": "private"},
+                        "message_id": 88,
                         "voice": {
                             "file_id": "voice-file",
                             "file_unique_id": "voice-unique",
@@ -517,13 +518,18 @@ async def test_mention_reply_to_external_voice_reprocesses_voice(
     items = await storage.list_items(chat_id=1)
     assert [item.name for item in items] == ["молоко"]
     assert sent_messages[-1].text.startswith("Transcript: купи молоко\n\nAdded")
+    routing = await storage.get_routing_trace(chat_id=1, message_id=10)
+    assert routing["outcome"] == "processed"
+    assert any(event.get("action") == "add_items" for event in routing["events"])
+    assert await storage.get_routing_trace(chat_id=2, message_id=88) is None
+    assert "купи молоко" not in json.dumps(routing, ensure_ascii=False)
     reactions = [
         request
         for request in session.requests
         if isinstance(request, SetMessageReaction)
     ]
     assert [(reaction.chat_id, reaction.message_id) for reaction in reactions] == [
-        (1, 10)
+        (1, 10), (2, 88)
     ]
     assert reactions[0].reaction[0].emoji == "👀"
     assert all(
@@ -621,17 +627,22 @@ async def test_mention_reply_to_voice_reacts_to_command_and_voice_source(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("voice_result", ["success", "pending", "failure"])
 async def test_direct_voice_message_reacts_to_voice_source(
     monkeypatch,
     tmp_path,
+    voice_result,
 ):
     async def fake_convert_voice_to_webm(*, source_path, webm_path):
         webm_path.write_bytes(source_path.read_bytes())
 
-    monkeypatch.setattr(
-        "honeybuy_tg.telegram_bot.VoiceTranscriber",
-        FakeVoiceTranscriber,
-    )
+    class ResultTranscriber(FakeVoiceTranscriber):
+        async def transcribe(self, path):
+            if voice_result == "failure":
+                raise RuntimeError("private-canary-voice-error")
+            return "Яйца и масло" if voice_result == "pending" else "купи молоко"
+
+    monkeypatch.setattr("honeybuy_tg.telegram_bot.VoiceTranscriber", ResultTranscriber)
     monkeypatch.setattr(
         "honeybuy_tg.telegram_bot.convert_voice_to_webm",
         fake_convert_voice_to_webm,
@@ -692,7 +703,17 @@ async def test_direct_voice_message_reacts_to_voice_source(
         if isinstance(request, SetMessageReaction)
     ]
     items = await storage.list_items(chat_id=1)
-    assert [item.name for item in items] == ["молоко"]
+    assert [item.name for item in items] == (["молоко"] if voice_result == "success" else [])
+    routing = await storage.get_routing_trace(chat_id=1, message_id=10)
+    assert routing["outcome"] == {
+        "success": "processed", "pending": "confirmation_pending", "failure": "failed"
+    }[voice_result]
+    if voice_result != "success":
+        assert any(event["stage"] == "voice" and event["reason"] == (
+            "confirmation_pending" if voice_result == "pending" else "error"
+        ) for event in routing["events"])
+    assert "private-canary" not in json.dumps(routing)
+    assert "молоко" not in json.dumps(routing, ensure_ascii=False)
     assert len(reactions) == 1
     assert reactions[0].chat_id == 1
     assert reactions[0].message_id == 10
@@ -928,6 +949,223 @@ def sent_message_texts(session):
         for request in session.requests
         if isinstance(request, SendMessage)
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "text", "user_id", "reason"),
+    [
+        ("off", "private-canary-739 ку пи", 42, "text_mode_off"),
+        ("mention", "private-canary-739 ку пи", 42, "mention_missing"),
+        ("all", "/unknown private-canary-739", 42, "slash_command_ignored"),
+        ("all", "/add@OtherBot private-canary-739", 42, "slash_command_ignored"),
+        ("all", "купи private-canary-739", 7, "unauthorized"),
+    ],
+)
+async def test_routing_trace_explains_ignored_text_without_content(
+    monkeypatch, tmp_path, mode, text, user_id, reason
+):
+    # AUTH-002 and TEXT-004/005/006: diagnostics must preserve existing gates.
+    storage, dispatcher, session, bot, calls, _, _ = await build_routing_test_context(
+        monkeypatch, tmp_path, mode=mode
+    )
+    await dispatcher.feed_update(bot, make_text_update(text, user_id=user_id))
+
+    trace = await storage.get_routing_trace(chat_id=1, message_id=10)
+
+    assert trace is not None
+    assert trace["correlation_id"]
+    assert trace["rule_revision"]
+    assert trace["outcome"] == "ignored"
+    assert any(event["reason"] == reason for event in trace["events"])
+    assert all(isinstance(event["stage"], str) for event in trace["events"])
+    assert "private-canary-739" not in json.dumps(trace)
+    assert await storage.get_routing_trace(chat_id=2, message_id=10) is None
+    assert await storage.list_items(chat_id=1) == []
+    assert calls == []
+    assert sent_message_texts(session) == []
+
+
+@pytest.mark.asyncio
+async def test_routing_trace_captures_unhandled_message(monkeypatch, tmp_path):
+    storage, dispatcher, session, bot, calls, _, _ = await build_routing_test_context(
+        monkeypatch, tmp_path
+    )
+    update = make_text_update("private-canary-739").model_dump(mode="json")
+    update["message"].pop("text")
+    update["message"]["sticker"] = {
+        "file_id": "private-canary-739",
+        "file_unique_id": "private-canary-739",
+        "type": "regular",
+        "width": 10,
+        "height": 10,
+        "is_animated": False,
+        "is_video": False,
+    }
+    await dispatcher.feed_update(bot, Update.model_validate(update))
+
+    trace = await storage.get_routing_trace(chat_id=1, message_id=10)
+
+    assert trace is not None
+    assert trace["outcome"] == "ignored"
+    assert any(event["reason"] == "unsupported_content" for event in trace["events"])
+    assert "private-canary-739" not in json.dumps(trace)
+    assert calls == []
+    assert sent_message_texts(session) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command,action", [("list", "show_list"), ("recipe_alias", "recipe_alias")])
+async def test_trace_identifies_matched_list_command(tmp_path, command, action):
+    storage, dispatcher, _, bot = await build_inline_test_context(tmp_path)
+    if command == "recipe_alias":
+        await storage.save_recipe(chat_id=1, name="pancakes", source_url=None,
+                                  created_by=42, ingredients=[("milk", "1")])
+    await dispatcher.feed_update(bot, make_text_update(
+        "/recipe_alias pancakes = breakfast" if command == "recipe_alias" else "/list"
+    ))
+    trace = await storage.get_routing_trace(chat_id=1, message_id=10)
+    assert any(
+        event.get("command") == command or event.get("action") == action
+        for event in trace["events"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group", [False, True])
+async def test_trace_owner_lookup_and_same_chat_reply(tmp_path, group):
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path)
+    chat_id = -100 if group else 1
+    chat_type = "supergroup" if group else "private"
+    if group:
+        await storage.authorize_chat(
+            chat_id=chat_id, chat_type=chat_type, title="Household", authorized_by=42
+        )
+    await dispatcher.feed_update(
+        bot, make_text_update("/unknown private-canary", chat_id=chat_id, chat_type=chat_type)
+    )
+    for number, text in enumerate(("/trace 10", "/trace"), start=11):
+        update = make_text_update(text, message_id=number, chat_id=chat_id, chat_type=chat_type)
+        if text == "/trace":
+            update = update.model_copy(update={"message": update.message.model_copy(update={
+                "reply_to_message": make_text_update("private-canary", chat_id=chat_id,
+                                                     chat_type=chat_type).message
+            })})
+        await dispatcher.feed_update(bot, update)
+        answer = [request for request in session.requests if isinstance(request, SendMessage)][-1]
+        assert answer.text.startswith("Trace ")
+        assert "slash_command_ignored" in answer.text
+        assert "private-canary" not in answer.text
+        assert len(answer.text) <= 4096
+        assert answer.parse_mode is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_id,group,authorized", [(7, False, False), (7, True, True), (42, True, False)])
+async def test_trace_access_is_checked_before_lookup(monkeypatch, tmp_path, user_id, group, authorized):
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path, allowed_user_ids="7")
+    if authorized:
+        await storage.authorize_chat(chat_id=-100, chat_type="supergroup", title="H", authorized_by=42)
+    lookups = []
+    async def lookup(**kwargs):
+        lookups.append(kwargs)
+        return None
+    monkeypatch.setattr(storage, "get_routing_trace", lookup)
+    await dispatcher.feed_update(bot, make_text_update(
+        "/trace 10", user_id=user_id, chat_id=-100 if group else 1,
+        chat_type="supergroup" if group else "private"
+    ))
+    assert lookups == []
+    if user_id == 42 and group:
+        assert sent_message_texts(session) == ["Chat is not authorized yet. Send /authorize first."]
+    else:
+        assert sent_message_texts(session) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["/trace", "/trace 0", "/trace -1", "/trace +1", "/trace ١", "/trace 2147483648", "/trace 1 2"])
+async def test_trace_malformed_target_never_looks_up(monkeypatch, tmp_path, text):
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path)
+    lookups = []
+    async def lookup(**kwargs):
+        lookups.append(kwargs)
+    monkeypatch.setattr(storage, "get_routing_trace", lookup)
+    await dispatcher.feed_update(bot, make_text_update(text))
+    assert lookups == []
+    assert sent_message_texts(session)[-1].startswith("Usage: /trace")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["save", "append", "read"])
+async def test_trace_diagnostic_failures_do_not_change_operations(monkeypatch, tmp_path, failure):
+    from honeybuy_tg.tracing import RoutingTrace, current_trace
+
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path)
+    async def fail_async(**kwargs):
+        raise RuntimeError("private-canary-error")
+    def fail_append(*args, **kwargs):
+        raise RuntimeError("private-canary-error")
+    if failure == "append":
+        monkeypatch.setattr(RoutingTrace, "append", fail_append)
+    else:
+        monkeypatch.setattr(storage, f"{'get' if failure == 'read' else 'save'}_routing_trace", fail_async)
+    await dispatcher.feed_update(bot, make_text_update("/trace 9" if failure == "read" else "/add milk"))
+    assert current_trace.get() is None
+    if failure == "read":
+        assert sent_message_texts(session) == ["Trace unavailable (missing or expired)."]
+    else:
+        assert [item.name for item in await storage.list_items(chat_id=1)] == ["milk"]
+    assert "private-canary-error" not in str(sent_message_texts(session))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["both", "cross_chat", "external"])
+async def test_trace_rejects_ambiguous_or_external_reply(monkeypatch, tmp_path, kind):
+    storage, dispatcher, session, bot = await build_inline_test_context(tmp_path)
+    update = make_text_update("/trace 9" if kind == "both" else "/trace", reply_text="secret")
+    payload = update.model_dump(mode="json")
+    if kind == "cross_chat":
+        payload["message"]["reply_to_message"]["chat"]["id"] = 2
+    if kind == "external":
+        payload["message"]["external_reply"] = {"origin": {
+            "type": "hidden_user", "date": int(datetime.now(UTC).timestamp()),
+            "sender_user_name": "private-canary"
+        }}
+    lookups = []
+    async def lookup(**kwargs):
+        lookups.append(kwargs)
+    monkeypatch.setattr(storage, "get_routing_trace", lookup)
+    await dispatcher.feed_update(bot, Update.model_validate(payload))
+    assert lookups == []
+    assert sent_message_texts(session)[-1].startswith("Usage: /trace")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duration,size,reason", [(999999, 10, "duration_limit"), (1, 999999999, "file_size_limit"), (1, 10, "ai_unavailable")])
+async def test_trace_voice_rejections_without_external_calls(tmp_path, duration, size, reason):
+    storage, dispatcher, _, bot = await build_inline_test_context(tmp_path)
+    payload = make_text_update("unused").model_dump(mode="json")
+    payload["message"].pop("text")
+    payload["message"]["voice"] = {"file_id": "private-canary", "file_unique_id": "private-canary", "duration": duration, "file_size": size}
+    await dispatcher.feed_update(bot, Update.model_validate(payload))
+    trace = await storage.get_routing_trace(chat_id=1, message_id=10)
+    assert trace["outcome"] == "rejected"
+    assert any(event["reason"] == reason for event in trace["events"])
+    assert "private-canary" not in json.dumps(trace)
+
+
+@pytest.mark.asyncio
+async def test_trace_missing_sender_and_edited_exclusion(tmp_path):
+    storage, dispatcher, _, bot = await build_inline_test_context(tmp_path)
+    payload = make_text_update("/whoami").model_dump(mode="json")
+    payload["message"]["from"] = None
+    # model_dump uses Python field names by default.
+    payload["message"]["from_user"] = None
+    await dispatcher.feed_update(bot, Update.model_validate(payload))
+    trace = await storage.get_routing_trace(chat_id=1, message_id=10)
+    assert any(event["reason"] == "missing_sender" for event in trace["events"])
+    await dispatcher.feed_update(bot, Update(update_id=2, edited_message=make_text_update("/list", message_id=20).message))
+    assert await storage.get_routing_trace(chat_id=1, message_id=20) is None
 
 
 async def build_inline_test_context(
@@ -1259,6 +1497,8 @@ async def test_inline_query_and_chosen_result_never_mutate_and_callback_adds_lit
     assert edits[-1].inline_message_id == "inline-message-1"
     assert "Secret Household" not in edits[-1].text
     assert len(callback_answers(session)) == 1
+    with storage.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM routing_traces").fetchone()[0] == 0
 
 
 @pytest.mark.asyncio
@@ -2182,6 +2422,11 @@ async def test_recipe_parser_exception_falls_through_to_shopping_parser(
     parser_trace = [entry for entry in trace if entry[0] in {"recipe", "shopping"}]
     assert parser_trace == [("recipe", text), ("shopping", text)]
     assert [item.name for item in await storage.list_items(chat_id=1)] == [text]
+    routing = await storage.get_routing_trace(chat_id=1, message_id=10)
+    decisions = [(event["stage"], event["reason"]) for event in routing["events"]]
+    assert decisions.index(("recipe", "error")) < decisions.index(("shopping", "accepted"))
+    assert routing["outcome"] == "processed"
+    assert "offline recipe parser failure" not in json.dumps(routing)
     assert not any("could not match" in answer.casefold() for answer in sent_message_texts(session))
 
 
@@ -2209,6 +2454,11 @@ async def test_deterministic_recipe_reuse_bypasses_ai_shopping_parser(
 
     await dispatcher.feed_update(bot, make_text_update("добавь всё для солянки"))
 
+    routing = await storage.get_routing_trace(chat_id=1, message_id=10)
+    assert any(event["reason"] == "deterministic_match" for event in routing["events"])
+    assert not any(event["stage"] == "shopping" for event in routing["events"])
+    assert any(event.get("action") == "add_recipe" and event["reason"] == "completed"
+               for event in routing["events"])
     assert not [entry for entry in trace if entry[0] in {"recipe", "shopping"}]
     assert [item.name for item in await storage.list_items(chat_id=1)] == [
         "солёные огурцы, 2 шт"
@@ -2312,6 +2562,10 @@ async def test_polite_recipe_ai_unknown_falls_through_without_recipe_error(
     parser_trace = [entry for entry in trace if entry[0] in {"recipe", "shopping"}]
     assert parser_trace == [("recipe", text), ("shopping", text)]
     assert [item.name for item in await storage.list_items(chat_id=1)] == ["солянка"]
+    routing = await storage.get_routing_trace(chat_id=1, message_id=10)
+    decisions = [(event["stage"], event["reason"]) for event in routing["events"]]
+    assert decisions.index(("recipe", "unknown")) < decisions.index(("shopping", "accepted"))
+    assert routing["outcome"] == "processed"
     replies = sent_message_texts(session)
     assert not any("I do not know recipe" in reply for reply in replies)
     assert not any("could not match" in reply.casefold() for reply in replies)

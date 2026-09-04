@@ -378,6 +378,15 @@ The detailed maintained checklist is at the end of
 
 ## Known Operational Gaps
 
+Routing diagnostics can be inspected by the owner using `/trace <message_id>`
+in the same authorized chat, or `/trace` as a reply to the original incoming
+message. The bounded code-only trace is retained for 24 hours, with a global
+cap of 1,000 records and opportunistic cleanup on trace activity. Group replies
+are visible to group members. No extra AI call is made. Missing or expired
+traces share a generic response; diagnostic failure does not fail the original
+shopping or recipe action. Existing raw-content `events` and process logs have
+their own lifecycle and are not sanitized by tracing.
+
 Database backup and restore are manual operator responsibilities. There is no
 general point-in-time restore command, scheduled backup policy, HTTP health
 endpoint, log-rotation policy, general state-retention task, voice/recipe

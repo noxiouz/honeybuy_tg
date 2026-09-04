@@ -1,6 +1,6 @@
 # Honeybuy Telegram Bot Plan
 
-Last updated: 2026-09-04
+Last updated: 2026-09-05
 
 ## Goal
 
@@ -11,6 +11,10 @@ stores state locally in SQLite.
 
 ## Current Status
 
+- AI-026 routing diagnostics are implemented for incoming message updates:
+  bounded typed stages, safe AI metadata, short-lived chat-scoped SQLite traces
+  and owner-only `/trace` lookup. Deployment and live smoke testing remain
+  separate operator steps.
 - The bot is implemented and the existing production bot runs on Ubuntu with
   `systemd`.
 - The main runtime path is long polling via `aiogram`.

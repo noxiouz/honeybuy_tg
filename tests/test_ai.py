@@ -1,4 +1,5 @@
 import json
+import asyncio
 
 import pytest
 
@@ -84,6 +85,46 @@ def wrapper_with_response(wrapper_class, output_text: str):
     wrapper.client = FakeOpenAIClient(output_text)
     wrapper.model = "test-model"
     return wrapper
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,reason,schema", [
+    (None, "validated", "valid"),
+    ("invalid", "invalid_schema", "invalid"),
+    ("request", "error", "not_validated"),
+    ("cancel", "cancelled", "not_validated"),
+])
+async def test_trace_real_ai_adapter_metadata_and_privacy(failure, reason, schema):
+    from honeybuy_tg.tracing import RoutingTrace, current_trace
+
+    response = {"action": "unknown", "items": [], "needs_confirmation": False,
+                "clarification_question": None}
+    wrapper = wrapper_with_response(ShoppingTextParser, json.dumps(response) if failure != "invalid" else "private-canary-invalid")
+    wrapper.model = "private-canary-model"
+    if failure in {"request", "cancel"}:
+        async def fail(**kwargs):
+            if failure == "cancel":
+                raise asyncio.CancelledError()
+            raise RuntimeError("private-canary-exception")
+        wrapper.client.responses.create = fail
+    trace = RoutingTrace()
+    token = current_trace.set(trace)
+    try:
+        if failure:
+            with pytest.raises(asyncio.CancelledError if failure == "cancel" else Exception):
+                await wrapper.parse("private-canary-input")
+        else:
+            assert await wrapper.parse("private-canary-input") == response
+    finally:
+        current_trace.reset(token)
+    event = trace.snapshot()["events"][0]
+    assert event["reason"] == reason
+    assert event["schema"] == schema
+    assert event["operation"] == SHOPPING_TEXT_PROMPT.operation
+    assert event["revision"] == SHOPPING_TEXT_PROMPT.revision
+    assert event["fingerprint"] == SHOPPING_TEXT_PROMPT.fingerprint
+    assert event["model"] == "other"
+    assert "private-canary" not in json.dumps(trace.snapshot())
 
 
 def assert_response_request(wrapper, *, expected_input, prompt_spec):

@@ -5,6 +5,37 @@ All Telegram routing is assembled in `build_dispatcher` in
 registered before the generic voice and text handlers, followed by callback
 handlers. A metrics middleware wraps messages and callbacks at the router.
 
+## Routing Trace And Owner Lookup
+
+A message outer middleware starts correlation before filters choose a handler
+and finalizes diagnostics on normal return, failure, or cancellation. Every
+received `Update.message` is in scope, including unsupported media and ignored
+text. Edited messages, channel/business posts, callbacks, inline/chosen-inline
+updates, membership and reaction updates are excluded; embedded reply or
+callback messages are not separate ingress. Messages Telegram never delivers
+cannot have a trace.
+
+Finite reasons distinguish parse-mode and authorization gates, recipe markers
+and recognizers, shopping AI and deterministic fallback, reply-context routing,
+voice rejection and confirmation. AI validation success is separate from a
+recognized action. Handler completion alone does not prove a mutation succeeded.
+Voice reanalysis belongs to the incoming command's chat and message ID even
+when its source is an external reply. Existing gate ordering and routing are
+preserved.
+
+The owner can send `/trace 123` or reply to the original incoming message with
+`/trace`. The command checks owner identity and current chat authorization
+before lookup. It accepts one positive ASCII ID up to `2147483647`, or one
+same-chat reply; it rejects both together and external/cross-chat replies.
+There is no bot-response-to-request mapping or cross-chat search. Missing and
+expired results share a generic response. Output is bounded plain text and
+makes no AI request. In an authorized group the reply is visible to the group.
+
+Only closed diagnostic codes and safe revision/model/timing metadata are
+recorded. Raw content and arbitrary exceptions are excluded. Trace operations
+fail open; request context is always reset. [Persistence](persistence.md)
+describes the separate bounded store and the existing raw-content event history.
+
 ## Access Control
 
 The configured owner is identified by a matching `OWNER_USER_ID` or a

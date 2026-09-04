@@ -5,6 +5,7 @@ from typing import Protocol
 
 from honeybuy_tg.models import ItemIdentity, Recipe, ShoppingItem
 from honeybuy_tg.storage import Storage, normalize_item_name
+from honeybuy_tg.tracing import Reason, Stage, record
 
 
 class ItemNormalizer(Protocol):
@@ -378,6 +379,7 @@ class ShoppingListService:
             try:
                 normalized = await self.item_normalizer.normalize(missing_names)
             except Exception:
+                record(Stage.IDENTITY, Reason.ERROR)
                 normalized = {}
             cacheable_names = set()
             normalized_by_name = {
@@ -394,6 +396,10 @@ class ShoppingListService:
         else:
             cacheable_names = set()
 
+        if len(missing_names) < len(clean_names):
+            record(Stage.IDENTITY, Reason.CACHE_HIT)
+        if any(name not in identities for name in missing_names):
+            record(Stage.IDENTITY, Reason.LOCAL_FALLBACK)
         for name in missing_names:
             identities.setdefault(name, local_item_identity(name))
 
