@@ -2,17 +2,41 @@
 Description=Honeybuy Telegram bot
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=5min
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=honeybuy
 Group=honeybuy
-WorkingDirectory=/opt/honeybuy-tg
+UMask=0027
 EnvironmentFile=/etc/honeybuy-tg/env
-Environment=UV_CACHE_DIR=/var/cache/honeybuy-tg/uv
-ExecStart=/usr/local/bin/uv run python -m honeybuy_tg
-Restart=always
-RestartSec=5
+WorkingDirectory=/opt/honeybuy-tg/current
+ExecStartPre=/opt/honeybuy-tg/current/.venv/bin/python -m honeybuy_tg healthcheck
+ExecStart=/opt/honeybuy-tg/current/.venv/bin/python -m honeybuy_tg
+TimeoutStartSec=2min
+TimeoutStopSec=30s
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/honeybuy-tg
 
 [Install]
 WantedBy=multi-user.target
