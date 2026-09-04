@@ -776,6 +776,12 @@ def test_installer_uses_fixed_absolute_security_sensitive_paths():
     assert lock_path.parent == Path(expected_paths["LOCK_DIR"])
     assert lock_path.suffix == ".lock"
 
+    assert _shell_assignment(installer, "EMPTY_WORK_DIR") == "$STATE_DIR/empty"
+    assert (
+        _expand_shell_constants(installer, "$EMPTY_WORK_DIR")
+        == "/var/lib/honeybuy-release-controller/empty"
+    )
+
 
 def test_installer_stops_timer_and_holds_the_controller_lock_during_overwrite():
     installer = _repo_text("deploy/ubuntu/install.sh")
@@ -987,10 +993,10 @@ def test_installer_creates_separate_users_and_narrow_directory_ownership():
         "$ENV_DIR",
         "$STATE_DIR",
         "$STATE_DIR/repository",
+        "$EMPTY_WORK_DIR",
         "$BACKUP_DIR",
         "$LOCK_DIR",
         "/usr/local/lib/honeybuy",
-        "/var/empty/honeybuy-healthcheck",
     ):
         _assert_install_ownership(
             installer,
@@ -1013,7 +1019,6 @@ def test_installer_creates_separate_users_and_narrow_directory_ownership():
         group="honeybuy-build",
         directory=True,
     )
-
     build_owned_lines = [
         line
         for line in lines
@@ -1025,6 +1030,47 @@ def test_installer_creates_separate_users_and_narrow_directory_ownership():
     }
     assert "$CACHE_DIR/uv" in build_owned_targets
     assert build_owned_targets <= {"$CACHE_DIR/uv", "$STAGING_DIR"}
+
+
+def test_installer_provisions_traversable_healthcheck_work_directory():
+    installer = _repo_text("deploy/ubuntu/install.sh")
+
+    assert "/var/empty" not in installer
+    _assert_install_ownership(
+        installer,
+        "$STATE_DIR",
+        owner="root",
+        group="root",
+        directory=True,
+        mode=0o711,
+    )
+    _assert_install_ownership(
+        installer,
+        "$EMPTY_WORK_DIR",
+        owner="root",
+        group="root",
+        directory=True,
+        mode=0o755,
+    )
+
+    lines = _shell_logical_lines(installer)
+    for guard in ("assert_not_symlink", "assert_safe_existing"):
+        matches = [
+            line
+            for line in lines
+            if shlex.split(line, comments=True)[:2]
+            == [guard, "$EMPTY_WORK_DIR"]
+        ]
+        assert len(matches) == 1
+    metadata_guard = next(
+        line for line in lines if line.startswith('assert_safe_existing "$EMPTY_WORK_DIR"')
+    )
+    assert shlex.split(metadata_guard, comments=True)[2:] == [
+        "directory",
+        "root",
+        "root",
+        "protected",
+    ]
 
 
 def test_installer_installs_root_owned_manual_control_plane_files():
@@ -1496,6 +1542,7 @@ def test_installer_refuses_unsafe_existing_trust_environment_and_state():
         ("$ENV_DIR/env", "$ENV_FILE"),
         ("$STATE_DIR",),
         ("$STATE_DIR/repository", "$REPOSITORY_DIR"),
+        ("$STATE_DIR/empty", "$EMPTY_WORK_DIR"),
         ("$STATE_DIR/deployed-sha", "$DEPLOYED_STATE_FILE"),
         ("$STATE_DIR/deployment-journal.json", "$JOURNAL_FILE"),
         ("$ALLOWED_SIGNERS_FILE",),
